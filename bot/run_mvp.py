@@ -265,6 +265,27 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             logger.exception("Failed to notify user about an error")
 
 
+class ApplicationBuilderWithErrorHandler:
+    def __init__(self, builder):
+        self._builder = builder
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._builder, name)
+        if not callable(attr):
+            return attr
+
+        def method(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            return self if result is self._builder else result
+
+        return method
+
+    def build(self, *args, **kwargs):
+        app = self._builder.build(*args, **kwargs)
+        app.add_error_handler(global_error_handler)
+        return app
+
+
 def install_patches() -> None:
     bot.user_tag = safe_user_tag
     bot.load_orders = load_orders
@@ -279,15 +300,7 @@ def install_patches() -> None:
 
     def builder_with_error_handler(*args, **kwargs):
         builder = _original_application_builder(*args, **kwargs)
-        original_build = builder.build
-
-        def build(*build_args, **build_kwargs):
-            app = original_build(*build_args, **build_kwargs)
-            app.add_error_handler(global_error_handler)
-            return app
-
-        builder.build = build
-        return builder
+        return ApplicationBuilderWithErrorHandler(builder)
 
     bot.Application.builder = builder_with_error_handler
 
