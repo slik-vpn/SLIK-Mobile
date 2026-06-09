@@ -53,6 +53,7 @@ RUSSIA_IMAGE = IMAGES_DIR / "russia.jpg"   # запасной файл для Р
 
 CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
+USERS_FILE     = Path(__file__).parent / "users.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
 # Экраны с баннерами
@@ -145,6 +146,95 @@ def save_orders(orders: list) -> None:
     ORDERS_FILE.write_text(
         json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+# ─── users.json ───────────────────────────────────────────────────────────────
+
+def ensure_users_file() -> None:
+    if not USERS_FILE.exists():
+        save_users({})
+
+
+def load_users() -> dict:
+    ensure_users_file()
+    try:
+        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_users(users: dict) -> None:
+    USERS_FILE.write_text(
+        json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def default_user_profile(user) -> dict:
+    return {
+        "telegram_id": user.id,
+        "username": user.username or "",
+        "full_name": user.full_name or "",
+        "created_at": now_str(),
+        "orders_count": 0,
+        "total_spent": 0,
+        "bonus_balance": 0,
+        "referrals": [],
+        "referrer": None,
+        "status": "Traveller",
+    }
+
+
+def ensure_user_profile(user) -> dict:
+    users = load_users()
+    key = str(user.id)
+    profile = users.get(key)
+    if not isinstance(profile, dict):
+        profile = default_user_profile(user)
+    else:
+        profile.setdefault("telegram_id", user.id)
+        profile.setdefault("created_at", now_str())
+        profile.setdefault("orders_count", 0)
+        profile.setdefault("total_spent", 0)
+        profile.setdefault("bonus_balance", 0)
+        profile.setdefault("referrals", [])
+        profile.setdefault("referrer", None)
+        profile.setdefault("status", "Traveller")
+        profile["username"] = user.username or ""
+        profile["full_name"] = user.full_name or ""
+    users[key] = profile
+    save_users(users)
+    return profile
+
+
+def record_user_order(user, order: dict) -> None:
+    users = load_users()
+    key = str(user.id)
+    profile = users.get(key) if isinstance(users.get(key), dict) else default_user_profile(user)
+    profile["username"] = user.username or ""
+    profile["full_name"] = user.full_name or ""
+    profile["orders_count"] = int(profile.get("orders_count") or 0) + 1
+    profile["total_spent"] = round(float(profile.get("total_spent") or 0) + parse_price(order.get("price", "0")), 2)
+    profile.setdefault("bonus_balance", 0)
+    profile.setdefault("referrals", [])
+    profile.setdefault("referrer", None)
+    profile.setdefault("status", "Traveller")
+    users[key] = profile
+    save_users(users)
+
+
+def get_user_orders(user_id: int) -> list:
+    return [order for order in load_orders() if str(order.get("user_id")) == str(user_id)]
+
+
+def sync_user_order_stats(user, profile: dict) -> dict:
+    orders = get_user_orders(user.id)
+    profile["orders_count"] = len(orders)
+    profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in orders), 2)
+    users = load_users()
+    users[str(user.id)] = profile
+    save_users(users)
+    return profile
 
 
 def append_order(order: dict) -> dict:
@@ -380,6 +470,7 @@ async def send_order_list(message, orders: list, title: str):
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌍 Купить eSIM",          callback_data="buy_esim")],
+        [InlineKeyboardButton("👤 Личный кабинет",       callback_data="profile")],
         [InlineKeyboardButton("📱 Проверить устройство", url=DEVICE_CHECK_URL)],
         [InlineKeyboardButton("📖 Инструкция",           callback_data="instructions")],
         [InlineKeyboardButton("👨‍💻 Поддержка",            callback_data="support_screen")],
@@ -443,6 +534,21 @@ def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Мои заказы",       callback_data="profile_orders")],
+        [InlineKeyboardButton("👥 Пригласить друга", callback_data="profile_invite")],
+        [InlineKeyboardButton("🎁 Мои бонусы",       callback_data="profile_bonuses")],
+        [InlineKeyboardButton("⬅️ Назад",            callback_data="back_main")],
+    ])
+
+
+def profile_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="profile")],
+    ])
+
+
 # ─── Главное меню ─────────────────────────────────────────────────────────────
 
 MAIN_MENU_TEXT = (
@@ -454,6 +560,8 @@ MAIN_MENU_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if user:
+        ensure_user_profile(user)
     if update.message:
         try:
             await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
@@ -594,6 +702,76 @@ async def show_support_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     if not is_admin(query.from_user):
         await track_action(context, query.from_user, "нажал «Поддержка»")
+
+
+# ─── Личный кабинет ───────────────────────────────────────────────────────────
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    profile = sync_user_order_stats(user, ensure_user_profile(user))
+    referrals = profile.get("referrals", [])
+    referrals_count = len(referrals) if isinstance(referrals, list) else 0
+    text = (
+        "👤 <b>Личный кабинет</b>\n\n"
+        f"Имя: <b>{html_escape(profile.get('full_name') or user.full_name or '—')}</b>\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Статус: <b>{html_escape(profile.get('status', 'Traveller'))}</b>\n"
+        f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
+        f"Сумма покупок: <b>${float(profile.get('total_spent') or 0):g}</b>\n"
+        f"Бонусный баланс: <b>{float(profile.get('bonus_balance') or 0):g}</b>\n"
+        f"Приглашено друзей: <b>{referrals_count}</b>"
+    )
+    await edit_or_send(query, context, text, profile_keyboard())
+
+
+def format_user_orders(orders: list) -> list[str]:
+    chunks: list[str] = []
+    current = "📦 <b>Мои заказы</b>\n\n"
+    for order in orders:
+        line = (
+            f"<b>{html_escape(order.get('number', '—'))}</b> · {html_escape(order.get('created_at', '—'))}\n"
+            f"Тариф: {html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}\n"
+            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"Статус: {html_escape(order.get('status', 'new'))}\n\n"
+        )
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    orders = get_user_orders(query.from_user.id)
+    if not orders:
+        await edit_or_send(
+            query, context,
+            "📦 <b>Мои заказы</b>\n\nУ вас пока нет заказов.",
+            profile_back_keyboard(),
+        )
+        return
+
+    chunks = format_user_orders(orders)
+    await edit_or_send(query, context, chunks[0], profile_back_keyboard())
+    for chunk in chunks[1:]:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=chunk,
+            parse_mode="HTML",
+            reply_markup=profile_back_keyboard(),
+        )
+
+
+async def show_profile_stub(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    query = update.callback_query
+    await query.answer()
+    await edit_or_send(query, context, text, profile_back_keyboard())
 
 
 # ─── Диалог покупки ───────────────────────────────────────────────────────────
@@ -794,6 +972,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "tg_handle":      tg_handle,
         "user_id":        user.id,
     })
+    record_user_order(user, order)
 
     await update.message.reply_text(
         (
@@ -1430,6 +1609,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_instructions(update, context)
     elif data == "support_screen":
         await show_support_screen(update, context)
+    elif data == "profile":
+        await show_profile(update, context)
+    elif data == "profile_orders":
+        await show_my_orders(update, context)
+    elif data == "profile_invite":
+        await show_profile_stub(update, context, "👥 Скоро здесь появится реферальная программа")
+    elif data == "profile_bonuses":
+        await show_profile_stub(update, context, "🎁 Скоро здесь появится бонусная система")
     elif data == "back_main":
         await query.answer()
         await start(update, context)

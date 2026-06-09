@@ -12,7 +12,12 @@ if [ ! -f "$DATA_DIR/orders.json" ]; then
   cp /app/bot/orders.example.json "$DATA_DIR/orders.json"
 fi
 
+if [ ! -f "$DATA_DIR/users.json" ]; then
+  cp /app/bot/users.example.json "$DATA_DIR/users.json"
+fi
+
 ln -sf "$DATA_DIR/config.json" /app/bot/config.json
 ln -sf "$DATA_DIR/orders.json" /app/bot/orders.json
+ln -sf "$DATA_DIR/users.json" /app/bot/users.json
 
 exec "$@"
