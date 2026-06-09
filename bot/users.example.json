@@ -1,0 +1,15 @@
+{
+  "123456789": {
+    "telegram_id": 123456789,
+    "username": "user",
+    "full_name": "Ivan Ivanov",
+    "created_at": "01.01.2026 12:00",
+    "orders_count": 0,
+    "total_spent": 0,
+    "slik_balance": 0.0,
+    "referrals_count": 0,
+    "referrer_id": null,
+    "referral_reward_given": false,
+    "status": "Traveller"
+  }
+}

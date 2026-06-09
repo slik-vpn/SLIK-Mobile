@@ -5,7 +5,7 @@ Telegram-бот для ручного MVP продажи eSIM. Текущая в
 ## Что важно знать
 
 - Выдача eSIM в этой версии ручная: менеджер получает заявку в админ-чате и отправляет клиенту QR/данные eSIM самостоятельно.
-- Рабочие файлы `bot/config.json` и `bot/orders.json` не хранятся в Git. На сервере они создаются из example-файлов.
+- Рабочие файлы `bot/config.json`, `bot/orders.json` и `bot/users.json` не хранятся в Git. На сервере они создаются из example-файлов.
 - Для запуска на VPS используйте `bot/run_mvp.py`, а не напрямую `bot/bot.py`. Этот entrypoint сохраняет текущую логику бота и добавляет защиту для ручного MVP.
 - Docker-запуск хранит runtime-данные в папке `data/` рядом с `docker-compose.yml`.
 
@@ -23,7 +23,7 @@ ADMIN_CHAT_ID=-1001234567890
 
 ## Запуск через Docker Compose
 
-Docker-вариант подходит для Debian 11 и Ubuntu. Контейнер автоматически запускает `python run_mvp.py`, читает `.env` через Compose и при первом старте создаёт `data/config.json` и `data/orders.json` из example-файлов.
+Docker-вариант подходит для Debian 11 и Ubuntu. Контейнер автоматически запускает `python run_mvp.py`, читает `.env` через Compose и при первом старте создаёт `data/config.json`, `data/orders.json` и `data/users.json` из example-файлов.
 
 ### Debian 11
 
@@ -106,9 +106,42 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json
 cp orders.example.json orders.json
+cp users.example.json users.json
 export TELEGRAM_BOT_TOKEN="1234567890:replace_me"
 export ADMIN_CHAT_ID="-1001234567890"
 python run_mvp.py
+```
+
+## Личный кабинет клиента
+
+Личный кабинет открывается кнопкой `👤 Личный кабинет` в главном меню. При первом `/start` бот автоматически создаёт профиль клиента в `users.json` и сохраняет Telegram ID, username, имя, дату создания, статус, счётчики заказов, сумму покупок, `SLIK Balance` и реферальные поля.
+
+В кабинете клиент видит статус, единый баланс `💵 SLIK Balance`, количество заказов, сумму покупок и количество приглашённых. Старого отдельного `bonus_balance` больше нет: все начисления и будущие списания идут только через `slik_balance`. Кнопка `📦 Мои заказы` показывает заказы текущего пользователя из `orders.json`; если заказов нет, бот отвечает: `У вас пока нет заказов.`
+
+### Реферальная программа
+
+Кнопка `👥 Пригласить друга` показывает персональную ссылку вида:
+
+```text
+https://t.me/<BOT_USERNAME>?start=ref_<USER_ID>
+```
+
+Если новый пользователь запускает бота по ссылке `/start ref_<USER_ID>`, бот сохраняет `referrer_id`, если реферер ещё не был записан и пользователь не приглашает сам себя. После первой созданной заявки приглашённого пользователя обе стороны получают по `$1.00` на `SLIK Balance`, а в профиле приглашённого выставляется `referral_reward_given: true`.
+
+Статус клиента автоматически пересчитывается по `total_spent`: `Traveller` от `$0`, `Explorer` от `$50`, `Premium` от `$150`, `Ambassador` от `$500`.
+
+`users.json` — runtime-файл: при systemd-запуске хранится в `bot/users.json`, при Docker-запуске — в `data/users.json`. Файл не коммитится в Git; шаблон с примером структуры хранится в `bot/users.example.json`, а рабочий `users.json` создаётся автоматически, если его нет.
+
+Бэкап при systemd-запуске:
+
+```bash
+tar -czf slik-mobile-users-$(date +%F).tar.gz bot/users.json
+```
+
+Бэкап при Docker-запуске:
+
+```bash
+tar -czf slik-mobile-users-$(date +%F).tar.gz data/users.json
 ```
 
 ## Настройка оплаты
@@ -140,6 +173,7 @@ sudo -u slik-mobile python3 -m venv .venv
 sudo -u slik-mobile .venv/bin/pip install -r bot/requirements.txt
 sudo -u slik-mobile cp bot/config.example.json bot/config.json
 sudo -u slik-mobile cp bot/orders.example.json bot/orders.json
+sudo -u slik-mobile cp bot/users.example.json bot/users.json
 sudo -u slik-mobile cp .env.example .env
 sudo nano /opt/slik-mobile/.env
 ```
@@ -164,14 +198,20 @@ sudo journalctl -u slik-mobile -f
 
 1. `/start` открывает главное меню.
 2. Покупка тарифа Россия создаёт заявку.
-3. Админ-чат получает уведомление.
-4. Кнопки `Выдано` и `Отменено` меняют статус заказа.
-5. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
-6. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
+3. Кнопка `👤 Личный кабинет` открывает профиль клиента.
+4. `📦 Мои заказы` показывает только заказы текущего пользователя или сообщение `У вас пока нет заказов.`
+5. `/start ref_<USER_ID>` сохраняет реферера, если он ещё не задан.
+6. После первой заявки приглашённого пользователя обе стороны получают `$1.00` на `SLIK Balance`.
+7. Статус клиента обновляется по сумме покупок.
+8. Админ-чат получает уведомление.
+9. Кнопки `Выдано` и `Отменено` меняют статус заказа.
+10. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
+11. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
 
 ## Файлы данных
 
 - `bot/config.json` при systemd-запуске или `data/config.json` при Docker-запуске — runtime-настройки, баннеры, админы, relay и платёжные реквизиты.
 - `bot/orders.json` при systemd-запуске или `data/orders.json` при Docker-запуске — заказы MVP.
+- `bot/users.json` при systemd-запуске или `data/users.json` при Docker-запуске — профили клиентов, SLIK Balance и реферальные данные.
 
 Эти файлы нужно регулярно бэкапить на VPS и не коммитить в Git.

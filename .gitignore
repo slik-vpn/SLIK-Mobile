@@ -10,6 +10,7 @@ venv/
 bot/.env
 bot/config.json
 bot/orders.json
+bot/users.json
 bot/*.log
 data/
 

@@ -6,6 +6,8 @@ import os
 import json
 import logging
 import datetime
+import asyncio
+from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +29,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import NetworkError, TimedOut
 
 # ─── Логирование ──────────────────────────────────────────────────────────────
 
@@ -50,6 +53,7 @@ RUSSIA_IMAGE = IMAGES_DIR / "russia.jpg"   # запасной файл для Р
 
 CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
+USERS_FILE     = Path(__file__).parent / "users.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
 # Экраны с баннерами
@@ -142,6 +146,213 @@ def save_orders(orders: list) -> None:
     ORDERS_FILE.write_text(
         json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+# ─── users.json ───────────────────────────────────────────────────────────────
+
+REFERRAL_REWARD_USD = 1.0
+
+
+def ensure_users_file() -> None:
+    if not USERS_FILE.exists():
+        save_users({})
+
+
+def load_users() -> dict:
+    ensure_users_file()
+    try:
+        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_users(users: dict) -> None:
+    USERS_FILE.write_text(
+        json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def client_status(total_spent: float) -> str:
+    if total_spent >= 500:
+        return "Ambassador"
+    if total_spent >= 150:
+        return "Premium"
+    if total_spent >= 50:
+        return "Explorer"
+    return "Traveller"
+
+
+def default_user_profile(user) -> dict:
+    return {
+        "telegram_id": user.id,
+        "username": user.username or "",
+        "full_name": user.full_name or "",
+        "created_at": now_str(),
+        "orders_count": 0,
+        "total_spent": 0,
+        "slik_balance": 0.0,
+        "referrals_count": 0,
+        "referrer_id": None,
+        "referral_reward_given": False,
+        "status": "Traveller",
+    }
+
+
+def normalize_user_profile(user, profile: dict | None = None) -> dict:
+    if not isinstance(profile, dict):
+        profile = default_user_profile(user)
+    else:
+        profile.setdefault("telegram_id", user.id)
+        profile.setdefault("created_at", now_str())
+        profile.setdefault("orders_count", 0)
+        profile.setdefault("total_spent", 0)
+        profile.setdefault("slik_balance", profile.get("bonus_balance", 0.0))
+        profile.setdefault("referrals_count", len(profile.get("referrals", [])) if isinstance(profile.get("referrals"), list) else 0)
+        profile.setdefault("referrer_id", profile.get("referrer"))
+        profile.setdefault("referral_reward_given", False)
+        profile["username"] = user.username or ""
+        profile["full_name"] = user.full_name or ""
+
+    profile["telegram_id"] = user.id
+    profile["orders_count"] = int(profile.get("orders_count") or 0)
+    profile["total_spent"] = round(float(profile.get("total_spent") or 0), 2)
+    profile["slik_balance"] = round(float(profile.get("slik_balance") or 0), 2)
+    profile["referrals_count"] = int(profile.get("referrals_count") or 0)
+    profile["status"] = client_status(profile["total_spent"])
+
+    # Удаляем устаревшие поля Этапа 1: единственный баланс теперь SLIK Balance.
+    profile.pop("bonus_balance", None)
+    profile.pop("referrals", None)
+    profile.pop("referrer", None)
+    return profile
+
+
+def ensure_user_profile(user, referrer_id: int | None = None) -> dict:
+    users = load_users()
+    key = str(user.id)
+    profile_exists = isinstance(users.get(key), dict)
+    profile = normalize_user_profile(user, users.get(key))
+
+    if (
+        referrer_id
+        and referrer_id != user.id
+        and not profile.get("referrer_id")
+    ):
+        profile["referrer_id"] = referrer_id
+        referrer_key = str(referrer_id)
+        referrer_profile = users.get(referrer_key)
+        if isinstance(referrer_profile, dict):
+            referrer_user = type("User", (), {
+                "id": referrer_id,
+                "username": referrer_profile.get("username") or "",
+                "full_name": referrer_profile.get("full_name") or "",
+            })()
+            referrer_profile = normalize_user_profile(referrer_user, referrer_profile)
+            referrer_profile["referrals_count"] = int(referrer_profile.get("referrals_count") or 0) + 1
+            users[referrer_key] = referrer_profile
+
+    users[key] = profile
+    save_users(users)
+    if not profile_exists:
+        logger.info("Создан профиль пользователя %s", user.id)
+    return profile
+
+
+def get_user_orders(user_id: int) -> list:
+    return [order for order in load_orders() if str(order.get("user_id")) == str(user_id)]
+
+
+def sync_user_order_stats(user, profile: dict) -> dict:
+    orders = get_user_orders(user.id)
+    profile["orders_count"] = len(orders)
+    profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in orders), 2)
+    profile["status"] = client_status(profile["total_spent"])
+    users = load_users()
+    users[str(user.id)] = normalize_user_profile(user, profile)
+    save_users(users)
+    return users[str(user.id)]
+
+
+def record_user_order(user, order: dict) -> dict:
+    profile = sync_user_order_stats(user, ensure_user_profile(user))
+    return profile
+
+
+def parse_referrer_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    args = getattr(context, "args", None) or []
+    if not args:
+        return None
+    raw = str(args[0]).strip()
+    if not raw.startswith("ref_"):
+        return None
+    try:
+        return int(raw.replace("ref_", "", 1))
+    except ValueError:
+        return None
+
+
+async def process_referral_reward(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    users = load_users()
+    key = str(user.id)
+    profile = normalize_user_profile(user, users.get(key))
+    referrer_id = profile.get("referrer_id")
+    if (
+        not referrer_id
+        or profile.get("referral_reward_given")
+        or int(profile.get("orders_count") or 0) != 1
+    ):
+        users[key] = profile
+        save_users(users)
+        return
+
+    referrer_key = str(referrer_id)
+    referrer_profile = users.get(referrer_key)
+    if not isinstance(referrer_profile, dict):
+        logger.info("Реферальная награда не начислена: реферер %s не найден", referrer_id)
+        users[key] = profile
+        save_users(users)
+        return
+
+    referrer_user = type("User", (), {
+        "id": referrer_id,
+        "username": referrer_profile.get("username") or "",
+        "full_name": referrer_profile.get("full_name") or "",
+    })()
+    referrer_profile = normalize_user_profile(referrer_user, referrer_profile)
+
+    profile["slik_balance"] = round(float(profile.get("slik_balance") or 0) + REFERRAL_REWARD_USD, 2)
+    profile["referral_reward_given"] = True
+    referrer_profile["slik_balance"] = round(float(referrer_profile.get("slik_balance") or 0) + REFERRAL_REWARD_USD, 2)
+    referrer_profile["referrals_count"] = max(1, int(referrer_profile.get("referrals_count") or 0))
+
+    users[key] = profile
+    users[referrer_key] = referrer_profile
+    save_users(users)
+
+    try:
+        await context.bot.send_message(
+            chat_id=referrer_id,
+            text=(
+                "🎉 По вашей рекомендации оформлен первый заказ.\n"
+                f"На ваш SLIK Balance начислено ${REFERRAL_REWARD_USD:.2f}\n"
+                f"Текущий баланс: ${referrer_profile['slik_balance']:.2f}"
+            ),
+        )
+    except Exception as e:
+        logger.error("Не удалось отправить уведомление рефереру %s: %s", referrer_id, e)
+
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "🎁 Добро пожаловать!\n"
+                f"На ваш SLIK Balance начислено ${REFERRAL_REWARD_USD:.2f} за участие в реферальной программе.\n"
+                f"Текущий баланс: ${profile['slik_balance']:.2f}"
+            ),
+        )
+    except Exception as e:
+        logger.error("Не удалось отправить уведомление приглашённому %s: %s", user.id, e)
 
 
 def append_order(order: dict) -> dict:
@@ -312,8 +523,16 @@ async def edit_or_send(query, context, text: str, reply_markup, parse_mode="HTML
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
+def html_escape(value) -> str:
+    return escape(str(value), quote=True)
+
+
 def user_tag(user) -> str:
     return f"@{user.username}" if user.username else "—"
+
+
+def user_tag_html(user) -> str:
+    return html_escape(user_tag(user))
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
@@ -321,12 +540,12 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
     admin_id = get_admin_chat_id()
     if not admin_id:
         return
-    text = f"👣 <b>Действие клиента</b>\n\nДействие: {action}"
+    text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
     if extra:
-        text += f"\n{extra}"
+        text += f"\n{html_escape(extra)}"
     text += (
-        f"\n\n👤 Имя: {user.full_name}\n"
-        f"📨 Username: {user_tag(user)}\n"
+        f"\n\n👤 Имя: {html_escape(user.full_name)}\n"
+        f"📨 Username: {user_tag_html(user)}\n"
         f"🆔 Telegram ID: <code>{user.id}</code>\n"
         f"🕒 Время: {now_str()}"
     )
@@ -369,6 +588,7 @@ async def send_order_list(message, orders: list, title: str):
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌍 Купить eSIM",          callback_data="buy_esim")],
+        [InlineKeyboardButton("👤 Личный кабинет",       callback_data="profile")],
         [InlineKeyboardButton("📱 Проверить устройство", url=DEVICE_CHECK_URL)],
         [InlineKeyboardButton("📖 Инструкция",           callback_data="instructions")],
         [InlineKeyboardButton("👨‍💻 Поддержка",            callback_data="support_screen")],
@@ -432,6 +652,21 @@ def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Мои заказы",       callback_data="profile_orders")],
+        [InlineKeyboardButton("👥 Пригласить друга", callback_data="profile_invite")],
+        [InlineKeyboardButton("💵 SLIK Balance",      callback_data="profile_balance")],
+        [InlineKeyboardButton("⬅️ Назад",            callback_data="back_main")],
+    ])
+
+
+def profile_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="profile")],
+    ])
+
+
 # ─── Главное меню ─────────────────────────────────────────────────────────────
 
 MAIN_MENU_TEXT = (
@@ -443,6 +678,8 @@ MAIN_MENU_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if user:
+        ensure_user_profile(user, parse_referrer_id(context))
     if update.message:
         try:
             await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
@@ -583,6 +820,106 @@ async def show_support_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     if not is_admin(query.from_user):
         await track_action(context, query.from_user, "нажал «Поддержка»")
+
+
+# ─── Личный кабинет ───────────────────────────────────────────────────────────
+
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    profile = sync_user_order_stats(user, ensure_user_profile(user))
+    text = (
+        "👤 <b>Личный кабинет</b>\n\n"
+        f"🌍 Статус: <b>{html_escape(profile.get('status', 'Traveller'))}</b>\n"
+        f"💵 SLIK Balance: <b>${float(profile.get('slik_balance') or 0):.2f}</b>\n"
+        f"📦 Заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
+        f"💰 Потрачено: <b>${float(profile.get('total_spent') or 0):.2f}</b>\n"
+        f"👥 Приглашено друзей: <b>{int(profile.get('referrals_count') or 0)}</b>"
+    )
+    await edit_or_send(query, context, text, profile_keyboard())
+
+
+def format_user_orders(orders: list) -> list[str]:
+    chunks: list[str] = []
+    current = "📦 <b>Мои заказы</b>\n\n"
+    for order in orders:
+        line = (
+            f"<b>{html_escape(order.get('number', '—'))}</b> · {html_escape(order.get('created_at', '—'))}\n"
+            f"Тариф: {html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}\n"
+            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"Статус: {html_escape(order.get('status', 'new'))}\n\n"
+        )
+        if len(current) + len(line) > 3800:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    orders = get_user_orders(query.from_user.id)
+    if not orders:
+        await edit_or_send(
+            query, context,
+            "📦 <b>Мои заказы</b>\n\nУ вас пока нет заказов.",
+            profile_back_keyboard(),
+        )
+        return
+
+    chunks = format_user_orders(orders)
+    await edit_or_send(query, context, chunks[0], profile_back_keyboard())
+    for chunk in chunks[1:]:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=chunk,
+            parse_mode="HTML",
+            reply_markup=profile_back_keyboard(),
+        )
+
+
+async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    try:
+        me = await context.bot.get_me()
+        return me.username or "BOT_USERNAME"
+    except Exception as e:
+        logger.error("Не удалось получить username бота для реферальной ссылки: %s", e)
+        return "BOT_USERNAME"
+
+
+async def show_referral_program(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    bot_username = await get_bot_username(context)
+    link = f"https://t.me/{bot_username}?start=ref_{query.from_user.id}"
+    text = (
+        "👥 <b>Реферальная программа</b>\n\n"
+        "Приглашайте друзей и получайте вознаграждение.\n\n"
+        "Ваша ссылка:\n"
+        f"<code>{html_escape(link)}</code>\n\n"
+        "Награда:\n"
+        f"• Вы получите ${REFERRAL_REWARD_USD:.0f}\n"
+        f"• Друг получит ${REFERRAL_REWARD_USD:.0f}\n\n"
+        "Начисление происходит после первой оплаченной заявки друга."
+    )
+    await edit_or_send(query, context, text, profile_back_keyboard())
+
+
+async def show_slik_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    profile = ensure_user_profile(query.from_user)
+    text = (
+        "💵 <b>SLIK Balance</b>\n\n"
+        f"Текущий баланс: <b>${float(profile.get('slik_balance') or 0):.2f}</b>\n\n"
+        "Баланс пополняется за участие в реферальной программе. "
+        "В следующих этапах здесь появится списание баланса при оплате заказов."
+    )
+    await edit_or_send(query, context, text, profile_back_keyboard())
 
 
 # ─── Диалог покупки ───────────────────────────────────────────────────────────
@@ -756,7 +1093,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING_NAME
     context.user_data["name"] = name
     await update.message.reply_text(
-        f"Отлично, <b>{name}</b>! 👋\n\nУкажите ваш Telegram для связи\n(например, @username):",
+        f"Отлично, <b>{html_escape(name)}</b>! 👋\n\nУкажите ваш Telegram для связи\n(например, @username):",
         parse_mode="HTML", reply_markup=cancel_keyboard(),
     )
     return WAITING_TELEGRAM
@@ -783,6 +1120,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "tg_handle":      tg_handle,
         "user_id":        user.id,
     })
+    record_user_order(user, order)
+    await process_referral_reward(context, user)
 
     await update.message.reply_text(
         (
@@ -823,29 +1162,76 @@ async def cancel_order_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ─── Уведомления администратору ───────────────────────────────────────────────
 
+async def send_admin_order_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_id: int,
+    text: str,
+    order_id: int,
+    max_attempts: int = 3,
+) -> bool:
+    """Отправляет уведомление о заказе админу с retry при сетевых сбоях."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id, text=text, parse_mode="HTML",
+                reply_markup=admin_order_keyboard(order_id),
+            )
+            logger.info(
+                "Админ-уведомление по заказу %s успешно отправлено в чат %s с попытки %s",
+                order_id, admin_id, attempt,
+            )
+            return True
+        except (TimedOut, NetworkError) as e:
+            logger.warning(
+                "Админ-уведомление по заказу %s не отправлено в чат %s: попытка %s/%s, причина: %s",
+                order_id, admin_id, attempt, max_attempts, e,
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(attempt)
+        except Exception as e:
+            logger.error(
+                "Админ-уведомление по заказу %s не отправлено в чат %s: причина: %s",
+                order_id, admin_id, e,
+            )
+            return False
+
+    logger.error(
+        "Админ-уведомление по заказу %s не отправлено в чат %s после %s попыток",
+        order_id, admin_id, max_attempts,
+    )
+    return False
+
+
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     admin_id = get_admin_chat_id()
+    order_number = order.get("number", "—")
+    order_id = order.get("id")
     if not admin_id:
-        logger.warning("ADMIN_CHAT_ID не задан — уведомление не отправлено")
+        logger.warning(
+            "Админ-уведомление по заказу %s не отправлено: ADMIN_CHAT_ID не задан",
+            order_number,
+        )
         return
-    payment_line = f"💳 Оплата: <b>{order.get('payment_method', '—')}</b>\n" if order.get("payment_method") else ""
+    if order_id is None:
+        logger.error(
+            "Админ-уведомление по заказу %s не отправлено: в заказе нет id",
+            order_number,
+        )
+        return
+
+    payment_method = order.get("payment_method")
+    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
     text = (
         "🔥 <b>Новый заказ</b>\n\n"
-        f"Номер заказа: <b>{order['number']}</b>\n\n"
-        f"📶 Тариф: <b>{order['gb']} / {order['days']}</b>\n"
-        f"💵 Цена: <b>{order['price']}</b>\n"
+        f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
+        f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
+        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
         f"{payment_line}\n"
-        f"👤 Имя: <b>{order['name']}</b>\n"
-        f"📨 Telegram: <b>{order['tg_handle']}</b>\n\n"
-        f"🕒 {order['created_at']}"
+        f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
+        f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
+        f"🕒 {html_escape(order.get('created_at', '—'))}"
     )
-    try:
-        await context.bot.send_message(
-            chat_id=admin_id, text=text, parse_mode="HTML",
-            reply_markup=admin_order_keyboard(order["id"]),
-        )
-    except Exception as e:
-        logger.error("Ошибка отправки уведомления: %s", e)
+    await send_admin_order_message(context, admin_id, text, order_id)
 
 
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1372,6 +1758,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_instructions(update, context)
     elif data == "support_screen":
         await show_support_screen(update, context)
+    elif data == "profile":
+        await show_profile(update, context)
+    elif data == "profile_orders":
+        await show_my_orders(update, context)
+    elif data == "profile_invite":
+        await show_referral_program(update, context)
+    elif data == "profile_balance":
+        await show_slik_balance(update, context)
     elif data == "back_main":
         await query.answer()
         await start(update, context)
