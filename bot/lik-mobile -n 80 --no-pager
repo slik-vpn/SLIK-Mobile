@@ -1,0 +1,20 @@
+[0;1;32m●[0m slik-mobile.service - SLIK Mobile Telegram Bot
+     Loaded: loaded (]8;;file://msk-1-vm-7t5n/etc/systemd/system/slik-mobile.service/etc/systemd/system/slik-mobile.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;32mactive (running)[0m since Tue 2026-06-09 16:52:08 UTC; 38s ago
+   Main PID: 4839 (python)
+      Tasks: 2 (limit: 4653)
+     Memory: 28.1M (peak: 28.5M)
+        CPU: 291ms
+     CGroup: /system.slice/slik-mobile.service
+             └─[0;38;5;245m4839 /opt/SLIK-Mobile/venv/bin/python /opt/SLIK-Mobile/bot/run_mvp.py[0m
+
+Jun 09 16:52:08 msk-1-vm-7t5n python[4839]:   purchase_conv = ConversationHandler(
+Jun 09 16:52:08 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:08,829 - bot - INFO - Бот SLIK Mobile запущен...
+Jun 09 16:52:09 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:09,007 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/getMe "HTTP/1.1 200 OK"
+Jun 09 16:52:09 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:09,071 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/setMyCommands "HTTP/1.1 200 OK"
+Jun 09 16:52:09 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:09,071 - bot - INFO - Команды зарегистрированы в Telegram
+Jun 09 16:52:09 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:09,139 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/deleteWebhook "HTTP/1.1 200 OK"
+Jun 09 16:52:09 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:09,141 - telegram.ext.Application - INFO - Application started
+Jun 09 16:52:19 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:19,313 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/getUpdates "HTTP/1.1 200 OK"
+Jun 09 16:52:29 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:29,372 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/getUpdates "HTTP/1.1 200 OK"
+Jun 09 16:52:39 msk-1-vm-7t5n python[4839]: 2026-06-09 16:52:39,427 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot8600869537:AAFkhk1uqqMVt_7Lwmri4nKW2GUrgc2rLsw/getUpdates "HTTP/1.1 200 OK"

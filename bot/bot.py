@@ -444,11 +444,22 @@ MAIN_MENU_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if update.message:
-        await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
-        await send_screen(
-            update.message, "start", MAIN_MENU_TEXT,
-            main_menu_keyboard(), local_file=BANNER_IMAGE,
-        )
+        try:
+            await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
+
+        try:
+            await send_screen(
+                update.message, "start", MAIN_MENU_TEXT,
+                main_menu_keyboard(), local_file=BANNER_IMAGE,
+            )
+        except Exception:
+            await update.message.reply_text(
+                MAIN_MENU_TEXT,
+                reply_markup=main_menu_keyboard(),
+                parse_mode="HTML",
+            )
         if not is_admin(user):
             await track_action(context, user, "открыл главное меню")
     elif update.callback_query:
@@ -1398,7 +1409,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не задана")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = Application.builder().token(token).connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).post_init(post_init).build()
 
     # ── ConversationHandler: баннеры ─────────────────────────────────────────
     banner_conv = ConversationHandler(
