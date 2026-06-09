@@ -1518,6 +1518,13 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         f"Время: {html_escape(now_str())}",
     )
 
+    effective_message = getattr(update, "effective_message", None) if update else None
+    if effective_message:
+        try:
+            await effective_message.reply_text("Произошла ошибка. Менеджер уже уведомлен, попробуйте ещё раз.")
+        except Exception:
+            logger.exception("Не удалось уведомить пользователя об ошибке")
+
 
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
 
