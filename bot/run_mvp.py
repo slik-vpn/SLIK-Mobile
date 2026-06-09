@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 _original_load_orders = bot.load_orders
 _original_save_orders = bot.save_orders
-_original_application_builder = bot.Application.builder
 
 
 def escape_html(value: Any, default: str = "-") -> str:
@@ -121,8 +120,9 @@ def format_order_list(orders: list, title: str) -> list[str]:
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
-    admin_id = bot.get_admin_chat_id()
+    admin_id = bot.get_activity_chat_id()
     if not admin_id:
+        logger.info("Activity notification skipped: ACTIVITY_CHAT_ID and ADMIN_CHAT_ID are not set")
         return
     text = f"<b>Действие клиента</b>\n\nДействие: {escape_html(action)}"
     if extra:
@@ -154,9 +154,9 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
-    admin_id = bot.get_admin_chat_id()
+    admin_id = bot.get_orders_chat_id()
     if not admin_id:
-        logger.warning("ADMIN_CHAT_ID is not set; order notification was not sent")
+        logger.warning("ORDERS_CHAT_ID and ADMIN_CHAT_ID are not set; order notification was not sent")
         return
     payment_line = f"Оплата: <b>{escape_html(order.get('payment_method'))}</b>\n" if order.get("payment_method") else ""
     text = (
@@ -169,15 +169,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         f"Telegram: <b>{escape_html(order.get('tg_handle'))}</b>\n\n"
         f"{escape_html(order.get('created_at'))}"
     )
-    try:
-        await context.bot.send_message(
-            chat_id=admin_id,
-            text=text,
-            parse_mode="HTML",
-            reply_markup=bot.admin_order_keyboard(order["id"]),
-        )
-    except Exception as exc:
-        logger.error("Order notification error: %s", exc)
+    await bot.send_admin_order_message(context, admin_id, text, order["id"])
 
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -214,7 +206,7 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
         return
     user = update.effective_user
     admin_id = bot.get_admin_chat_id()
-    if admin_id and msg.chat_id == admin_id:
+    if msg.chat_id in bot.get_configured_notification_chat_ids():
         return
     if msg.text.startswith("/") or bot.is_admin(user):
         return
@@ -255,35 +247,24 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             "Unhandled Telegram error",
             exc_info=(type(context.error), context.error, context.error.__traceback__),
         )
+        reason = escape_html(context.error)
     else:
         logger.error("Unhandled Telegram error")
+        reason = "неизвестная ошибка"
+
+    await bot.notify_system(
+        context,
+        "⚠️ <b>Системная ошибка бота</b>\n\n"
+        f"Причина: <code>{reason}</code>\n"
+        f"Время: {escape_html(bot.now_str())}",
+    )
+
     effective_message = getattr(update, "effective_message", None) if update else None
     if effective_message:
         try:
             await effective_message.reply_text("Произошла ошибка. Менеджер уже уведомлен, попробуйте ещё раз.")
         except Exception:
             logger.exception("Failed to notify user about an error")
-
-
-class ApplicationBuilderWithErrorHandler:
-    def __init__(self, builder):
-        self._builder = builder
-
-    def __getattr__(self, name: str):
-        attr = getattr(self._builder, name)
-        if not callable(attr):
-            return attr
-
-        def method(*args, **kwargs):
-            result = attr(*args, **kwargs)
-            return self if result is self._builder else result
-
-        return method
-
-    def build(self, *args, **kwargs):
-        app = self._builder.build(*args, **kwargs)
-        app.add_error_handler(global_error_handler)
-        return app
 
 
 def install_patches() -> None:
@@ -297,12 +278,7 @@ def install_patches() -> None:
     bot.notify_admin = notify_admin
     bot.handle_admin_reply = handle_admin_reply
     bot.handle_unknown_message = handle_unknown_message
-
-    def builder_with_error_handler(*args, **kwargs):
-        builder = _original_application_builder(*args, **kwargs)
-        return ApplicationBuilderWithErrorHandler(builder)
-
-    bot.Application.builder = builder_with_error_handler
+    bot.global_error_handler = global_error_handler
 
 
 def main() -> None:

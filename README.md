@@ -16,10 +16,17 @@ Telegram-бот для ручного MVP продажи eSIM. Текущая в
 ```env
 TELEGRAM_BOT_TOKEN=1234567890:replace_me
 ADMIN_CHAT_ID=-1001234567890
+ORDERS_CHAT_ID=
+ACTIVITY_CHAT_ID=
+SYSTEM_CHAT_ID=
 ```
 
 `TELEGRAM_BOT_TOKEN` берётся у `@BotFather`.
-`ADMIN_CHAT_ID` — ID админ-группы или личного чата для уведомлений.
+`ADMIN_CHAT_ID` — fallback: личный чат владельца или общий админ-чат, куда бот пишет, если отдельный чат не задан.
+`ORDERS_CHAT_ID` — отдельная группа/чат для новых заявок.
+`ACTIVITY_CHAT_ID` — отдельная группа/чат для активности пользователей (`track_action`).
+`SYSTEM_CHAT_ID` — отдельная группа/чат для системных ошибок и технических уведомлений.
+Если `ORDERS_CHAT_ID`, `ACTIVITY_CHAT_ID` или `SYSTEM_CHAT_ID` пустые, используется `ADMIN_CHAT_ID`; если не задан и fallback, бот не падает, а пропускает соответствующее уведомление с записью в лог.
 
 ## Запуск через Docker Compose
 
@@ -108,6 +115,9 @@ cp config.example.json config.json
 cp orders.example.json orders.json
 export TELEGRAM_BOT_TOKEN="1234567890:replace_me"
 export ADMIN_CHAT_ID="-1001234567890"
+export ORDERS_CHAT_ID=""
+export ACTIVITY_CHAT_ID=""
+export SYSTEM_CHAT_ID=""
 python run_mvp.py
 ```
 
@@ -121,6 +131,36 @@ python run_mvp.py
 ```
 
 Оплата картой в MVP подтверждается вручную менеджером. CryptoBot создаёт счёт и проверяет статус по кнопке клиента.
+
+## Разделение Telegram-уведомлений по чатам
+
+Бот поддерживает отдельные Telegram-чаты для разных типов уведомлений:
+
+- `ORDERS_CHAT_ID` — новые заявки. Если пусто, используется `ADMIN_CHAT_ID`.
+- `ACTIVITY_CHAT_ID` — действия пользователей: `/start`, выбор страны, тарифа, создание заявки и другие `track_action`. Если пусто, используется `ADMIN_CHAT_ID`.
+- `SYSTEM_CHAT_ID` — глобальные ошибки бота и технические уведомления. Если пусто, используется `ADMIN_CHAT_ID`.
+- `ADMIN_CHAT_ID` — fallback/личка владельца или общий админ-чат.
+
+Как создать и подключить группы:
+
+1. Создайте нужные группы в Telegram, например `SLIK Orders`, `SLIK Activity`, `SLIK System`.
+2. Добавьте бота в каждую группу. Для групп, где нужны команды, дайте боту право читать сообщения/команды.
+3. Выполните `/groupid` в личке с ботом или в нужной группе. Команда доступна только owner/admin и показывает `Chat ID` и название текущего чата.
+4. Скопируйте полученные ID в `.env` на сервере:
+
+```env
+ADMIN_CHAT_ID=353540198
+ORDERS_CHAT_ID=-1001111111111
+ACTIVITY_CHAT_ID=-1002222222222
+SYSTEM_CHAT_ID=-1003333333333
+```
+
+После изменения `.env` перезапустите сервис:
+
+```bash
+sudo systemctl restart slik-mobile
+sudo systemctl status slik-mobile
+```
 
 ## Установка на VPS через systemd
 
@@ -164,10 +204,11 @@ sudo journalctl -u slik-mobile -f
 
 1. `/start` открывает главное меню.
 2. Покупка тарифа Россия создаёт заявку.
-3. Админ-чат получает уведомление.
+3. Чат `ORDERS_CHAT_ID` получает уведомление о новой заявке или, если он не задан, уведомление приходит в `ADMIN_CHAT_ID`.
 4. Кнопки `Выдано` и `Отменено` меняют статус заказа.
-5. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
-6. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
+5. `/groupid` в личке и группе показывает ID текущего чата только owner/admin.
+6. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
+7. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
 
 ## Файлы данных
 
@@ -175,3 +216,16 @@ sudo journalctl -u slik-mobile -f
 - `bot/orders.json` при systemd-запуске или `data/orders.json` при Docker-запуске — заказы MVP.
 
 Эти файлы нужно регулярно бэкапить на VPS и не коммитить в Git.
+
+## Обновление кода на VPS после merge
+
+После merge в `main` выполните на VPS:
+
+```bash
+cd /opt/SLIK-Mobile
+git pull origin main
+sudo systemctl restart slik-mobile
+sudo systemctl status slik-mobile
+```
+
+Если сервис запущен от root-сессии без `sudo`, используйте те же команды `systemctl` без `sudo`.
