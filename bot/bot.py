@@ -6,6 +6,7 @@ import os
 import json
 import logging
 import datetime
+from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -195,12 +196,40 @@ def is_admin(user) -> bool:
     return False
 
 
-def get_admin_chat_id() -> int | None:
-    val = os.environ.get("ADMIN_CHAT_ID", "").strip()
+def get_env_chat_id(var_name: str) -> int | None:
+    val = os.environ.get(var_name, "").strip()
     try:
         return int(val) if val else None
     except ValueError:
+        logger.warning("%s должен быть числовым chat_id, текущее значение проигнорировано", var_name)
         return None
+
+
+def get_admin_chat_id() -> int | None:
+    return get_env_chat_id("ADMIN_CHAT_ID")
+
+
+def get_orders_chat_id() -> int | None:
+    return get_env_chat_id("ORDERS_CHAT_ID") or get_admin_chat_id()
+
+
+def get_activity_chat_id() -> int | None:
+    return get_env_chat_id("ACTIVITY_CHAT_ID") or get_admin_chat_id()
+
+
+def get_system_chat_id() -> int | None:
+    return get_env_chat_id("SYSTEM_CHAT_ID") or get_admin_chat_id()
+
+
+def get_configured_notification_chat_ids() -> set[int]:
+    return {
+        chat_id for chat_id in (
+            get_admin_chat_id(),
+            get_orders_chat_id(),
+            get_activity_chat_id(),
+            get_system_chat_id(),
+        ) if chat_id is not None
+    }
 
 
 # ─── CryptoBot API ────────────────────────────────────────────────────────────
@@ -312,13 +341,17 @@ async def edit_or_send(query, context, text: str, reply_markup, parse_mode="HTML
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
+def html_escape(value) -> str:
+    return escape(str(value), quote=True)
+
+
 def user_tag(user) -> str:
     return f"@{user.username}" if user.username else "—"
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
-    """Отправляет уведомление в админ-чат о действии клиента."""
-    admin_id = get_admin_chat_id()
+    """Отправляет уведомление о действии клиента."""
+    admin_id = get_activity_chat_id()
     if not admin_id:
         return
     text = f"👣 <b>Действие клиента</b>\n\nДействие: {action}"
@@ -824,9 +857,9 @@ async def cancel_order_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ─── Уведомления администратору ───────────────────────────────────────────────
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
-    admin_id = get_admin_chat_id()
+    admin_id = get_orders_chat_id()
     if not admin_id:
-        logger.warning("ADMIN_CHAT_ID не задан — уведомление не отправлено")
+        logger.warning("ORDERS_CHAT_ID и ADMIN_CHAT_ID не заданы — уведомление не отправлено")
         return
     payment_line = f"💳 Оплата: <b>{order.get('payment_method', '—')}</b>\n" if order.get("payment_method") else ""
     text = (
@@ -942,8 +975,8 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     admin_id = get_admin_chat_id()
 
-    # Игнорировать сообщения из самого админ-чата
-    if admin_id and msg.chat_id == admin_id:
+    # Игнорировать сообщения из служебных чатов уведомлений
+    if msg.chat_id in get_configured_notification_chat_ids():
         return
 
     # Игнорировать команды
@@ -1356,6 +1389,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_groupid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.effective_message.reply_text("⛔ Нет доступа.")
+        return
+
+    chat = update.effective_chat
+    title = chat.title or getattr(chat, "full_name", None) or "личный чат"
+    await update.effective_message.reply_text(
+        "🆔 <b>Информация о чате</b>\n\n"
+        f"Chat ID: <code>{chat.id}</code>\n"
+        f"Название: <b>{html_escape(title)}</b>",
+        parse_mode="HTML",
+    )
+
+
 # ─── Роутер callback ──────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1381,6 +1429,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Неизвестная команда")
 
 
+# ─── Системные уведомления ────────────────────────────────────────────────────
+
+async def notify_system(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    chat_id = get_system_chat_id()
+    if not chat_id:
+        return
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error("Ошибка отправки системного уведомления: %s", e)
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.error:
+        logger.error(
+            "Unhandled Telegram error",
+            exc_info=(type(context.error), context.error, context.error.__traceback__),
+        )
+        reason = html_escape(context.error)
+    else:
+        logger.error("Unhandled Telegram error")
+        reason = "неизвестная ошибка"
+
+    await notify_system(
+        context,
+        "⚠️ <b>Системная ошибка бота</b>\n\n"
+        f"Причина: <code>{reason}</code>\n"
+        f"Время: {html_escape(now_str())}",
+    )
+
+
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
@@ -1391,6 +1470,7 @@ async def post_init(app: Application) -> None:
         BotCommand("orders_7d",       "Заказы за 7 дней"),
         BotCommand("orders_30d",      "Заказы за 30 дней"),
         BotCommand("stats",           "Статистика продаж"),
+        BotCommand("groupid",         "ID текущего чата"),
         BotCommand("pending",         "Активные заявки"),
         BotCommand("completed",       "Выполненные заявки"),
         BotCommand("cancelled",       "Отменённые заявки"),
@@ -1456,6 +1536,7 @@ def main() -> None:
     app.add_handler(CommandHandler("orders_7d",       cmd_orders_7d))
     app.add_handler(CommandHandler("orders_30d",      cmd_orders_30d))
     app.add_handler(CommandHandler("stats",           cmd_stats))
+    app.add_handler(CommandHandler("groupid",         cmd_groupid))
     app.add_handler(CommandHandler("pending",         cmd_pending))
     app.add_handler(CommandHandler("completed",       cmd_completed))
     app.add_handler(CommandHandler("cancelled",       cmd_cancelled))
@@ -1482,6 +1563,8 @@ def main() -> None:
         filters.TEXT & ~filters.COMMAND,
         handle_unknown_message,
     ))
+
+    app.add_error_handler(global_error_handler)
 
     logger.info("Бот SLIK Mobile запущен...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

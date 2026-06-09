@@ -16,10 +16,18 @@ Telegram-бот для ручного MVP продажи eSIM. Текущая в
 ```env
 TELEGRAM_BOT_TOKEN=1234567890:replace_me
 ADMIN_CHAT_ID=-1001234567890
+ORDERS_CHAT_ID=
+ACTIVITY_CHAT_ID=
+SYSTEM_CHAT_ID=
 ```
 
 `TELEGRAM_BOT_TOKEN` берётся у `@BotFather`.
-`ADMIN_CHAT_ID` — ID админ-группы или личного чата для уведомлений.
+`ADMIN_CHAT_ID` — fallback: личный чат владельца или общий админ-чат.
+`ORDERS_CHAT_ID` — отдельный чат новых заявок; если пусто, используется `ADMIN_CHAT_ID`.
+`ACTIVITY_CHAT_ID` — отдельный чат активности пользователей; если пусто, используется `ADMIN_CHAT_ID`.
+`SYSTEM_CHAT_ID` — отдельный чат системных ошибок; если пусто, используется `ADMIN_CHAT_ID`.
+
+Чтобы получить ID группы, добавьте бота в группу и выполните `/groupid`. Команда работает в личке и группах, но отвечает только owner/admin.
 
 ## Запуск через Docker Compose
 
@@ -108,6 +116,9 @@ cp config.example.json config.json
 cp orders.example.json orders.json
 export TELEGRAM_BOT_TOKEN="1234567890:replace_me"
 export ADMIN_CHAT_ID="-1001234567890"
+export ORDERS_CHAT_ID=""
+export ACTIVITY_CHAT_ID=""
+export SYSTEM_CHAT_ID=""
 python run_mvp.py
 ```
 
@@ -164,10 +175,11 @@ sudo journalctl -u slik-mobile -f
 
 1. `/start` открывает главное меню.
 2. Покупка тарифа Россия создаёт заявку.
-3. Админ-чат получает уведомление.
-4. Кнопки `Выдано` и `Отменено` меняют статус заказа.
-5. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
-6. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
+3. `ORDERS_CHAT_ID` получает уведомление о новой заявке или, если он не задан, уведомление приходит в `ADMIN_CHAT_ID`.
+4. `/groupid` показывает ID текущего чата в личке и группе только owner/admin.
+5. Кнопки `Выдано` и `Отменено` меняют статус заказа.
+6. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
+7. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
 
 ## Файлы данных
 
