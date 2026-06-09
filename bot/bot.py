@@ -6,6 +6,8 @@ import os
 import json
 import logging
 import datetime
+import asyncio
+from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,6 +29,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import NetworkError, TimedOut
 
 # ─── Логирование ──────────────────────────────────────────────────────────────
 
@@ -312,8 +315,16 @@ async def edit_or_send(query, context, text: str, reply_markup, parse_mode="HTML
 
 # ─── Вспомогательные функции ──────────────────────────────────────────────────
 
+def html_escape(value) -> str:
+    return escape(str(value), quote=True)
+
+
 def user_tag(user) -> str:
     return f"@{user.username}" if user.username else "—"
+
+
+def user_tag_html(user) -> str:
+    return html_escape(user_tag(user))
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
@@ -321,12 +332,12 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
     admin_id = get_admin_chat_id()
     if not admin_id:
         return
-    text = f"👣 <b>Действие клиента</b>\n\nДействие: {action}"
+    text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
     if extra:
-        text += f"\n{extra}"
+        text += f"\n{html_escape(extra)}"
     text += (
-        f"\n\n👤 Имя: {user.full_name}\n"
-        f"📨 Username: {user_tag(user)}\n"
+        f"\n\n👤 Имя: {html_escape(user.full_name)}\n"
+        f"📨 Username: {user_tag_html(user)}\n"
         f"🆔 Telegram ID: <code>{user.id}</code>\n"
         f"🕒 Время: {now_str()}"
     )
@@ -756,7 +767,7 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return WAITING_NAME
     context.user_data["name"] = name
     await update.message.reply_text(
-        f"Отлично, <b>{name}</b>! 👋\n\nУкажите ваш Telegram для связи\n(например, @username):",
+        f"Отлично, <b>{html_escape(name)}</b>! 👋\n\nУкажите ваш Telegram для связи\n(например, @username):",
         parse_mode="HTML", reply_markup=cancel_keyboard(),
     )
     return WAITING_TELEGRAM
@@ -823,29 +834,76 @@ async def cancel_order_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 # ─── Уведомления администратору ───────────────────────────────────────────────
 
+async def send_admin_order_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_id: int,
+    text: str,
+    order_id: int,
+    max_attempts: int = 3,
+) -> bool:
+    """Отправляет уведомление о заказе админу с retry при сетевых сбоях."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id, text=text, parse_mode="HTML",
+                reply_markup=admin_order_keyboard(order_id),
+            )
+            logger.info(
+                "Админ-уведомление по заказу %s успешно отправлено в чат %s с попытки %s",
+                order_id, admin_id, attempt,
+            )
+            return True
+        except (TimedOut, NetworkError) as e:
+            logger.warning(
+                "Админ-уведомление по заказу %s не отправлено в чат %s: попытка %s/%s, причина: %s",
+                order_id, admin_id, attempt, max_attempts, e,
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(attempt)
+        except Exception as e:
+            logger.error(
+                "Админ-уведомление по заказу %s не отправлено в чат %s: причина: %s",
+                order_id, admin_id, e,
+            )
+            return False
+
+    logger.error(
+        "Админ-уведомление по заказу %s не отправлено в чат %s после %s попыток",
+        order_id, admin_id, max_attempts,
+    )
+    return False
+
+
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     admin_id = get_admin_chat_id()
+    order_number = order.get("number", "—")
+    order_id = order.get("id")
     if not admin_id:
-        logger.warning("ADMIN_CHAT_ID не задан — уведомление не отправлено")
+        logger.warning(
+            "Админ-уведомление по заказу %s не отправлено: ADMIN_CHAT_ID не задан",
+            order_number,
+        )
         return
-    payment_line = f"💳 Оплата: <b>{order.get('payment_method', '—')}</b>\n" if order.get("payment_method") else ""
+    if order_id is None:
+        logger.error(
+            "Админ-уведомление по заказу %s не отправлено: в заказе нет id",
+            order_number,
+        )
+        return
+
+    payment_method = order.get("payment_method")
+    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
     text = (
         "🔥 <b>Новый заказ</b>\n\n"
-        f"Номер заказа: <b>{order['number']}</b>\n\n"
-        f"📶 Тариф: <b>{order['gb']} / {order['days']}</b>\n"
-        f"💵 Цена: <b>{order['price']}</b>\n"
+        f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
+        f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
+        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
         f"{payment_line}\n"
-        f"👤 Имя: <b>{order['name']}</b>\n"
-        f"📨 Telegram: <b>{order['tg_handle']}</b>\n\n"
-        f"🕒 {order['created_at']}"
+        f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
+        f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
+        f"🕒 {html_escape(order.get('created_at', '—'))}"
     )
-    try:
-        await context.bot.send_message(
-            chat_id=admin_id, text=text, parse_mode="HTML",
-            reply_markup=admin_order_keyboard(order["id"]),
-        )
-    except Exception as e:
-        logger.error("Ошибка отправки уведомления: %s", e)
+    await send_admin_order_message(context, admin_id, text, order_id)
 
 
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
