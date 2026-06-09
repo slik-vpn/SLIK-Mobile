@@ -1,0 +1,43 @@
+[
+  {
+    "plan_key": "plan_1gb",
+    "gb": "1 GB",
+    "price": "$3",
+    "days": "30 дней",
+    "name": "Антон",
+    "tg_handle": "@big_zzz",
+    "user_id": 7237385621,
+    "username": "@slik_place",
+    "id": 1,
+    "created_at": "05.06.2026 02:22"
+  },
+  {
+    "gb": "10 GB",
+    "days": "30 дней",
+    "price": "$12.5",
+    "plan_key": "plan_10gb",
+    "name": "Oleg",
+    "tg_handle": "Used",
+    "user_id": 353540198,
+    "username": "@big_zzz",
+    "id": 2,
+    "number": "#0002",
+    "status": "done",
+    "created_at": "05.06.2026 02:31",
+    "created_date": "2026-06-05"
+  },
+  {
+    "gb": "10 GB",
+    "days": "30 дней",
+    "price": "$12.5",
+    "plan_key": "plan_10gb",
+    "name": "Jjj",
+    "tg_handle": "John",
+    "user_id": 7237385621,
+    "id": 3,
+    "number": "#0003",
+    "status": "done",
+    "created_at": "05.06.2026 07:45",
+    "created_date": "2026-06-05"
+  }
+]
