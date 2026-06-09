@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime
 import html
 import logging
-from copy import deepcopy
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -251,7 +250,13 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled Telegram error", exc_info=context.error)
+    if context.error:
+        logger.error(
+            "Unhandled Telegram error",
+            exc_info=(type(context.error), context.error, context.error.__traceback__),
+        )
+    else:
+        logger.error("Unhandled Telegram error")
     effective_message = getattr(update, "effective_message", None) if update else None
     if effective_message:
         try:
