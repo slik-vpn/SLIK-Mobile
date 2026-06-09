@@ -1,0 +1,21 @@
+[Unit]
+Description=SLIK Mobile Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=slik-mobile
+Group=slik-mobile
+WorkingDirectory=/opt/slik-mobile/bot
+EnvironmentFile=/opt/slik-mobile/.env
+ExecStart=/opt/slik-mobile/.venv/bin/python /opt/slik-mobile/bot/run_mvp.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/slik-mobile/bot
+
+[Install]
+WantedBy=multi-user.target

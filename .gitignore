@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Runtime configuration and data
+.env
+bot/.env
+bot/config.json
+bot/orders.json
+bot/*.log
+
+# Local tooling
+.DS_Store
+.idea/
+.vscode/
+
+# Deployment scratch
+*.bak
+*.tmp

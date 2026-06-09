@@ -1,0 +1,9 @@
+{
+  "banners": {},
+  "admins": [],
+  "relay": {},
+  "payment": {
+    "card": "",
+    "cryptobot_token": ""
+  }
+}
