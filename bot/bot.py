@@ -81,13 +81,22 @@ RUSSIA_PLANS = [
 ]
 PLAN_MAP = {p[3]: {"gb": p[0], "days": p[1], "price": p[2]} for p in RUSSIA_PLANS}
 
-REFERRAL_REWARD_USD = 1.0
+FRIEND_REFERRAL_REWARD_USD = 1.0
 STATUS_LEVELS = [
-    (100.0, "VIP"),
-    (50.0, "Pro"),
-    (10.0, "Explorer"),
-    (0.0, "Traveller"),
+    (1000.0, "Ambassador", "👑", 10.0),
+    (300.0, "Premium", "💎", 5.0),
+    (150.0, "Nomad", "🌎", 3.0),
+    (50.0, "Explorer", "✈️", 2.0),
+    (0.0, "Traveller", "🧳", 1.0),
 ]
+STATUS_META = {
+    status: {"threshold": threshold, "icon": icon, "referral_reward": reward}
+    for threshold, status, icon, reward in STATUS_LEVELS
+}
+STATUS_ORDER = {
+    status: index
+    for index, (_, status, _, _) in enumerate(reversed(STATUS_LEVELS))
+}
 
 # ─── Состояния диалога ────────────────────────────────────────────────────────
 
@@ -204,10 +213,32 @@ def format_usd(value) -> str:
 
 
 def calculate_user_status(total_spent: float) -> str:
-    for threshold, status in STATUS_LEVELS:
+    for threshold, status, _icon, _reward in STATUS_LEVELS:
         if total_spent >= threshold:
             return status
     return "Traveller"
+
+
+def status_icon(status: str) -> str:
+    return STATUS_META.get(status, STATUS_META["Traveller"])["icon"]
+
+
+def format_status(status: str) -> str:
+    actual_status = status if status in STATUS_META else "Traveller"
+    return f"{status_icon(actual_status)} {actual_status}"
+
+
+def referral_reward_for_status(status: str) -> float:
+    return STATUS_META.get(status, STATUS_META["Traveller"])["referral_reward"]
+
+
+def referral_reward_for_profile(profile: dict) -> float:
+    status = calculate_user_status(float(profile.get("total_spent") or 0))
+    return referral_reward_for_status(status)
+
+
+def status_rank(status: str) -> int:
+    return STATUS_ORDER.get(status, STATUS_ORDER["Traveller"])
 
 
 def referral_entry_user_id(entry) -> str | None:
@@ -221,11 +252,19 @@ def referral_entry_user_id(entry) -> str | None:
 def ensure_referral_entry(referrer_profile: dict, referred_user) -> None:
     referrals = referrer_profile.setdefault("referrals", [])
     referred_key = str(referred_user.id)
-    for entry in referrals:
+    for index, entry in enumerate(referrals):
         if referral_entry_user_id(entry) == referred_key:
             if isinstance(entry, dict):
                 entry["username"] = referred_user.username or entry.get("username", "")
                 entry["full_name"] = referred_user.full_name or entry.get("full_name", "")
+            else:
+                referrals[index] = {
+                    "user_id": referred_user.id,
+                    "username": referred_user.username or "",
+                    "full_name": referred_user.full_name or "",
+                    "joined_at": now_str(),
+                    "bonus_awarded": False,
+                }
             return
     referrals.append({
         "user_id": referred_user.id,
@@ -287,11 +326,15 @@ def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict
     if not isinstance(referrer_profile, dict):
         return False
 
-    credit_slik_balance(profile, REFERRAL_REWARD_USD)
-    credit_slik_balance(referrer_profile, REFERRAL_REWARD_USD)
+    referrer_profile = update_profile_stats_from_orders(int(referrer_id), referrer_profile)
+    referrer_reward = referral_reward_for_profile(referrer_profile)
+    credit_slik_balance(profile, FRIEND_REFERRAL_REWARD_USD)
+    credit_slik_balance(referrer_profile, referrer_reward)
     profile["referral_bonus_awarded"] = True
     profile["referral_bonus_order"] = order.get("number")
     profile["referral_bonus_awarded_at"] = now_str()
+    profile["referral_bonus_amount"] = FRIEND_REFERRAL_REWARD_USD
+    profile["referrer_bonus_amount"] = referrer_reward
 
     ensure_referral_entry(referrer_profile, user)
     for entry in referrer_profile.get("referrals", []):
@@ -299,6 +342,8 @@ def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict
             entry["bonus_awarded"] = True
             entry["first_order_number"] = order.get("number")
             entry["bonus_awarded_at"] = profile["referral_bonus_awarded_at"]
+            entry["bonus_amount"] = referrer_reward
+            entry["friend_bonus_amount"] = FRIEND_REFERRAL_REWARD_USD
             break
 
     users[referrer_key] = referrer_profile
@@ -340,7 +385,7 @@ def ensure_user_profile(user) -> dict:
     return profile
 
 
-def record_user_order(user, order: dict) -> None:
+def record_user_order(user, order: dict) -> tuple[dict, str, str]:
     users = load_users()
     key = str(user.id)
     profile = users.get(key) if isinstance(users.get(key), dict) else default_user_profile(user)
@@ -351,10 +396,29 @@ def record_user_order(user, order: dict) -> None:
     profile.setdefault("referrals", [])
     profile.setdefault("referrer", None)
     profile.setdefault("referral_bonus_awarded", False)
-    profile = update_profile_stats_from_orders(user.id, profile)
+
+    all_user_orders = get_user_orders(user.id)
+    current_order_id = order.get("id")
+    previous_orders = [
+        user_order for user_order in all_user_orders
+        if user_order.get("id") != current_order_id
+    ]
+    previous_total = round(
+        sum(
+            parse_price(user_order.get("price", "0"))
+            for user_order in previous_orders
+            if user_order.get("status") != "cancelled"
+        ),
+        2,
+    )
+    previous_status = calculate_user_status(previous_total)
+
+    profile = update_profile_stats_from_orders(user.id, profile, all_user_orders)
+    current_status = profile.get("status", "Traveller")
     award_referral_bonus_if_needed(users, profile, user, order)
     users[key] = profile
     save_users(users)
+    return profile, previous_status, current_status
 
 
 def get_user_orders(user_id: int) -> list:
@@ -863,7 +927,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "👤 <b>Личный кабинет</b>\n\n"
         f"Имя: <b>{html_escape(profile.get('full_name') or user.full_name or '—')}</b>\n"
         f"Telegram ID: <code>{user.id}</code>\n"
-        f"Статус: <b>{html_escape(profile.get('status', 'Traveller'))}</b>\n"
+        f"Статус: <b>{html_escape(format_status(profile.get('status', 'Traveller')))}</b>\n"
         f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
         f"Сумма покупок: <b>{format_usd(profile.get('total_spent'))}</b>\n"
         f"SLIK Balance: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
@@ -924,13 +988,18 @@ async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
 async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
+    status = profile.get("status", "Traveller")
+    referral_reward = referral_reward_for_profile(profile)
     username = await get_bot_username(context)
     referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
     text = (
         "👥 <b>Пригласить друга</b>\n\n"
-        "Поделитесь ссылкой с другом. После его первой заявки вы оба получите "
-        f"<b>{format_usd(REFERRAL_REWARD_USD)}</b> на SLIK Balance.\n\n"
-        f"Ваша реферальная ссылка:\n<code>{html_escape(referral_link)}</code>"
+        f"Ваш статус: <b>{html_escape(format_status(status))}</b>\n\n"
+        "За первую заявку друга:\n"
+        f"Вы получите: <b>{format_usd(referral_reward)}</b>\n"
+        f"Друг получит: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>\n\n"
+        f"Ваша ссылка:\n<code>{html_escape(referral_link)}</code>"
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
 
@@ -945,12 +1014,16 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
         1 for entry in referrals
         if isinstance(entry, dict) and entry.get("bonus_awarded")
     )
+    status = profile.get("status", "Traveller")
+    referral_reward = referral_reward_for_profile(profile)
     text = (
         "🎁 <b>SLIK Balance</b>\n\n"
         f"Баланс: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        f"Статус: <b>{html_escape(format_status(status))}</b>\n"
+        f"Ваш бонус за приглашённого друга: <b>{format_usd(referral_reward)}</b>\n"
         f"Приглашено друзей: <b>{referrals_count}</b>\n"
-        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
-        f"Бонус за первую заявку друга: <b>{format_usd(REFERRAL_REWARD_USD)}</b> вам и другу."
+        f"Бонус уже принесли друзей: <b>{awarded_count}</b>\n\n"
+        f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
 
@@ -1132,6 +1205,22 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAITING_TELEGRAM
 
 
+async def notify_status_upgrade(context: ContextTypes.DEFAULT_TYPE, user_id: int, status: str) -> None:
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎉 <b>Ваш статус повышен!</b>\n\n"
+                f"Новый статус: <b>{html_escape(format_status(status))}</b>\n\n"
+                f"Теперь вы получаете <b>{format_usd(referral_reward_for_status(status))}</b> "
+                "за приглашённого друга."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить о повышении статуса: %s", e)
+
+
 async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     tg_handle = update.message.text.strip()
     if not tg_handle:
@@ -1153,7 +1242,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "tg_handle":      tg_handle,
         "user_id":        user.id,
     })
-    record_user_order(user, order)
+    _profile, previous_status, current_status = record_user_order(user, order)
 
     await update.message.reply_text(
         (
@@ -1171,6 +1260,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             [InlineKeyboardButton("🏠 Главное меню",        callback_data="back_main")],
         ]),
     )
+    if status_rank(current_status) > status_rank(previous_status):
+        await notify_status_upgrade(context, user.id, current_status)
     await notify_admin(context, order)
     if not is_admin(user):
         await track_action(context, user, "создал заявку",
