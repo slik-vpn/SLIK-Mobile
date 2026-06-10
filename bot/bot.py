@@ -8,6 +8,8 @@ import logging
 import datetime
 import asyncio
 import zipfile
+import math
+import re
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -56,6 +58,10 @@ CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
+
+USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
+CARD_PAYMENT_MARKUP_PERCENT = 1.5
+CARD_RATE_LOCK_SECONDS = 5 * 60
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
@@ -245,6 +251,178 @@ def format_usd_cents(value) -> str:
     except (TypeError, ValueError):
         amount = 0.0
     return f"${amount:.2f}"
+
+
+def format_rub(amount) -> str:
+    try:
+        rub = int(amount)
+    except (TypeError, ValueError):
+        rub = 0
+    return f"{rub:,}".replace(",", " ") + " ₽"
+
+
+def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=TZ)
+    return parsed
+
+
+def rate_lock_now() -> datetime.datetime:
+    return datetime.datetime.now(tz=TZ)
+
+
+def is_card_payment_lock_active(lock: dict | None) -> bool:
+    if not isinstance(lock, dict):
+        return False
+    locked_until = parse_iso_datetime(lock.get("rate_locked_until"))
+    return bool(locked_until and locked_until > rate_lock_now())
+
+
+def extract_rate_from_text(text: str) -> float | None:
+    candidates = []
+    for raw in re.findall(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,6})?)(?!\d)", text):
+        try:
+            value = float(raw.replace(",", "."))
+        except ValueError:
+            continue
+        if 30 <= value <= 200:
+            candidates.append(value)
+    return candidates[0] if candidates else None
+
+
+def normalize_rate(value) -> float | None:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return rate if 30 <= rate <= 200 else None
+
+
+async def fetch_yandex_usd_rub_rate(client: httpx.AsyncClient) -> float | None:
+    urls = [
+        "https://yandex.ru/finance/currencies/usd-rub",
+        "https://yandex.ru/search/?text=курс%20доллара%20к%20рублю",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 SLIK-Mobile/1.0"}
+    for url in urls:
+        response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            continue
+        rate = extract_rate_from_text(response.text)
+        if rate:
+            return rate
+    return None
+
+
+async def fetch_cbr_usd_rub_rate(client: httpx.AsyncClient) -> float | None:
+    response = await client.get("https://www.cbr-xml-daily.ru/daily_json.js")
+    response.raise_for_status()
+    data = response.json()
+    usd = data.get("Valute", {}).get("USD", {})
+    value = normalize_rate(usd.get("Value"))
+    nominal = normalize_rate(usd.get("Nominal")) or 1
+    return value / nominal if value else None
+
+
+async def fetch_open_er_usd_rub_rate(client: httpx.AsyncClient) -> float | None:
+    response = await client.get("https://open.er-api.com/v6/latest/USD")
+    response.raise_for_status()
+    data = response.json()
+    if data.get("result") not in {None, "success"}:
+        return None
+    return normalize_rate(data.get("rates", {}).get("RUB"))
+
+
+async def fetch_exchangerate_host_usd_rub_rate(client: httpx.AsyncClient) -> float | None:
+    response = await client.get(
+        "https://api.exchangerate.host/latest",
+        params={"base": "USD", "symbols": "RUB"},
+    )
+    response.raise_for_status()
+    data = response.json()
+    if data.get("success") is False:
+        return None
+    return normalize_rate(data.get("rates", {}).get("RUB"))
+
+
+async def get_usd_rub_rate() -> tuple[float, str]:
+    providers = [
+        ("Яндекс", fetch_yandex_usd_rub_rate),
+        ("ЦБ РФ", fetch_cbr_usd_rub_rate),
+        ("open.er-api.com", fetch_open_er_usd_rub_rate),
+        ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
+    ]
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        for source, provider in providers:
+            try:
+                rate = await provider(client)
+                if rate:
+                    return round(rate, 4), source
+            except Exception as e:
+                logger.warning("Не удалось получить USD/RUB из %s: %s", source, e)
+    logger.warning(
+        "Не удалось получить USD/RUB из внешних источников; используется fallback %.2f",
+        USD_RUB_FALLBACK_RATE,
+    )
+    return USD_RUB_FALLBACK_RATE, "USD_RUB_FALLBACK_RATE"
+
+
+async def create_card_payment_lock(plan: dict) -> dict:
+    usd_price = parse_price(plan.get("price", "0"))
+    rate, source = await get_usd_rub_rate()
+    rub_amount = math.ceil(usd_price * rate * (1 + CARD_PAYMENT_MARKUP_PERCENT / 100))
+    locked_until = rate_lock_now() + datetime.timedelta(seconds=CARD_RATE_LOCK_SECONDS)
+    return {
+        "usd_price": usd_price,
+        "usd_rub_rate": round(rate, 2),
+        "rate_source": source,
+        "markup_percent": CARD_PAYMENT_MARKUP_PERCENT,
+        "rub_amount": rub_amount,
+        "rate_locked_until": locked_until.isoformat(timespec="seconds"),
+    }
+
+
+def build_card_payment_text(plan: dict, card: str, lock: dict) -> str:
+    card_text = f"<code>{html_escape(card)}</code>" if card else "Реквизиты карты уточните у менеджера"
+    return (
+        "💳 <b>Перевод на карту</b>\n"
+        f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
+        "К оплате:\n"
+        f"<b>{format_rub(lock.get('rub_amount'))}</b>\n"
+        "Сумма зафиксирована на 5 минут.\n"
+        "Карта:\n"
+        f"{card_text}\n"
+        "Переведите сумму и нажмите «Я оплатил»."
+    )
+
+
+def card_payment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Я оплатил",       callback_data="payment_done")],
+        [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+    ])
+
+
+def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    if context.user_data.get("payment_method") != "Карта":
+        return None
+    lock = context.user_data.get("card_payment_lock")
+    if not isinstance(lock, dict):
+        return None
+    return {
+        "usd_price": lock.get("usd_price"),
+        "usd_rub_rate": lock.get("usd_rub_rate"),
+        "rate_source": lock.get("rate_source"),
+        "markup_percent": lock.get("markup_percent"),
+        "rub_amount": lock.get("rub_amount"),
+        "rate_locked_until": lock.get("rate_locked_until"),
+    }
 
 
 def calculate_user_status(total_spent: float) -> str:
@@ -1386,6 +1564,28 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return WAITING_PAYMENT
 
     elif data == "payment_done":
+        if context.user_data.get("payment_method") == "Карта" and not is_card_payment_lock_active(
+            context.user_data.get("card_payment_lock")
+        ):
+            cfg = load_config()
+            card = cfg["payment"].get("card", "")
+            new_lock = await create_card_payment_lock(plan)
+            context.user_data["card_payment_lock"] = new_lock
+            await query.message.reply_text(
+                "⏳ <b>Время действия суммы истекло</b>\n"
+                "Курс изменился, поэтому сумма к оплате пересчитана.\n"
+                "Новая сумма к оплате:\n"
+                f"<b>{format_rub(new_lock.get('rub_amount'))}</b>\n"
+                "Переведите новую сумму и нажмите «Я оплатил».",
+                parse_mode="HTML",
+            )
+            await query.message.reply_text(
+                build_card_payment_text(plan, card, new_lock),
+                parse_mode="HTML",
+                reply_markup=card_payment_keyboard(),
+            )
+            return WAITING_PAYMENT
+
         await query.message.reply_text(
             "📝 <b>Оформление заявки</b>\n\nКак вас зовут?",
             parse_mode="HTML", reply_markup=cancel_keyboard(),
@@ -1396,17 +1596,12 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cfg = load_config()
         card = cfg["payment"].get("card", "")
         context.user_data["payment_method"] = "Карта"
-        card_text = f"<code>{card}</code>" if card else "Реквизиты карты уточните у менеджера"
+        lock = await create_card_payment_lock(plan)
+        context.user_data["card_payment_lock"] = lock
         await query.message.reply_text(
-            f"💳 <b>Перевод на карту</b>\n\n"
-            f"Сумма: <b>{plan.get('price', '—')}</b>\n\n"
-            f"Карта: {card_text}\n\n"
-            "Переведите сумму и нажмите «Я оплатил».",
+            build_card_payment_text(plan, card, lock),
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Я оплатил",       callback_data="payment_done")],
-                [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
-            ]),
+            reply_markup=card_payment_keyboard(),
         )
         return WAITING_PAYMENT
 
@@ -1522,7 +1717,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     name    = context.user_data["name"]
     payment = context.user_data.get("payment_method", "—")
 
-    order = append_order({
+    order_payload = {
         "gb":             plan["gb"],
         "days":           plan["days"],
         "price":          plan["price"],
@@ -1532,7 +1727,11 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "name":           name,
         "tg_handle":      tg_handle,
         "user_id":        user.id,
-    })
+    }
+    payment_details = order_payment_details_from_context(context)
+    if payment_details:
+        order_payload["payment_details"] = payment_details
+    order = append_order(order_payload)
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
     await update.message.reply_text(
@@ -1637,12 +1836,24 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
 
     payment_method = order.get("payment_method")
     payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
+    payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
+    payment_details_line = ""
+    if payment_method == "Карта" and payment_details:
+        rate_text = f"{float(payment_details.get('usd_rub_rate') or 0):.2f}"
+        markup_text = f"{float(payment_details.get('markup_percent') or 0):g}"
+        payment_details_line = (
+            f"Источник курса: <b>{html_escape(payment_details.get('rate_source', '—'))}</b>\n"
+            f"Курс: <b>{html_escape(rate_text)} ₽</b>\n"
+            f"Комиссия: <b>{html_escape(markup_text)}%</b>\n"
+            f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
+        )
     text = (
         "🔥 <b>Новый заказ</b>\n\n"
         f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
         f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
         f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
-        f"{payment_line}\n"
+        f"{payment_line}"
+        f"{payment_details_line}\n"
         f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
         f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
         f"🕒 {html_escape(order.get('created_at', '—'))}"
