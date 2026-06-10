@@ -1,6 +1,7 @@
 {
   "banners": {},
   "admins": [],
+  "managers": [],
   "relay": {},
   "payment": {
     "card": "",
