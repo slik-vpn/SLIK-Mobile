@@ -7,6 +7,7 @@ import json
 import logging
 import datetime
 import asyncio
+import zipfile
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,6 +56,17 @@ CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+BACKUPS_DIR = PROJECT_ROOT / "backups"
+BACKUP_INTERVAL_SECONDS = 5 * 60 * 60
+BACKUP_FIRST_RUN_SECONDS = 60
+BACKUP_KEEP_LIMIT = 50
+BACKUP_FILES = [
+    (USERS_FILE, "bot/users.json", "users.json"),
+    (ORDERS_FILE, "bot/orders.json", "orders.json"),
+    (CONFIG_FILE, "bot/config.json", "config.json"),
+]
 
 # Экраны с баннерами
 BANNER_SCREENS = {
@@ -600,6 +612,137 @@ def get_admin_chat_id() -> int | None:
         return int(val) if val else None
     except ValueError:
         return None
+
+
+# ─── Резервные копии runtime-данных ──────────────────────────────────────────
+
+def list_backup_archives() -> list[Path]:
+    if not BACKUPS_DIR.exists():
+        return []
+    return sorted(
+        BACKUPS_DIR.glob("backup_*.zip"),
+        key=lambda path: (path.stat().st_mtime, path.name),
+        reverse=True,
+    )
+
+
+def cleanup_old_backups(keep_limit: int = BACKUP_KEEP_LIMIT) -> list[Path]:
+    archives = list_backup_archives()
+    old_archives = archives[keep_limit:]
+    deleted = []
+    for archive in old_archives:
+        try:
+            archive.unlink()
+            deleted.append(archive)
+            logger.info("Удалён старый бэкап: %s", archive)
+        except Exception:
+            logger.exception("Не удалось удалить старый бэкап: %s", archive)
+    return deleted
+
+
+def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
+    created_at = created_at or datetime.datetime.now(tz=TZ)
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = BACKUPS_DIR / f"backup_{created_at.strftime('%Y-%m-%d_%H-%M')}.zip"
+    included: list[str] = []
+    skipped: list[str] = []
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for source_path, archive_name, display_name in BACKUP_FILES:
+            if source_path.exists():
+                zip_file.write(source_path, arcname=archive_name)
+                included.append(display_name)
+            else:
+                skipped.append(display_name)
+                logger.warning("Файл для бэкапа отсутствует и пропущен: %s", source_path)
+
+    cleanup_old_backups()
+    logger.info("Создан бэкап runtime-данных: %s", archive_path)
+    return {
+        "path": archive_path,
+        "created_at": created_at,
+        "included": included,
+        "skipped": skipped,
+    }
+
+
+def format_backup_caption(backup_info: dict) -> str:
+    created_at = backup_info["created_at"].strftime("%d.%m.%Y %H:%M")
+    included = backup_info.get("included") or []
+    skipped = backup_info.get("skipped") or []
+    included_text = "\n".join(f"• {name}" for name in included) or "• —"
+    text = (
+        "💾 Автоматический бэкап SLIK Mobile\n\n"
+        "Дата:\n"
+        f"{created_at}\n\n"
+        "В архиве:\n"
+        f"{included_text}"
+    )
+    if skipped:
+        skipped_text = "\n".join(f"• {name}" for name in skipped)
+        text += f"\n\nПропущено:\n{skipped_text}"
+    return text
+
+
+async def send_backup_archive(bot, chat_id: int, backup_info: dict) -> None:
+    with backup_info["path"].open("rb") as archive_file:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=archive_file,
+            filename=backup_info["path"].name,
+            caption=format_backup_caption(backup_info),
+        )
+
+
+async def automatic_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        backup_info = create_backup_archive()
+        admin_id = get_admin_chat_id()
+        if not admin_id:
+            logger.warning("ADMIN_CHAT_ID не задан; автоматический бэкап сохранён локально: %s", backup_info["path"])
+            return
+        await send_backup_archive(context.bot, admin_id, backup_info)
+    except Exception:
+        logger.exception("Ошибка автоматического бэкапа SLIK Mobile")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        return
+    try:
+        backup_info = create_backup_archive()
+        await send_backup_archive(context.bot, update.effective_chat.id, backup_info)
+        await update.message.reply_text("Бэкап создан и отправлен.")
+    except Exception:
+        logger.exception("Не удалось создать или отправить ручной бэкап")
+        await update.message.reply_text("Не удалось создать бэкап. Ошибка записана в лог.")
+
+
+async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        return
+    archives = list_backup_archives()[:10]
+    if not archives:
+        await update.message.reply_text("💾 Последние бэкапы:\n\nПока нет архивов.")
+        return
+    lines = ["💾 Последние бэкапы:", ""]
+    lines.extend(f"{index}. {archive.name}" for index, archive in enumerate(archives, start=1))
+    await update.message.reply_text("\n".join(lines))
+
+
+def schedule_automatic_backups(app: Application) -> None:
+    if not app.job_queue:
+        logger.warning("JobQueue недоступен; автоматические бэкапы не запущены")
+        return
+    app.job_queue.run_repeating(
+        automatic_backup_job,
+        interval=BACKUP_INTERVAL_SECONDS,
+        first=BACKUP_FIRST_RUN_SECONDS,
+        name="automatic_runtime_backup",
+    )
+    logger.info("Автоматические бэкапы запланированы: первый запуск через %s секунд, далее каждые %s секунд", BACKUP_FIRST_RUN_SECONDS, BACKUP_INTERVAL_SECONDS)
 
 
 # ─── CryptoBot API ────────────────────────────────────────────────────────────
@@ -2002,6 +2145,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/payment_details — реквизиты\n"
         "/setpayment card <i>номер</i>\n"
         "/setpayment crypto <i>ссылка</i>\n\n"
+        "<b>Бэкапы:</b>\n"
+        "/backup — создать и отправить ZIP сейчас\n"
+        "/backups — последние 10 архивов\n\n"
         "/start — главное меню\n"
         "/help — эта справка\n\n"
         "─────────────────\n"
@@ -2064,8 +2210,11 @@ async def post_init(app: Application) -> None:
         BotCommand("admins",          "Управление администраторами"),
         BotCommand("banners",         "Управление баннерами"),
         BotCommand("payment_details", "Реквизиты оплаты"),
+        BotCommand("backup",          "Создать резервную копию"),
+        BotCommand("backups",         "Последние резервные копии"),
         BotCommand("help",            "Справка администратора"),
     ])
+    schedule_automatic_backups(app)
     logger.info("Команды зарегистрированы в Telegram")
 
 
@@ -2133,6 +2282,8 @@ def main() -> None:
     app.add_handler(CommandHandler("delbanner",       cmd_delbanner))
     app.add_handler(CommandHandler("payment_details", cmd_payment_details))
     app.add_handler(CommandHandler("setpayment",      cmd_setpayment))
+    app.add_handler(CommandHandler("backup",          cmd_backup))
+    app.add_handler(CommandHandler("backups",         cmd_backups))
     app.add_handler(CommandHandler("help",            cmd_help))
 
     # ── Навигационные callback'и ──────────────────────────────────────────────

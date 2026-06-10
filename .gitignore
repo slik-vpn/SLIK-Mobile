@@ -13,6 +13,7 @@ bot/orders.json
 bot/users.json
 bot/*.log
 data/
+backups/
 
 # Local tooling
 .DS_Store
