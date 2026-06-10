@@ -83,19 +83,34 @@ PLAN_MAP = {p[3]: {"gb": p[0], "days": p[1], "price": p[2]} for p in RUSSIA_PLAN
 
 FRIEND_REFERRAL_REWARD_USD = 1.0
 STATUS_LEVELS = [
-    (1000.0, "Ambassador", "👑", 10.0),
-    (300.0, "Premium", "💎", 5.0),
-    (150.0, "Nomad", "🌎", 3.0),
-    (50.0, "Explorer", "✈️", 2.0),
-    (0.0, "Traveller", "🧳", 1.0),
+    (1000.0, "Ambassador", "👑", 10.0, 7),
+    (300.0, "Premium", "💎", 5.0, 5),
+    (150.0, "Nomad", "🌎", 3.0, 3),
+    (50.0, "Explorer", "✈️", 2.0, 2),
+    (0.0, "Traveller", "🧳", 1.0, 1),
 ]
 STATUS_META = {
-    status: {"threshold": threshold, "icon": icon, "referral_reward": reward}
-    for threshold, status, icon, reward in STATUS_LEVELS
+    status: {
+        "threshold": threshold,
+        "icon": icon,
+        "referral_reward": reward,
+        "cashback_percent": cashback_percent,
+    }
+    for threshold, status, icon, reward, cashback_percent in STATUS_LEVELS
 }
 STATUS_ORDER = {
     status: index
-    for index, (_, status, _, _) in enumerate(reversed(STATUS_LEVELS))
+    for index, (_, status, _, _, _) in enumerate(reversed(STATUS_LEVELS))
+}
+STATUS_LEVELS_ASC = list(reversed(STATUS_LEVELS))
+ORDER_STATUS_LABELS = {
+    "new": "Новый",
+    "processing": "В работе",
+    "in_progress": "В работе",
+    "done": "Выдан",
+    "completed": "Выдан",
+    "cancelled": "Отменён",
+    "canceled": "Отменён",
 }
 
 # ─── Состояния диалога ────────────────────────────────────────────────────────
@@ -212,8 +227,16 @@ def format_usd(value) -> str:
     return f"${amount:g}"
 
 
+def format_usd_cents(value) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"${amount:.2f}"
+
+
 def calculate_user_status(total_spent: float) -> str:
-    for threshold, status, _icon, _reward in STATUS_LEVELS:
+    for threshold, status, _icon, _reward, _cashback_percent in STATUS_LEVELS:
         if total_spent >= threshold:
             return status
     return "Traveller"
@@ -235,6 +258,34 @@ def referral_reward_for_status(status: str) -> float:
 def referral_reward_for_profile(profile: dict) -> float:
     status = calculate_user_status(float(profile.get("total_spent") or 0))
     return referral_reward_for_status(status)
+
+
+def cashback_percent_for_status(status: str) -> int:
+    return int(STATUS_META.get(status, STATUS_META["Traveller"])["cashback_percent"])
+
+
+def cashback_percent_for_profile(profile: dict) -> int:
+    status = calculate_user_status(float(profile.get("total_spent") or 0))
+    return cashback_percent_for_status(status)
+
+
+def next_status_progress(total_spent: float) -> tuple[str, float] | None:
+    for threshold, status, _icon, _reward, _cashback_percent in STATUS_LEVELS_ASC:
+        if total_spent < threshold:
+            return status, round(threshold - total_spent, 2)
+    return None
+
+
+def order_status_label(status: str) -> str:
+    return ORDER_STATUS_LABELS.get(str(status or "new"), str(status or "new"))
+
+
+def order_sort_key(order: dict) -> tuple[int, str]:
+    try:
+        order_id = int(order.get("id") or 0)
+    except (TypeError, ValueError):
+        order_id = 0
+    return order_id, str(order.get("created_at") or "")
 
 
 def status_rank(status: str) -> int:
@@ -352,13 +403,55 @@ def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict
 
 def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list | None = None) -> dict:
     user_orders = orders if orders is not None else get_user_orders(user_id)
-    active_orders = [order for order in user_orders if order.get("status") != "cancelled"]
+    active_orders = [order for order in user_orders if order.get("status") not in {"cancelled", "canceled"}]
     profile["orders_count"] = len(active_orders)
     profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
     profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
     profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
     profile["bonus_balance"] = profile.get("slik_balance", 0)
     return profile
+
+
+def award_cashback_if_needed(profile: dict, order: dict) -> float:
+    if order.get("cashback_awarded"):
+        return 0.0
+    if order.get("status") in {"cancelled", "canceled"}:
+        return 0.0
+
+    order_amount = parse_price(order.get("price", "0"))
+    if order_amount <= 0:
+        return 0.0
+
+    status = profile.get("status") or calculate_user_status(float(profile.get("total_spent") or 0))
+    cashback_percent = cashback_percent_for_status(status)
+    cashback_amount = round(order_amount * cashback_percent / 100, 2)
+    if cashback_amount <= 0:
+        return 0.0
+
+    credit_slik_balance(profile, cashback_amount)
+    order["cashback_awarded"] = True
+    order["cashback_amount"] = cashback_amount
+    order["cashback_percent"] = cashback_percent
+    order["cashback_awarded_at"] = now_str()
+    return cashback_amount
+
+
+def save_order_cashback_fields(order: dict) -> None:
+    order_id = order.get("id")
+    if order_id is None:
+        return
+    orders = load_orders()
+    for saved_order in orders:
+        if saved_order.get("id") == order_id:
+            saved_order["cashback_awarded"] = order.get("cashback_awarded", False)
+            if "cashback_amount" in order:
+                saved_order["cashback_amount"] = order["cashback_amount"]
+            if "cashback_percent" in order:
+                saved_order["cashback_percent"] = order["cashback_percent"]
+            if "cashback_awarded_at" in order:
+                saved_order["cashback_awarded_at"] = order["cashback_awarded_at"]
+            save_orders(orders)
+            return
 
 
 def ensure_user_profile(user) -> dict:
@@ -385,7 +478,7 @@ def ensure_user_profile(user) -> dict:
     return profile
 
 
-def record_user_order(user, order: dict) -> tuple[dict, str, str]:
+def record_user_order(user, order: dict) -> tuple[dict, str, str, float]:
     users = load_users()
     key = str(user.id)
     profile = users.get(key) if isinstance(users.get(key), dict) else default_user_profile(user)
@@ -415,10 +508,13 @@ def record_user_order(user, order: dict) -> tuple[dict, str, str]:
 
     profile = update_profile_stats_from_orders(user.id, profile, all_user_orders)
     current_status = profile.get("status", "Traveller")
+    cashback_amount = award_cashback_if_needed(profile, order)
+    if cashback_amount > 0:
+        save_order_cashback_fields(order)
     award_referral_bonus_if_needed(users, profile, user, order)
     users[key] = profile
     save_users(users)
-    return profile, previous_status, current_status
+    return profile, previous_status, current_status, cashback_amount
 
 
 def get_user_orders(user_id: int) -> list:
@@ -447,11 +543,12 @@ def sync_order_user_stats(user_id: int) -> None:
 def append_order(order: dict) -> dict:
     orders = load_orders()
     order_id = len(orders) + 1
-    order["id"]           = order_id
-    order["number"]       = f"#{order_id:04d}"
-    order["status"]       = "new"
-    order["created_at"]   = now_str()
-    order["created_date"] = local_date().isoformat()
+    order["id"]                 = order_id
+    order["number"]             = f"#{order_id:04d}"
+    order["status"]             = "new"
+    order["created_at"]         = now_str()
+    order["created_date"]       = local_date().isoformat()
+    order["cashback_awarded"]   = False
     orders.append(order)
     save_orders(orders)
     logger.info("Новый заказ: %s", order)
@@ -923,36 +1020,70 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     profile = sync_user_order_stats(user, ensure_user_profile(user))
     referrals = profile.get("referrals", [])
     referrals_count = len(referrals) if isinstance(referrals, list) else 0
+    total_spent = float(profile.get('total_spent') or 0)
+    next_progress = next_status_progress(total_spent)
+    progress_text = (
+        f"До следующего статуса:\n<b>{html_escape(format_status(next_progress[0]))}</b> — осталось <b>{format_usd_cents(next_progress[1])}</b>"
+        if next_progress
+        else "Максимальный статус достигнут 👑"
+    )
     text = (
         "👤 <b>Личный кабинет</b>\n\n"
         f"Имя: <b>{html_escape(profile.get('full_name') or user.full_name or '—')}</b>\n"
-        f"Telegram ID: <code>{user.id}</code>\n"
-        f"Статус: <b>{html_escape(format_status(profile.get('status', 'Traveller')))}</b>\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        "Текущий статус:\n"
+        f"<b>{html_escape(format_status(profile.get('status', 'Traveller')))}</b>\n\n"
+        f"Потрачено: <b>{format_usd_cents(total_spent)}</b>\n\n"
+        f"{progress_text}\n\n"
         f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
-        f"Сумма покупок: <b>{format_usd(profile.get('total_spent'))}</b>\n"
-        f"SLIK Balance: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        f"SLIK Balance: <b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         f"Приглашено друзей: <b>{referrals_count}</b>"
     )
     await edit_or_send(query, context, text, profile_keyboard())
 
 
-def format_user_orders(orders: list) -> list[str]:
-    chunks: list[str] = []
-    current = "📦 <b>Мои заказы</b>\n\n"
-    for order in orders:
-        line = (
-            f"<b>{html_escape(order.get('number', '—'))}</b> · {html_escape(order.get('created_at', '—'))}\n"
-            f"Тариф: {html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}\n"
-            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
-            f"Статус: {html_escape(order.get('status', 'new'))}\n\n"
-        )
-        if len(current) + len(line) > 3800:
-            chunks.append(current)
-            current = ""
-        current += line
-    if current:
-        chunks.append(current)
-    return chunks
+def format_order_date(order: dict) -> str:
+    created_date = order.get("created_date")
+    if created_date:
+        try:
+            return datetime.date.fromisoformat(str(created_date)).strftime("%d.%m.%Y")
+        except ValueError:
+            pass
+    created_at = str(order.get("created_at") or "")
+    return created_at[:10] if created_at else "—"
+
+
+def format_user_orders(orders: list) -> str:
+    total_orders = len(orders)
+    total_spent = round(
+        sum(
+            parse_price(order.get("price", "0"))
+            for order in orders
+            if order.get("status") not in {"cancelled", "canceled"}
+        ),
+        2,
+    )
+    latest_orders = sorted(orders, key=order_sort_key, reverse=True)[:10]
+    lines = [
+        "📦 <b>Ваши заказы</b>",
+        "",
+        f"Всего заказов: <b>{total_orders}</b>",
+        f"Потрачено: <b>{format_usd_cents(total_spent)}</b>",
+        "",
+    ]
+    for index, order in enumerate(latest_orders):
+        if index:
+            lines.append("────────────")
+        lines.extend([
+            f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>",
+            f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>",
+            f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>",
+            f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>",
+            f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>",
+        ])
+    if total_orders > 10:
+        lines.extend(["", "Показаны последние 10 заказов."])
+    return "\n".join(lines)
 
 
 async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -962,20 +1093,12 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not orders:
         await edit_or_send(
             query, context,
-            "📦 <b>Мои заказы</b>\n\nУ вас пока нет заказов.",
+            "📦 <b>У вас пока нет заказов.</b>",
             profile_back_keyboard(),
         )
         return
 
-    chunks = format_user_orders(orders)
-    await edit_or_send(query, context, chunks[0], profile_back_keyboard())
-    for chunk in chunks[1:]:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=chunk,
-            parse_mode="HTML",
-            reply_markup=profile_back_keyboard(),
-        )
+    await edit_or_send(query, context, format_user_orders(orders), profile_back_keyboard())
 
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -1017,12 +1140,13 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
     text = (
-        "🎁 <b>SLIK Balance</b>\n\n"
-        f"Баланс: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        "💰 <b>SLIK Balance</b>\n\n"
+        f"Баланс: <b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         f"Статус: <b>{html_escape(format_status(status))}</b>\n"
-        f"Ваш бонус за приглашённого друга: <b>{format_usd(referral_reward)}</b>\n"
+        f"Ваш кэшбэк: <b>{cashback_percent_for_status(status)}%</b>\n"
+        f"Ваш бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
         f"Приглашено друзей: <b>{referrals_count}</b>\n"
-        f"Бонус уже принесли друзей: <b>{awarded_count}</b>\n\n"
+        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
         f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -1205,6 +1329,29 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return WAITING_TELEGRAM
 
 
+async def notify_cashback_awarded(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    order: dict,
+    cashback_amount: float,
+    profile: dict,
+) -> None:
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎁 <b>Cashback начислен</b>\n\n"
+                f"За заказ <b>{html_escape(order.get('number', '—'))}</b> вам начислено:\n"
+                f"+<b>{format_usd_cents(cashback_amount)}</b> на SLIK Balance\n\n"
+                "Ваш баланс:\n"
+                f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить о cashback: %s", e)
+
+
 async def notify_status_upgrade(context: ContextTypes.DEFAULT_TYPE, user_id: int, status: str) -> None:
     try:
         await context.bot.send_message(
@@ -1236,13 +1383,14 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "gb":             plan["gb"],
         "days":           plan["days"],
         "price":          plan["price"],
+        "country":        "Россия",
         "plan_key":       context.user_data["plan_key"],
         "payment_method": payment,
         "name":           name,
         "tg_handle":      tg_handle,
         "user_id":        user.id,
     })
-    _profile, previous_status, current_status = record_user_order(user, order)
+    profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
     await update.message.reply_text(
         (
@@ -1260,6 +1408,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             [InlineKeyboardButton("🏠 Главное меню",        callback_data="back_main")],
         ]),
     )
+    if cashback_amount > 0:
+        await notify_cashback_awarded(context, user.id, order, cashback_amount, profile)
     if status_rank(current_status) > status_rank(previous_status):
         await notify_status_upgrade(context, user.id, current_status)
     await notify_admin(context, order)
