@@ -131,6 +131,12 @@ ORDER_STATUS_LABELS = {
     "canceled": "Отменён",
 }
 
+ROLE_OWNER = "OWNER"
+ROLE_ADMIN = "ADMIN"
+ROLE_MANAGER = "MANAGER"
+ROLE_USER = "USER"
+ADMIN_ACCESS_DENIED_TEXT = "⛔ У вас нет доступа."
+
 # ─── Состояния диалога ────────────────────────────────────────────────────────
 
 WAITING_PAYMENT, WAITING_NAME, WAITING_TELEGRAM = range(1, 4)
@@ -158,6 +164,7 @@ def parse_price(s: str) -> float:
 DEFAULT_CONFIG = {
     "banners":  {},
     "admins":   [],
+    "managers": [],
     "relay":    {},
     "payment":  {"card": "", "cryptobot_token": ""},
 }
@@ -760,7 +767,23 @@ def update_order_status(order_id: int, status: str) -> dict | None:
 
 # ─── Проверка прав ────────────────────────────────────────────────────────────
 
+def _matches_principal(user, entry) -> bool:
+    if not user or entry is None:
+        return False
+    entry_str = str(entry).lstrip("@").lower()
+    if entry_str.isdigit():
+        return str(user.id) == entry_str
+    return bool(user.username and user.username.lower() == entry_str)
+
+
+def _user_in_config_list(user, key: str) -> bool:
+    cfg = load_config()
+    return any(_matches_principal(user, entry) for entry in cfg.get(key, []))
+
+
 def is_owner(user) -> bool:
+    if not user:
+        return False
     if user.username and user.username.lower() == OWNER_USERNAME.lower():
         return True
     admin_env = os.environ.get("ADMIN_CHAT_ID", "").strip()
@@ -772,16 +795,34 @@ def is_owner(user) -> bool:
 def is_admin(user) -> bool:
     if is_owner(user):
         return True
-    cfg = load_config()
-    for entry in cfg.get("admins", []):
-        entry_str = str(entry).lstrip("@").lower()
-        if entry_str.isdigit():
-            if str(user.id) == entry_str:
-                return True
-        else:
-            if user.username and user.username.lower() == entry_str:
-                return True
-    return False
+    return _user_in_config_list(user, "admins")
+
+
+def is_manager(user) -> bool:
+    if is_owner(user) or is_admin(user):
+        return True
+    return _user_in_config_list(user, "managers")
+
+
+def get_user_role(user) -> str:
+    if is_owner(user):
+        return ROLE_OWNER
+    if _user_in_config_list(user, "admins"):
+        return ROLE_ADMIN
+    if _user_in_config_list(user, "managers"):
+        return ROLE_MANAGER
+    return ROLE_USER
+
+
+def has_admin_access(user) -> bool:
+    return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER}
+
+
+async def deny_admin_access(update: Update) -> None:
+    if update.callback_query:
+        await update.callback_query.answer(ADMIN_ACCESS_DENIED_TEXT, show_alert=True)
+    elif update.message:
+        await update.message.reply_text(ADMIN_ACCESS_DENIED_TEXT)
 
 
 def get_admin_chat_id() -> int | None:
@@ -885,8 +926,8 @@ async def automatic_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     try:
         backup_info = create_backup_archive()
@@ -898,8 +939,8 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     archives = list_backup_archives()[:10]
     if not archives:
@@ -1094,13 +1135,25 @@ async def send_order_list(message, orders: list, title: str):
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
+        [InlineKeyboardButton("📦 Мои заказы",               callback_data="profile_orders")],
+        [InlineKeyboardButton("👥 Реферальная программа",    callback_data="profile_invite")],
+        [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
+    ]
+    if has_admin_access(user):
+        rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌍 Купить eSIM",          callback_data="buy_esim")],
-        [InlineKeyboardButton("👤 Личный кабинет",       callback_data="profile")],
-        [InlineKeyboardButton("📱 Проверить устройство", url=DEVICE_CHECK_URL)],
-        [InlineKeyboardButton("📖 Инструкция",           callback_data="instructions")],
-        [InlineKeyboardButton("👨‍💻 Поддержка",            callback_data="support_screen")],
+        [InlineKeyboardButton("📋 Заказы",       callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
+        [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
+        [InlineKeyboardButton("💾 Бэкапы",       callback_data="admin_backups")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
     ])
 
 
@@ -1199,18 +1252,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await send_screen(
                 update.message, "start", MAIN_MENU_TEXT,
-                main_menu_keyboard(), local_file=BANNER_IMAGE,
+                main_menu_keyboard(user), local_file=BANNER_IMAGE,
             )
         except Exception:
             await update.message.reply_text(
                 MAIN_MENU_TEXT,
-                reply_markup=main_menu_keyboard(),
+                reply_markup=main_menu_keyboard(user),
                 parse_mode="HTML",
             )
-        if not is_admin(user):
+        if not has_admin_access(user):
             await track_action(context, user, "открыл главное меню")
     elif update.callback_query:
-        await edit_or_send(update.callback_query, context, MAIN_MENU_TEXT, main_menu_keyboard())
+        await edit_or_send(update.callback_query, context, MAIN_MENU_TEXT, main_menu_keyboard(user))
 
 
 # ─── Навигационные экраны ─────────────────────────────────────────────────────
@@ -1220,7 +1273,7 @@ async def show_buy_esim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
     user = query.from_user
     await edit_or_send(query, context, "🌍 <b>Выберите страну:</b>", buy_esim_keyboard())
-    if not is_admin(user):
+    if not has_admin_access(user):
         await track_action(context, user, "нажал «Купить eSIM»")
 
 
@@ -1248,7 +1301,7 @@ async def show_region_russia(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await edit_or_send(query, context, text, russia_plans_keyboard())
     else:
         await edit_or_send(query, context, text, russia_plans_keyboard())
-    if not is_admin(user):
+    if not has_admin_access(user):
         await track_action(context, user, "выбрал страну", "Страна: Россия")
 
 
@@ -1267,7 +1320,7 @@ async def show_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📱 Поддержка iPhone и Android с eSIM"
     )
     await edit_or_send(query, context, text, plan_card_keyboard(plan_key))
-    if not is_admin(query.from_user):
+    if not has_admin_access(query.from_user):
         await track_action(context, query.from_user, "выбрал тариф",
                            f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}")
 
@@ -1313,7 +1366,7 @@ async def show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ],
         ]),
     )
-    if not is_admin(query.from_user):
+    if not has_admin_access(query.from_user):
         await track_action(context, query.from_user, "открыл инструкцию")
 
 
@@ -1328,7 +1381,7 @@ async def show_support_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
         ]),
     )
-    if not is_admin(query.from_user):
+    if not has_admin_access(query.from_user):
         await track_action(context, query.from_user, "нажал «Поддержка»")
 
 
@@ -1755,7 +1808,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if status_rank(current_status) > status_rank(previous_status):
         await notify_status_upgrade(context, user.id, current_status)
     await notify_admin(context, order)
-    if not is_admin(user):
+    if not has_admin_access(user):
         await track_action(context, user, "создал заявку",
                            f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}\nОплата: {payment}")
     context.user_data.clear()
@@ -1863,8 +1916,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
 
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not is_admin(query.from_user):
-        await query.answer("⛔ Нет доступа.", show_alert=True)
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
         return
 
     data     = query.data
@@ -1917,7 +1970,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not admin_id or msg.chat_id != admin_id:
         return
 
-    if not is_admin(msg.from_user):
+    if not has_admin_access(msg.from_user):
         return
 
     replied_id = str(msg.reply_to_message.message_id)
@@ -1964,7 +2017,7 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # Игнорировать самих администраторов
-    if is_admin(user):
+    if has_admin_access(user):
         return
 
     # Ответить клиенту
@@ -2007,8 +2060,8 @@ async def handle_unknown_message(update: Update, context: ContextTypes.DEFAULT_T
 # ─── Баннеры ──────────────────────────────────────────────────────────────────
 
 async def cmd_banners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     cfg = load_config()
     banners = cfg.get("banners", {})
@@ -2025,8 +2078,8 @@ async def cmd_banners(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_setbanner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return ConversationHandler.END
     args = context.args or []
     if not args or args[0] not in BANNER_SCREENS:
@@ -2064,8 +2117,8 @@ async def receive_banner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_delbanner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     args = context.args or []
     if not args or args[0] not in BANNER_SCREENS:
@@ -2085,8 +2138,8 @@ async def cmd_delbanner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── Управление администраторами ──────────────────────────────────────────────
 
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     cfg = load_config()
     entries = cfg.get("admins", [])
@@ -2109,7 +2162,7 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        await deny_admin_access(update)
         return
     args = context.args or []
     if not args:
@@ -2136,7 +2189,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_deladmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        await deny_admin_access(update)
         return
     args = context.args or []
     if not args:
@@ -2161,8 +2214,8 @@ async def cmd_deladmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─── Способы оплаты ───────────────────────────────────────────────────────────
 
 async def cmd_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     cfg   = load_config()
     card  = cfg["payment"].get("card", "") or "не задана"
@@ -2189,8 +2242,8 @@ async def cmd_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_setpayment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     args = context.args or []
     if len(args) < 2:
@@ -2242,21 +2295,24 @@ def orders_by_period(orders: list, since: datetime.date) -> list:
 
 
 async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = load_orders()
     await send_order_list(update.message, orders[-50:][::-1], "📋 <b>Последние 50 заказов</b>")
 
 
 async def cmd_orders_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = orders_by_period(load_orders(), local_date())
     await send_order_list(update.message, orders[::-1], f"📅 <b>Заказы сегодня</b>")
 
 
 async def cmd_orders_7d(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     since = local_date() - datetime.timedelta(days=7)
     orders = orders_by_period(load_orders(), since)
@@ -2264,7 +2320,8 @@ async def cmd_orders_7d(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_orders_30d(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     since = local_date() - datetime.timedelta(days=30)
     orders = orders_by_period(load_orders(), since)
@@ -2272,21 +2329,24 @@ async def cmd_orders_30d(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = [o for o in load_orders() if o.get("status") == "new"]
     await send_order_list(update.message, orders[::-1], "🆕 <b>Активные заявки</b>")
 
 
 async def cmd_completed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = [o for o in load_orders() if o.get("status") == "done"]
     await send_order_list(update.message, orders[::-1], "✅ <b>Выполненные заявки</b>")
 
 
 async def cmd_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = [o for o in load_orders() if o.get("status") == "cancelled"]
     await send_order_list(update.message, orders[::-1], "❌ <b>Отменённые заявки</b>")
@@ -2301,7 +2361,8 @@ def calc_stats(orders: list, since: datetime.date) -> tuple[int, float]:
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     orders = load_orders()
     today  = local_date()
@@ -2330,8 +2391,101 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    await update.message.reply_text(admin_panel_text(update.effective_user), parse_mode="HTML", reply_markup=admin_panel_keyboard())
+
+
+async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    await update.message.reply_text("👥 Раздел клиентов подготовлен для будущей CRM.")
+
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    await update.message.reply_text("📰 Раздел новостей подготовлен для будущей CRM.")
+
+
+def admin_panel_text(user) -> str:
+    role = get_user_role(user)
+    return (
+        "🛠 <b>Админ-панель SLIK Mobile</b>\n\n"
+        f"Роль: <b>{role}</b>\n\n"
+        "Доступные разделы:\n"
+        "• 📋 Заказы и статистика\n"
+        "• 👥 Клиенты — заготовка для CRM\n"
+        "• 📰 Новости — заготовка для CRM\n"
+        "• 💾 Бэкапы runtime-данных"
+    )
+
+
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, admin_panel_text(query.from_user), admin_panel_keyboard())
+
+
+async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(
+        query,
+        context,
+        "📋 <b>Заказы</b>\n\n"
+        "Команды: /orders, /orders_today, /orders_7d, /orders_30d, /pending, /completed, /cancelled, /stats",
+        admin_panel_keyboard(),
+    )
+
+
+async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, "👥 <b>Клиенты</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard())
+
+
+async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, "📰 <b>Новости</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard())
+
+
+async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    archives = list_backup_archives()[:10]
+    lines = ["💾 <b>Последние бэкапы</b>", ""]
+    if archives:
+        lines.extend(f"{index}. <code>{archive.name}</code>" for index, archive in enumerate(archives, start=1))
+    else:
+        lines.append("Пока нет архивов.")
+    lines.append("\nСоздать новый ZIP: /backup")
+    await edit_or_send(query, context, "\n".join(lines), admin_panel_keyboard())
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user):
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
         return
     await update.message.reply_text(
         "📖 <b>SLIK Mobile Admin</b>\n\n"
@@ -2378,7 +2532,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     data  = query.data
 
-    if data == "buy_esim":
+    if data.startswith("admin_") and not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+    elif data == "admin_panel":
+        await show_admin_panel(update, context)
+    elif data == "admin_orders":
+        await show_admin_orders(update, context)
+    elif data == "admin_clients":
+        await show_admin_clients(update, context)
+    elif data == "admin_news":
+        await show_admin_news(update, context)
+    elif data == "admin_backups":
+        await show_admin_backups(update, context)
+    elif data == "buy_esim":
         await show_buy_esim(update, context)
     elif data == "region_russia":
         await show_region_russia(update, context)
@@ -2410,6 +2576,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start",           "Главное меню"),
+        BotCommand("admin",           "Админ-панель"),
+        BotCommand("clients",         "Клиенты CRM"),
+        BotCommand("news",            "Новости CRM"),
         BotCommand("orders",          "Последние 50 заказов"),
         BotCommand("orders_today",    "Заказы за сегодня"),
         BotCommand("orders_7d",       "Заказы за 7 дней"),
@@ -2478,6 +2647,9 @@ def main() -> None:
 
     # ── Команды ──────────────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start",           start))
+    app.add_handler(CommandHandler("admin",           cmd_admin))
+    app.add_handler(CommandHandler("clients",         cmd_clients))
+    app.add_handler(CommandHandler("news",            cmd_news))
     app.add_handler(CommandHandler("orders",          cmd_orders))
     app.add_handler(CommandHandler("orders_today",    cmd_orders_today))
     app.add_handler(CommandHandler("orders_7d",       cmd_orders_7d))
