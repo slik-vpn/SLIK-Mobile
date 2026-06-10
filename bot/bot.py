@@ -126,9 +126,22 @@ ORDER_STATUS_LABELS = {
     "processing": "В работе",
     "in_progress": "В работе",
     "done": "Выдан",
+    "issued": "Выдан",
     "completed": "Выдан",
     "cancelled": "Отменён",
     "canceled": "Отменён",
+}
+ORDER_STATUS_ICONS = {
+    "new": "🟡",
+    "in_progress": "🔵",
+    "issued": "🟢",
+    "cancelled": "🔴",
+}
+ORDER_STATUS_ALIASES = {
+    "processing": "in_progress",
+    "done": "issued",
+    "completed": "issued",
+    "canceled": "cancelled",
 }
 
 ROLE_OWNER = "OWNER"
@@ -473,8 +486,19 @@ def next_status_progress(total_spent: float) -> tuple[str, float] | None:
     return None
 
 
-def order_status_label(status: str) -> str:
-    return ORDER_STATUS_LABELS.get(str(status or "new"), str(status or "new"))
+def normalize_order_status(status: str | None) -> str:
+    raw_status = str(status or "new")
+    return ORDER_STATUS_ALIASES.get(raw_status, raw_status)
+
+
+def order_status_label(status: str | None) -> str:
+    normalized = normalize_order_status(status)
+    return ORDER_STATUS_LABELS.get(normalized, normalized)
+
+
+def order_status_with_icon(status: str | None) -> str:
+    normalized = normalize_order_status(status)
+    return f"{ORDER_STATUS_ICONS.get(normalized, '🟡')} {order_status_label(normalized)}"
 
 
 def order_sort_key(order: dict) -> tuple[int, str]:
@@ -752,12 +776,18 @@ def append_order(order: dict) -> dict:
     return order
 
 
-def update_order_status(order_id: int, status: str) -> dict | None:
+def update_order_status(order_id: int, status: str, updated_by: int | None = None) -> dict | None:
     orders = load_orders()
     for o in orders:
-        if o["id"] == order_id:
-            o["status"]     = status
+        try:
+            current_id = int(o.get("id"))
+        except (TypeError, ValueError):
+            current_id = None
+        if current_id == order_id:
+            o["status"]     = normalize_order_status(status)
             o["updated_at"] = now_str()
+            if updated_by is not None:
+                o["status_updated_by"] = updated_by
             save_orders(orders)
             if o.get("user_id") is not None:
                 sync_order_user_stats(o["user_id"])
@@ -816,6 +846,10 @@ def get_user_role(user) -> str:
 
 def has_admin_access(user) -> bool:
     return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER}
+
+
+def has_backup_access(user) -> bool:
+    return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}
 
 
 async def deny_admin_access(update: Update) -> None:
@@ -926,7 +960,7 @@ async def automatic_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user):
+    if not has_backup_access(update.effective_user):
         await deny_admin_access(update)
         return
     try:
@@ -939,7 +973,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user):
+    if not has_backup_access(update.effective_user):
         await deny_admin_access(update)
         return
     archives = list_backup_archives()[:10]
@@ -1133,6 +1167,247 @@ async def send_order_list(message, orders: list, title: str):
         await message.reply_text(chunk, parse_mode="HTML")
 
 
+ORDER_LIST_FILTERS = {
+    "new": {"new"},
+    "in_progress": {"in_progress"},
+    "issued": {"issued"},
+    "cancelled": {"cancelled"},
+    "pending": {"new", "in_progress"},
+}
+ORDER_LIST_TITLES = {
+    "new": "🟡 Новые заявки",
+    "in_progress": "🔵 В работе",
+    "issued": "🟢 Выданные заявки",
+    "cancelled": "🔴 Отменённые заявки",
+    "pending": "🟡 Активные заявки",
+}
+STATUS_NOTIFICATION_TEXT = {
+    "in_progress": "🔵 Ваш заказ {number} взят в работу.",
+    "issued": "🟢 Ваш заказ {number} выдан.\nЕсли eSIM уже отправлена менеджером, проверьте чат.",
+    "cancelled": "🔴 Ваш заказ {number} отменён.\nЕсли это ошибка — напишите в поддержку.",
+}
+
+
+def filter_orders_by_status(orders: list, filter_key: str) -> list:
+    statuses = ORDER_LIST_FILTERS.get(filter_key, {filter_key})
+    return [order for order in orders if normalize_order_status(order.get("status")) in statuses]
+
+
+def order_number_plain(order: dict) -> str:
+    number = str(order.get("number") or f"#{order.get('id', '—')}")
+    return number if number.startswith("#") else f"#{number}"
+
+
+def format_order_button_text(order: dict) -> str:
+    return (
+        f"{order_number_plain(order)} — {order.get('country', 'Россия')} "
+        f"{order.get('gb', '—')} — {order.get('price', '—')}"
+    )
+
+
+def build_orders_dashboard() -> str:
+    orders = load_orders()
+    today = local_date()
+    today_orders = orders_by_period(orders, today)
+    week_orders = orders_by_period(orders, today - datetime.timedelta(days=7))
+    month_orders = orders_by_period(orders, today - datetime.timedelta(days=30))
+
+    def count_status(items: list, status: str) -> int:
+        return sum(1 for order in items if normalize_order_status(order.get("status")) == status)
+
+    week_total = sum(parse_price(order.get("price", "0")) for order in week_orders)
+    month_total = sum(parse_price(order.get("price", "0")) for order in month_orders)
+    return (
+        "📋 <b>Заказы</b>\n\n"
+        "<b>Сегодня:</b>\n"
+        f"🆕 Новых: <b>{count_status(today_orders, 'new')}</b>\n"
+        f"🔵 В работе: <b>{count_status(today_orders, 'in_progress')}</b>\n"
+        f"🟢 Выдано: <b>{count_status(today_orders, 'issued')}</b>\n"
+        f"🔴 Отменено: <b>{count_status(today_orders, 'cancelled')}</b>\n\n"
+        "<b>За 7 дней:</b>\n"
+        f"📦 Всего заказов: <b>{len(week_orders)}</b>\n"
+        f"💵 Сумма: <b>${week_total:.2f}</b>\n\n"
+        "<b>За 30 дней:</b>\n"
+        f"📦 Всего заказов: <b>{len(month_orders)}</b>\n"
+        f"💵 Сумма: <b>${month_total:.2f}</b>\n\n"
+        "<b>Быстрые действия:</b>\n"
+        "🟡 Новые заявки\n"
+        "🔵 В работе\n"
+        "🟢 Выданные\n"
+        "🔴 Отменённые\n"
+        "📊 Статистика"
+    )
+
+
+def orders_dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟡 Новые", callback_data="orders_list:new")],
+        [InlineKeyboardButton("🔵 В работе", callback_data="orders_list:in_progress")],
+        [InlineKeyboardButton("🟢 Выданные", callback_data="orders_list:issued")],
+        [InlineKeyboardButton("🔴 Отменённые", callback_data="orders_list:cancelled")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="orders_stats")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def order_list_keyboard(filter_key: str) -> InlineKeyboardMarkup:
+    orders = filter_orders_by_status(load_orders(), filter_key)
+    latest_orders = sorted(orders, key=order_sort_key, reverse=True)[:10]
+    rows = [
+        [InlineKeyboardButton(format_order_button_text(order), callback_data=f"order_card:{order.get('id')}")]
+        for order in latest_orders
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_orders")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_order_list_text(filter_key: str) -> str:
+    title = ORDER_LIST_TITLES.get(filter_key, "📋 Заявки")
+    orders = filter_orders_by_status(load_orders(), filter_key)
+    if not orders:
+        return f"{title}\n\nЗаявок в этой категории нет."
+    return f"{title}\n\nПоследние 10 заказов:"
+
+
+def find_order(order_id: int) -> dict | None:
+    for order in load_orders():
+        try:
+            current_id = int(order.get("id"))
+        except (TypeError, ValueError):
+            current_id = None
+        if current_id == order_id:
+            return order
+    return None
+
+
+def build_order_card_text(order: dict) -> str:
+    payment_method = order.get("payment_method") or "—"
+    payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
+    card_lines = ""
+    if payment_method == "Карта":
+        rate = float(payment_details.get("usd_rub_rate") or 0)
+        markup = float(payment_details.get("markup_percent") or 0)
+        card_lines = (
+            f"💳 К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
+            f"Курс: <b>{rate:.2f} ₽</b>\n"
+            f"Комиссия: <b>{markup:g}%</b>\n"
+        )
+    username = order.get("tg_handle") or "—"
+    return (
+        f"📦 <b>Заказ {html_escape(order_number_plain(order))}</b>\n\n"
+        f"👤 Клиент: <b>{html_escape(order.get('name', '—'))}</b>\n"
+        f"🆔 Telegram ID: <code>{html_escape(order.get('user_id', '—'))}</code>\n"
+        f"Username: <b>{html_escape(username)}</b>\n\n"
+        f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>\n"
+        f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>\n"
+        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n\n"
+        "<b>Способ оплаты:</b>\n"
+        f"{html_escape(payment_method)}\n\n"
+        f"{card_lines}"
+        "<b>Статус:</b>\n"
+        f"{html_escape(order_status_with_icon(order.get('status')))}\n\n"
+        "<b>Дата:</b>\n"
+        f"{html_escape(format_order_date(order))}"
+    )
+
+
+def order_card_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
+        [InlineKeyboardButton("📤 Выдано", callback_data=f"order_status:issued:{order_id}")],
+        [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_orders")],
+    ])
+
+
+def build_orders_stats_text() -> str:
+    orders = load_orders()
+    today = local_date()
+    week_count, week_total = calc_stats(orders, today - datetime.timedelta(days=7))
+    month_count, month_total = calc_stats(orders, today - datetime.timedelta(days=30))
+    return (
+        "📊 <b>Статистика заказов</b>\n\n"
+        f"За 7 дней: <b>{week_count}</b> / <b>${week_total:.2f}</b>\n"
+        f"За 30 дней: <b>{month_count}</b> / <b>${month_total:.2f}</b>"
+    )
+
+
+async def notify_client_order_status(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
+    user_id = order.get("user_id")
+    if user_id is None:
+        return
+    status = normalize_order_status(order.get("status"))
+    template = STATUS_NOTIFICATION_TEXT.get(status)
+    if not template:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=template.format(number=order_number_plain(order)),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
+            ]),
+        )
+    except Exception as e:
+        logger.warning("Не удалось уведомить клиента о статусе заказа %s: %s", order.get("id"), e)
+
+
+def format_file_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
+
+
+def backup_info_from_path(path: Path) -> dict:
+    return {"path": path, "created_at": datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=TZ), "included": [], "skipped": []}
+
+
+def build_backups_dashboard() -> str:
+    archives = list_backup_archives()
+    latest = archives[0] if archives else None
+    latest_time = datetime.datetime.fromtimestamp(latest.stat().st_mtime, tz=TZ).strftime("%d.%m.%Y %H:%M") if latest else "—"
+    latest_size = format_file_size(latest.stat().st_size) if latest else "—"
+    return (
+        "💾 <b>Бэкапы</b>\n\n"
+        "<b>Последний бэкап:</b>\n"
+        f"{latest_time}\n\n"
+        "<b>Всего архивов:</b>\n"
+        f"{len(archives)}\n\n"
+        "<b>Последний размер:</b>\n"
+        f"{latest_size}"
+    )
+
+
+def backups_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Скачать последний", callback_data="backup_download_latest")],
+        [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
+        [InlineKeyboardButton("📋 Список архивов", callback_data="backup_list")],
+        [InlineKeyboardButton("🗑 Очистить старые", callback_data="backup_cleanup_prompt")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def backup_cleanup_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да", callback_data="backup_cleanup_yes")],
+        [InlineKeyboardButton("❌ Нет", callback_data="admin_backups")],
+    ])
+
+
+def build_backup_list_text() -> str:
+    archives = list_backup_archives()[:10]
+    lines = ["💾 <b>Последние архивы</b>", ""]
+    if archives:
+        lines.extend(f"{index}. <code>{archive.name}</code> — {format_file_size(archive.stat().st_size)}" for index, archive in enumerate(archives, start=1))
+    else:
+        lines.append("Архивы не найдены.")
+    return "\n".join(lines)
+
+
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
@@ -1147,14 +1422,16 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton("📋 Заказы",       callback_data="admin_orders")],
         [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
-        [InlineKeyboardButton("💾 Бэкапы",       callback_data="admin_backups")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
-    ])
+    ]
+    if has_backup_access(user):
+        rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
+    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def buy_esim_keyboard() -> InlineKeyboardMarkup:
@@ -1208,10 +1485,11 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 
 
 def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Выдано",   callback_data=f"done_{order_id}"),
-        InlineKeyboardButton("❌ Отменено", callback_data=f"cancelled_{order_id}"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
+        [InlineKeyboardButton("📤 Выдано", callback_data=f"order_status:issued:{order_id}")],
+        [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
+    ])
 
 
 def profile_keyboard() -> InlineKeyboardMarkup:
@@ -1920,42 +2198,23 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await deny_admin_access(update)
         return
 
-    data     = query.data
-    action   = "done" if data.startswith("done_") else "cancelled"
-    order_id = int(data.split("_", 1)[1])
+    data = query.data
+    if data.startswith("order_status:"):
+        _prefix, status, order_id_raw = data.split(":", 2)
+        order_id = int(order_id_raw)
+    else:
+        action = "issued" if data.startswith("done_") else "cancelled"
+        status = action
+        order_id = int(data.split("_", 1)[1])
 
-    order = update_order_status(order_id, action)
+    order = update_order_status(order_id, status, query.from_user.id)
     if not order:
         await query.answer("Заявка не найдена.", show_alert=True)
         return
 
-    time_now = now_time()
-
-    if action == "done":
-        await query.answer("✅ Выдано")
-        await query.edit_message_text(
-            f"✅ <b>Заказ {order['number']} выдан</b>\n\nДата выдачи: {time_now}",
-            parse_mode="HTML",
-        )
-        client_text = "✅ <b>Ваш заказ обработан.</b>\n\nМенеджер скоро отправит данные eSIM.\n\nЕсли у вас возникли вопросы — напишите в поддержку."
-    else:
-        await query.answer("❌ Отменено")
-        await query.edit_message_text(
-            f"❌ <b>Заказ {order['number']} отменён</b>\n\nВремя: {time_now}",
-            parse_mode="HTML",
-        )
-        client_text = "❌ <b>Заказ отменён.</b>\n\nДля уточнения свяжитесь с поддержкой."
-
-    try:
-        await context.bot.send_message(
-            chat_id=order["user_id"], text=client_text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("👨‍💻 Поддержка",    url=SUPPORT_URL)],
-                [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
-            ]),
-        )
-    except Exception as e:
-        logger.error("Не удалось уведомить клиента: %s", e)
+    await query.answer(f"Статус: {order_status_label(order.get('status'))}")
+    await notify_client_order_status(context, order)
+    await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(order_id))
 
 
 # ─── Ответ админа клиенту через reply ────────────────────────────────────────
@@ -2298,8 +2557,7 @@ async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    orders = load_orders()
-    await send_order_list(update.message, orders[-50:][::-1], "📋 <b>Последние 50 заказов</b>")
+    await update.message.reply_text(build_orders_dashboard(), parse_mode="HTML", reply_markup=orders_dashboard_keyboard())
 
 
 async def cmd_orders_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2332,31 +2590,27 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    orders = [o for o in load_orders() if o.get("status") == "new"]
-    await send_order_list(update.message, orders[::-1], "🆕 <b>Активные заявки</b>")
+    await update.message.reply_text(build_order_list_text("pending"), parse_mode="HTML", reply_markup=order_list_keyboard("pending"))
 
 
 async def cmd_completed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    orders = [o for o in load_orders() if o.get("status") == "done"]
-    await send_order_list(update.message, orders[::-1], "✅ <b>Выполненные заявки</b>")
+    await update.message.reply_text(build_order_list_text("issued"), parse_mode="HTML", reply_markup=order_list_keyboard("issued"))
 
 
 async def cmd_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    orders = [o for o in load_orders() if o.get("status") == "cancelled"]
-    await send_order_list(update.message, orders[::-1], "❌ <b>Отменённые заявки</b>")
+    await update.message.reply_text(build_order_list_text("cancelled"), parse_mode="HTML", reply_markup=order_list_keyboard("cancelled"))
 
 
 def calc_stats(orders: list, since: datetime.date) -> tuple[int, float]:
-    active_statuses = {"new", "done", None}
     filtered = orders_by_period(orders, since)
-    count = sum(1 for o in filtered if o.get("status") != "cancelled")
-    total = sum(parse_price(o.get("price", "0")) for o in filtered if o.get("status") != "cancelled")
+    count = sum(1 for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
+    total = sum(parse_price(o.get("price", "0")) for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
     return count, total
 
 
@@ -2373,11 +2627,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         count, total = calc_stats(orders, since)
         return f"{label}:\nЗаказов: <b>{count}</b>\nСумма: <b>${total:g}</b>"
 
-    cancelled_orders = [o for o in orders if o.get("status") == "cancelled"]
+    cancelled_orders = [o for o in orders if normalize_order_status(o.get("status")) == "cancelled"]
     cancelled_sum    = sum(parse_price(o.get("price", "0")) for o in cancelled_orders)
 
-    all_count = sum(1 for o in orders if o.get("status") != "cancelled")
-    all_sum   = sum(parse_price(o.get("price", "0")) for o in orders if o.get("status") != "cancelled")
+    all_count = sum(1 for o in orders if normalize_order_status(o.get("status")) != "cancelled")
+    all_sum   = sum(parse_price(o.get("price", "0")) for o in orders if normalize_order_status(o.get("status")) != "cancelled")
 
     await update.message.reply_text(
         "📊 <b>Статистика продаж</b>\n\n"
@@ -2395,7 +2649,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    await update.message.reply_text(admin_panel_text(update.effective_user), parse_mode="HTML", reply_markup=admin_panel_keyboard())
+    await update.message.reply_text(admin_panel_text(update.effective_user), parse_mode="HTML", reply_markup=admin_panel_keyboard(update.effective_user))
 
 
 async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2421,7 +2675,7 @@ def admin_panel_text(user) -> str:
         "• 📋 Заказы и статистика\n"
         "• 👥 Клиенты — заготовка для CRM\n"
         "• 📰 Новости — заготовка для CRM\n"
-        "• 💾 Бэкапы runtime-данных"
+        + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
     )
 
 
@@ -2431,7 +2685,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, admin_panel_text(query.from_user), admin_panel_keyboard())
+    await edit_or_send(query, context, admin_panel_text(query.from_user), admin_panel_keyboard(query.from_user))
 
 
 async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2440,13 +2694,7 @@ async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(
-        query,
-        context,
-        "📋 <b>Заказы</b>\n\n"
-        "Команды: /orders, /orders_today, /orders_7d, /orders_30d, /pending, /completed, /cancelled, /stats",
-        admin_panel_keyboard(),
-    )
+    await edit_or_send(query, context, build_orders_dashboard(), orders_dashboard_keyboard())
 
 
 async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2455,7 +2703,7 @@ async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, "👥 <b>Клиенты</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard())
+    await edit_or_send(query, context, "👥 <b>Клиенты</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard(query.from_user))
 
 
 async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2464,23 +2712,16 @@ async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, "📰 <b>Новости</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard())
+    await edit_or_send(query, context, "📰 <b>Новости</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard(query.from_user))
 
 
 async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not has_admin_access(query.from_user):
+    if not has_backup_access(query.from_user):
         await deny_admin_access(update)
         return
     await query.answer()
-    archives = list_backup_archives()[:10]
-    lines = ["💾 <b>Последние бэкапы</b>", ""]
-    if archives:
-        lines.extend(f"{index}. <code>{archive.name}</code>" for index, archive in enumerate(archives, start=1))
-    else:
-        lines.append("Пока нет архивов.")
-    lines.append("\nСоздать новый ZIP: /backup")
-    await edit_or_send(query, context, "\n".join(lines), admin_panel_keyboard())
+    await edit_or_send(query, context, build_backups_dashboard(), backups_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2532,8 +2773,73 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     data  = query.data
 
-    if data.startswith("admin_") and not has_admin_access(query.from_user):
+    backup_callbacks = {
+        "admin_backups",
+        "backup_download_latest",
+        "backup_create",
+        "backup_list",
+        "backup_cleanup_prompt",
+        "backup_cleanup_yes",
+    }
+    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:")
+    if data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
+    elif (data.startswith(admin_prefixes) or data == "orders_stats") and not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+    elif data.startswith("order_status:"):
+        await handle_admin_action(update, context)
+    elif data.startswith("orders_list:"):
+        await query.answer()
+        filter_key = data.split(":", 1)[1]
+        await edit_or_send(query, context, build_order_list_text(filter_key), order_list_keyboard(filter_key))
+    elif data.startswith("order_card:"):
+        order_id = int(data.split(":", 1)[1])
+        order = find_order(order_id)
+        if not order:
+            await query.answer("Заявка не найдена.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(order_id))
+    elif data == "orders_stats":
+        await query.answer()
+        await edit_or_send(
+            query, context, build_orders_stats_text(),
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_orders")]]),
+        )
+    elif data == "backup_download_latest":
+        await query.answer()
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        await send_backup_archive(context.bot, query.message.chat_id, backup_info_from_path(archives[0]))
+    elif data == "backup_create":
+        await query.answer("Создаю бэкап...")
+        try:
+            backup_info = create_backup_archive()
+            await edit_or_send(
+                query, context,
+                f"✅ <b>Бэкап создан</b>\nФайл: <code>{html_escape(backup_info['path'].name)}</code>",
+                backups_keyboard(),
+            )
+            await send_backup_archive(context.bot, query.message.chat_id, backup_info)
+        except Exception:
+            logger.exception("Не удалось создать или отправить бэкап кнопкой")
+            await edit_or_send(query, context, "Не удалось создать бэкап. Ошибка записана в лог.", backups_keyboard())
+    elif data == "backup_list":
+        await query.answer()
+        await edit_or_send(query, context, build_backup_list_text(), backups_keyboard())
+    elif data == "backup_cleanup_prompt":
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "⚠️ <b>Удалить старые архивы?</b>\nОстанутся последние 10 архивов.",
+            backup_cleanup_confirm_keyboard(),
+        )
+    elif data == "backup_cleanup_yes":
+        await query.answer()
+        cleanup_old_backups(keep_limit=10)
+        await edit_or_send(query, context, "✅ Старые архивы удалены.", backups_keyboard())
     elif data == "admin_panel":
         await show_admin_panel(update, context)
     elif data == "admin_orders":
@@ -2642,7 +2948,7 @@ def main() -> None:
 
     # ── Кнопки ✅ / ❌ на уведомлениях ──────────────────────────────────────
     app.add_handler(CallbackQueryHandler(
-        handle_admin_action, pattern=r"^(done|cancelled)_\d+$"
+        handle_admin_action, pattern=r"^((done|cancelled)_\d+|order_status:(in_progress|issued|cancelled):\d+)$"
     ))
 
     # ── Команды ──────────────────────────────────────────────────────────────
