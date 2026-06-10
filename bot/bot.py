@@ -81,6 +81,14 @@ RUSSIA_PLANS = [
 ]
 PLAN_MAP = {p[3]: {"gb": p[0], "days": p[1], "price": p[2]} for p in RUSSIA_PLANS}
 
+REFERRAL_REWARD_USD = 1.0
+STATUS_LEVELS = [
+    (100.0, "VIP"),
+    (50.0, "Pro"),
+    (10.0, "Explorer"),
+    (0.0, "Traveller"),
+]
+
 # ─── Состояния диалога ────────────────────────────────────────────────────────
 
 WAITING_PAYMENT, WAITING_NAME, WAITING_TELEGRAM = range(1, 4)
@@ -179,10 +187,133 @@ def default_user_profile(user) -> dict:
         "orders_count": 0,
         "total_spent": 0,
         "bonus_balance": 0,
+        "slik_balance": 0,
         "referrals": [],
         "referrer": None,
+        "referral_bonus_awarded": False,
         "status": "Traveller",
     }
+
+
+def format_usd(value) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"${amount:g}"
+
+
+def calculate_user_status(total_spent: float) -> str:
+    for threshold, status in STATUS_LEVELS:
+        if total_spent >= threshold:
+            return status
+    return "Traveller"
+
+
+def referral_entry_user_id(entry) -> str | None:
+    if isinstance(entry, dict):
+        user_id = entry.get("user_id")
+    else:
+        user_id = entry
+    return str(user_id) if user_id is not None else None
+
+
+def ensure_referral_entry(referrer_profile: dict, referred_user) -> None:
+    referrals = referrer_profile.setdefault("referrals", [])
+    referred_key = str(referred_user.id)
+    for entry in referrals:
+        if referral_entry_user_id(entry) == referred_key:
+            if isinstance(entry, dict):
+                entry["username"] = referred_user.username or entry.get("username", "")
+                entry["full_name"] = referred_user.full_name or entry.get("full_name", "")
+            return
+    referrals.append({
+        "user_id": referred_user.id,
+        "username": referred_user.username or "",
+        "full_name": referred_user.full_name or "",
+        "joined_at": now_str(),
+        "bonus_awarded": False,
+    })
+
+
+def credit_slik_balance(profile: dict, amount: float) -> None:
+    balance = round(float(profile.get("slik_balance", profile.get("bonus_balance", 0)) or 0) + amount, 2)
+    profile["slik_balance"] = balance
+    profile["bonus_balance"] = balance
+
+
+def register_start_referral(user, referrer_id: int | None) -> None:
+    if referrer_id is None or str(referrer_id) == str(user.id):
+        return
+    users = load_users()
+    user_key = str(user.id)
+    referrer_key = str(referrer_id)
+    profile = users.get(user_key) if isinstance(users.get(user_key), dict) else default_user_profile(user)
+    if profile.get("referrer"):
+        return
+    referrer_profile = users.get(referrer_key)
+    if not isinstance(referrer_profile, dict):
+        return
+
+    profile["referrer"] = referrer_id
+    profile.setdefault("referral_bonus_awarded", False)
+    profile["username"] = user.username or ""
+    profile["full_name"] = user.full_name or ""
+    ensure_referral_entry(referrer_profile, user)
+    users[user_key] = profile
+    users[referrer_key] = referrer_profile
+    save_users(users)
+
+
+def extract_referrer_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    if not context.args:
+        return None
+    payload = context.args[0].strip()
+    if not payload.startswith("ref_"):
+        return None
+    raw_id = payload.removeprefix("ref_").strip()
+    return int(raw_id) if raw_id.isdigit() else None
+
+
+def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict) -> bool:
+    if profile.get("referral_bonus_awarded"):
+        return False
+    referrer_id = profile.get("referrer")
+    if not referrer_id or str(referrer_id) == str(user.id):
+        return False
+
+    referrer_key = str(referrer_id)
+    referrer_profile = users.get(referrer_key)
+    if not isinstance(referrer_profile, dict):
+        return False
+
+    credit_slik_balance(profile, REFERRAL_REWARD_USD)
+    credit_slik_balance(referrer_profile, REFERRAL_REWARD_USD)
+    profile["referral_bonus_awarded"] = True
+    profile["referral_bonus_order"] = order.get("number")
+    profile["referral_bonus_awarded_at"] = now_str()
+
+    ensure_referral_entry(referrer_profile, user)
+    for entry in referrer_profile.get("referrals", []):
+        if isinstance(entry, dict) and referral_entry_user_id(entry) == str(user.id):
+            entry["bonus_awarded"] = True
+            entry["first_order_number"] = order.get("number")
+            entry["bonus_awarded_at"] = profile["referral_bonus_awarded_at"]
+            break
+
+    users[referrer_key] = referrer_profile
+    return True
+
+
+def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list | None = None) -> dict:
+    user_orders = orders if orders is not None else get_user_orders(user_id)
+    active_orders = [order for order in user_orders if order.get("status") != "cancelled"]
+    profile["orders_count"] = len(active_orders)
+    profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
+    profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
+    profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
+    profile["bonus_balance"] = profile.get("slik_balance", 0)
+    return profile
 
 
 def ensure_user_profile(user) -> dict:
@@ -197,9 +328,11 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("orders_count", 0)
         profile.setdefault("total_spent", 0)
         profile.setdefault("bonus_balance", 0)
+        profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
         profile.setdefault("referrals", [])
         profile.setdefault("referrer", None)
-        profile.setdefault("status", "Traveller")
+        profile.setdefault("referral_bonus_awarded", False)
+        profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
         profile["username"] = user.username or ""
         profile["full_name"] = user.full_name or ""
     users[key] = profile
@@ -213,12 +346,13 @@ def record_user_order(user, order: dict) -> None:
     profile = users.get(key) if isinstance(users.get(key), dict) else default_user_profile(user)
     profile["username"] = user.username or ""
     profile["full_name"] = user.full_name or ""
-    profile["orders_count"] = int(profile.get("orders_count") or 0) + 1
-    profile["total_spent"] = round(float(profile.get("total_spent") or 0) + parse_price(order.get("price", "0")), 2)
     profile.setdefault("bonus_balance", 0)
+    profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
     profile.setdefault("referrals", [])
     profile.setdefault("referrer", None)
-    profile.setdefault("status", "Traveller")
+    profile.setdefault("referral_bonus_awarded", False)
+    profile = update_profile_stats_from_orders(user.id, profile)
+    award_referral_bonus_if_needed(users, profile, user, order)
     users[key] = profile
     save_users(users)
 
@@ -228,13 +362,22 @@ def get_user_orders(user_id: int) -> list:
 
 
 def sync_user_order_stats(user, profile: dict) -> dict:
-    orders = get_user_orders(user.id)
-    profile["orders_count"] = len(orders)
-    profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in orders), 2)
+    profile = update_profile_stats_from_orders(user.id, profile, get_user_orders(user.id))
     users = load_users()
     users[str(user.id)] = profile
     save_users(users)
     return profile
+
+
+def sync_order_user_stats(user_id: int) -> None:
+    users = load_users()
+    key = str(user_id)
+    profile = users.get(key)
+    if not isinstance(profile, dict):
+        return
+    profile = update_profile_stats_from_orders(user_id, profile, get_user_orders(user_id))
+    users[key] = profile
+    save_users(users)
 
 
 def append_order(order: dict) -> dict:
@@ -258,6 +401,8 @@ def update_order_status(order_id: int, status: str) -> dict | None:
             o["status"]     = status
             o["updated_at"] = now_str()
             save_orders(orders)
+            if o.get("user_id") is not None:
+                sync_order_user_stats(o["user_id"])
             return o
     return None
 
@@ -538,7 +683,7 @@ def profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Мои заказы",       callback_data="profile_orders")],
         [InlineKeyboardButton("👥 Пригласить друга", callback_data="profile_invite")],
-        [InlineKeyboardButton("🎁 Мои бонусы",       callback_data="profile_bonuses")],
+        [InlineKeyboardButton("💰 SLIK Balance",     callback_data="profile_bonuses")],
         [InlineKeyboardButton("⬅️ Назад",            callback_data="back_main")],
     ])
 
@@ -562,6 +707,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user:
         ensure_user_profile(user)
+        register_start_referral(user, extract_referrer_id(context))
     if update.message:
         try:
             await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
@@ -719,8 +865,8 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Telegram ID: <code>{user.id}</code>\n"
         f"Статус: <b>{html_escape(profile.get('status', 'Traveller'))}</b>\n"
         f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
-        f"Сумма покупок: <b>${float(profile.get('total_spent') or 0):g}</b>\n"
-        f"Бонусный баланс: <b>{float(profile.get('bonus_balance') or 0):g}</b>\n"
+        f"Сумма покупок: <b>{format_usd(profile.get('total_spent'))}</b>\n"
+        f"SLIK Balance: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         f"Приглашено друзей: <b>{referrals_count}</b>"
     )
     await edit_or_send(query, context, text, profile_keyboard())
@@ -768,9 +914,44 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def show_profile_stub(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
+    if getattr(context.bot, "username", None):
+        return context.bot.username
+    bot_info = await context.bot.get_me()
+    return bot_info.username or ""
+
+
+async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    username = await get_bot_username(context)
+    referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
+    text = (
+        "👥 <b>Пригласить друга</b>\n\n"
+        "Поделитесь ссылкой с другом. После его первой заявки вы оба получите "
+        f"<b>{format_usd(REFERRAL_REWARD_USD)}</b> на SLIK Balance.\n\n"
+        f"Ваша реферальная ссылка:\n<code>{html_escape(referral_link)}</code>"
+    )
+    await edit_or_send(query, context, text, profile_back_keyboard())
+
+
+async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
+    referrals = profile.get("referrals", [])
+    referrals_count = len(referrals) if isinstance(referrals, list) else 0
+    awarded_count = sum(
+        1 for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    )
+    text = (
+        "🎁 <b>SLIK Balance</b>\n\n"
+        f"Баланс: <b>{format_usd(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        f"Приглашено друзей: <b>{referrals_count}</b>\n"
+        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
+        f"Бонус за первую заявку друга: <b>{format_usd(REFERRAL_REWARD_USD)}</b> вам и другу."
+    )
     await edit_or_send(query, context, text, profile_back_keyboard())
 
 
@@ -1614,9 +1795,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "profile_orders":
         await show_my_orders(update, context)
     elif data == "profile_invite":
-        await show_profile_stub(update, context, "👥 Скоро здесь появится реферальная программа")
+        await show_profile_invite(update, context)
     elif data == "profile_bonuses":
-        await show_profile_stub(update, context, "🎁 Скоро здесь появится бонусная система")
+        await show_profile_bonuses(update, context)
     elif data == "back_main":
         await query.answer()
         await start(update, context)
