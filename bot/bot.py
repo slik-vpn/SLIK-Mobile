@@ -8,6 +8,7 @@ import logging
 import datetime
 import asyncio
 import zipfile
+import math
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -56,6 +57,8 @@ CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
+CBR_DAILY_JSON_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
+EXCHANGE_RATE_API_URL = "https://open.er-api.com/v6/latest/USD"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
@@ -146,6 +149,123 @@ def parse_price(s: str) -> float:
         return float(s.replace("$", "").strip())
     except Exception:
         return 0.0
+
+
+def format_usd_price(value: float | str) -> str:
+    amount = parse_price(str(value))
+    return f"${amount:.2f}" if amount else html_escape(str(value))
+
+
+def read_float_env(name: str, default: float) -> float:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value.replace(",", "."))
+    except ValueError:
+        logger.warning(
+            "Некорректное значение %s=%r; используется значение по умолчанию %s",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+
+def get_usd_rub_fallback_rate() -> float:
+    return read_float_env("USD_RUB_FALLBACK_RATE", 90.0)
+
+
+def get_usd_rub_markup_percent() -> float:
+    return read_float_env("USD_RUB_MARKUP_PERCENT", 3.0)
+
+
+def apply_usd_rub_markup(rate: float) -> float:
+    return round(rate * (1 + get_usd_rub_markup_percent() / 100), 2)
+
+
+def round_rub_payment(amount_usd: float, effective_rate: float) -> int:
+    return int(math.ceil(amount_usd * effective_rate))
+
+
+def format_rub_amount(amount: int | float | str) -> str:
+    try:
+        rubles = int(amount)
+    except (TypeError, ValueError):
+        return html_escape(str(amount))
+    return f"{rubles:,}".replace(",", " ") + " ₽"
+
+
+def format_rub_rate(rate: float | str) -> str:
+    try:
+        return f"{float(rate):.2f} ₽"
+    except (TypeError, ValueError):
+        return html_escape(str(rate))
+
+
+def build_card_payment_details(amount_usd: float, effective_rate: float, source: str) -> dict:
+    rub_amount = round_rub_payment(amount_usd, effective_rate)
+    return {
+        "card_payment_usd": format_usd_price(amount_usd),
+        "card_payment_rub_amount": rub_amount,
+        "card_payment_rub": format_rub_amount(rub_amount),
+        "usd_rub_rate": round(float(effective_rate), 2),
+        "usd_rub_rate_text": format_rub_rate(effective_rate),
+        "usd_rub_source": source,
+    }
+
+
+async def fetch_usd_rub_rate_from_cbr(client: httpx.AsyncClient) -> float:
+    response = await client.get(CBR_DAILY_JSON_URL)
+    response.raise_for_status()
+    data = response.json()
+    return float(data["Valute"]["USD"]["Value"])
+
+
+async def fetch_usd_rub_rate_from_exchange_api(client: httpx.AsyncClient) -> float:
+    response = await client.get(EXCHANGE_RATE_API_URL)
+    response.raise_for_status()
+    data = response.json()
+    return float(data["rates"]["RUB"])
+
+
+async def get_usd_rub_rate() -> tuple[float, str]:
+    sources = (
+        ("CBR daily JSON", fetch_usd_rub_rate_from_cbr),
+        ("open.er-api.com", fetch_usd_rub_rate_from_exchange_api),
+    )
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for source_name, fetcher in sources:
+            try:
+                base_rate = await fetcher(client)
+                if base_rate <= 0:
+                    raise ValueError(f"rate must be positive, got {base_rate}")
+                return apply_usd_rub_markup(base_rate), source_name
+            except Exception as exc:
+                logger.warning("Не удалось получить курс USD/RUB из %s: %s", source_name, exc)
+
+    fallback_rate = get_usd_rub_fallback_rate()
+    effective_rate = apply_usd_rub_markup(fallback_rate)
+    logger.warning(
+        "Не удалось получить курс USD/RUB из публичных источников; используется fallback USD_RUB_FALLBACK_RATE=%s с markup %s%%",
+        fallback_rate,
+        get_usd_rub_markup_percent(),
+    )
+    return effective_rate, "fallback"
+
+
+async def get_card_payment_details(amount_usd: float) -> dict:
+    effective_rate, source = await get_usd_rub_rate()
+    return build_card_payment_details(amount_usd, effective_rate, source)
+
+
+def card_payment_admin_lines(order: dict) -> str:
+    if order.get("payment_method") != "Карта" or not order.get("card_payment_rub"):
+        return ""
+    return (
+        f"К оплате по карте: <b>{html_escape(str(order.get('card_payment_rub')))}</b>\n"
+        f"Курс: <b>{html_escape(format_rub_rate(order.get('usd_rub_rate', order.get('usd_rub_rate_text', '—'))))}</b>\n"
+    )
 
 # ─── config.json ──────────────────────────────────────────────────────────────
 
@@ -1396,12 +1516,16 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cfg = load_config()
         card = cfg["payment"].get("card", "")
         context.user_data["payment_method"] = "Карта"
-        card_text = f"<code>{card}</code>" if card else "Реквизиты карты уточните у менеджера"
+        amount_usd = parse_price(plan.get("price", "0"))
+        payment_details = await get_card_payment_details(amount_usd)
+        context.user_data["card_payment_details"] = payment_details
+        card_text = f"<code>{html_escape(card)}</code>" if card else "Реквизиты карты уточните у менеджера"
         await query.message.reply_text(
             f"💳 <b>Перевод на карту</b>\n\n"
-            f"Сумма: <b>{plan.get('price', '—')}</b>\n\n"
+            f"Сумма: <b>{payment_details['card_payment_usd']}</b>\n"
+            f"К оплате: <b>{payment_details['card_payment_rub']}</b>\n\n"
             f"Карта: {card_text}\n\n"
-            "Переведите сумму и нажмите «Я оплатил».",
+            "Переведите сумму в рублях и нажмите «Я оплатил».",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Я оплатил",       callback_data="payment_done")],
@@ -1522,7 +1646,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     name    = context.user_data["name"]
     payment = context.user_data.get("payment_method", "—")
 
-    order = append_order({
+    order_data = {
         "gb":             plan["gb"],
         "days":           plan["days"],
         "price":          plan["price"],
@@ -1532,7 +1656,11 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "name":           name,
         "tg_handle":      tg_handle,
         "user_id":        user.id,
-    })
+    }
+    if payment == "Карта":
+        order_data.update(context.user_data.get("card_payment_details") or {})
+
+    order = append_order(order_data)
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
     await update.message.reply_text(
@@ -1637,11 +1765,13 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
 
     payment_method = order.get("payment_method")
     payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
+    card_payment_lines = card_payment_admin_lines(order)
     text = (
         "🔥 <b>Новый заказ</b>\n\n"
         f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
         f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
-        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+        f"💵 Цена: <b>{format_usd_price(order.get('price', '—'))}</b>\n"
+        f"{card_payment_lines}"
         f"{payment_line}\n"
         f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
         f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"

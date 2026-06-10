@@ -159,11 +159,13 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         logger.warning("ADMIN_CHAT_ID is not set; order notification was not sent")
         return
     payment_line = f"Оплата: <b>{escape_html(order.get('payment_method'))}</b>\n" if order.get("payment_method") else ""
+    card_payment_lines = bot.card_payment_admin_lines(order)
     text = (
         "<b>Новый заказ</b>\n\n"
         f"Номер заказа: <b>{escape_html(order.get('number'))}</b>\n\n"
         f"Тариф: <b>{escape_html(order.get('gb'))} / {escape_html(order.get('days'))}</b>\n"
-        f"Цена: <b>{escape_html(order.get('price'))}</b>\n"
+        f"Цена: <b>{bot.format_usd_price(order.get('price'))}</b>\n"
+        f"{card_payment_lines}"
         f"{payment_line}\n"
         f"Имя: <b>{escape_html(order.get('name'))}</b>\n"
         f"Telegram: <b>{escape_html(order.get('tg_handle'))}</b>\n\n"

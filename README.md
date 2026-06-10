@@ -16,10 +16,14 @@ Telegram-бот для ручного MVP продажи eSIM. Текущая в
 ```env
 TELEGRAM_BOT_TOKEN=1234567890:replace_me
 ADMIN_CHAT_ID=-1001234567890
+USD_RUB_FALLBACK_RATE=90
+USD_RUB_MARKUP_PERCENT=3
 ```
 
 `TELEGRAM_BOT_TOKEN` берётся у `@BotFather`.
 `ADMIN_CHAT_ID` — ID админ-группы или личного чата для уведомлений.
+`USD_RUB_FALLBACK_RATE` — запасной курс USD/RUB для оплаты переводом на РФ карту, если публичные источники курса временно недоступны.
+`USD_RUB_MARKUP_PERCENT` — наценка/буфер в процентах, который добавляется к полученному или fallback-курсу перед расчётом суммы в рублях.
 
 ## Запуск через Docker Compose
 
@@ -201,7 +205,11 @@ sudo systemctl start slik-mobile
 /setpayment crypto CRYPTOBOT_API_TOKEN
 ```
 
-Оплата картой в MVP подтверждается вручную менеджером. CryptoBot создаёт счёт и проверяет статус по кнопке клиента.
+Оплата картой в MVP подтверждается вручную менеджером. На экране перевода бот показывает цену тарифа в USD и сумму к оплате в рублях. Для расчёта USD/RUB бот сначала запрашивает публичный курс из CBR daily JSON, затем использует fallback-источник `open.er-api.com`; если оба источника недоступны, бот не падает, пишет warning в лог и берёт `USD_RUB_FALLBACK_RATE` из окружения.
+
+Перед показом клиенту к курсу применяется буфер `USD_RUB_MARKUP_PERCENT`. Например, при `USD_RUB_FALLBACK_RATE=90` и `USD_RUB_MARKUP_PERCENT=3` итоговый курс будет `92.70 ₽`. Итоговая сумма в рублях всегда округляется вверх до целого рубля.
+
+CryptoBot создаёт счёт и проверяет статус по кнопке клиента.
 
 ## Установка на VPS через systemd
 
