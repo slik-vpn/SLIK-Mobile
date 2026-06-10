@@ -57,6 +57,7 @@ RUSSIA_IMAGE = IMAGES_DIR / "russia.jpg"   # запасной файл для Р
 CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
+BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
 USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
@@ -72,6 +73,7 @@ BACKUP_FILES = [
     (USERS_FILE, "bot/users.json", "users.json"),
     (ORDERS_FILE, "bot/orders.json", "orders.json"),
     (CONFIG_FILE, "bot/config.json", "config.json"),
+    (BALANCE_LOG_FILE, "bot/balance_changes.json", "balance_changes.json"),
 ]
 
 # Экраны с баннерами
@@ -1311,12 +1313,12 @@ def build_order_card_text(order: dict) -> str:
     )
 
 
-def order_card_keyboard(order_id: int) -> InlineKeyboardMarkup:
+def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
         [InlineKeyboardButton("📤 Выдано", callback_data=f"order_status:issued:{order_id}")],
         [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_orders")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
     ])
 
 
@@ -1330,6 +1332,291 @@ def build_orders_stats_text() -> str:
         f"За 7 дней: <b>{week_count}</b> / <b>${week_total:.2f}</b>\n"
         f"За 30 дней: <b>{month_count}</b> / <b>${month_total:.2f}</b>"
     )
+
+
+CLIENT_CATEGORY_TITLES = {
+    "no_orders": "🆕 Без покупок",
+    "buyers": "💰 Покупатели",
+    "return": "🔄 Вернуть клиентов",
+    "top": "💎 Топ клиенты",
+}
+CLIENT_INPUT_BALANCE = "client_balance"
+CLIENT_INPUT_MESSAGE = "client_message"
+CLIENT_INPUT_SEARCH = "client_search"
+
+
+def load_balance_log() -> list:
+    if BALANCE_LOG_FILE.exists():
+        try:
+            data = json.loads(BALANCE_LOG_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def append_balance_log(admin_id: int, user_id: int, amount: float) -> None:
+    log = load_balance_log()
+    log.append({
+        "admin_id": admin_id,
+        "user_id": user_id,
+        "amount": amount,
+        "created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"),
+    })
+    BALANCE_LOG_FILE.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def parse_order_datetime(order: dict) -> datetime.datetime | None:
+    created_date = order.get("created_date")
+    if created_date:
+        try:
+            return datetime.datetime.combine(datetime.date.fromisoformat(str(created_date)), datetime.time.min, tzinfo=TZ)
+        except ValueError:
+            pass
+    created_at = str(order.get("created_at") or "")
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.datetime.strptime(created_at[:16], fmt)
+            return parsed.replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def days_ago_text(moment: datetime.datetime | None) -> str:
+    if not moment:
+        return "—"
+    today = datetime.datetime.now(tz=TZ).date()
+    days = max((today - moment.astimezone(TZ).date()).days, 0)
+    if days == 0:
+        return "сегодня"
+    if days == 1:
+        return "1 день назад"
+    if 2 <= days <= 4:
+        return f"{days} дня назад"
+    return f"{days} дней назад"
+
+
+def client_display_name(user_id: str, profile: dict) -> str:
+    name = str(profile.get("full_name") or "").strip()
+    if name:
+        return name
+    username = str(profile.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    return f"ID {user_id}"
+
+
+def collect_clients() -> list[dict]:
+    users = load_users()
+    orders = load_orders()
+    orders_by_user: dict[str, list] = {}
+    for order in orders:
+        user_id = order.get("user_id")
+        if user_id is not None:
+            orders_by_user.setdefault(str(user_id), []).append(order)
+
+    clients = []
+    for user_id, profile in users.items():
+        if not isinstance(profile, dict):
+            continue
+        user_orders = orders_by_user.get(str(user_id), [])
+        active_orders = [order for order in user_orders if normalize_order_status(order.get("status")) != "cancelled"]
+        total_spent = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
+        order_dates = [date for date in (parse_order_datetime(order) for order in active_orders) if date]
+        last_order_at = max(order_dates, default=None)
+        orders_count = len(active_orders)
+        status = calculate_user_status(total_spent)
+        created_at = parse_iso_datetime(str(profile.get("created_at") or ""))
+        if created_at is None:
+            for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+                try:
+                    created_at = datetime.datetime.strptime(str(profile.get("created_at") or ""), fmt).replace(tzinfo=TZ)
+                    break
+                except ValueError:
+                    pass
+        clients.append({
+            "user_id": str(user_id),
+            "profile": profile,
+            "orders": sorted(active_orders, key=order_sort_key, reverse=True),
+            "orders_count": orders_count,
+            "total_spent": total_spent,
+            "last_order_at": last_order_at,
+            "created_at": created_at or datetime.datetime.min.replace(tzinfo=TZ),
+            "status": status,
+        })
+    return clients
+
+
+def client_category_items(category: str) -> list[dict]:
+    clients = collect_clients()
+    now_date = datetime.datetime.now(tz=TZ).date()
+    if category == "no_orders":
+        items = [client for client in clients if client["orders_count"] == 0]
+        return sorted(items, key=lambda client: client["created_at"], reverse=True)[:20]
+    if category == "buyers":
+        items = [client for client in clients if client["orders_count"] > 0]
+        return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
+    if category == "return":
+        items = [
+            client for client in clients
+            if client["orders_count"] > 0
+            and client["last_order_at"]
+            and (now_date - client["last_order_at"].astimezone(TZ).date()).days > 30
+        ]
+        return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
+    if category == "top":
+        items = [client for client in clients if client["orders_count"] > 0]
+        return sorted(items, key=lambda client: client["total_spent"], reverse=True)[:20]
+    return []
+
+
+def clients_dashboard_text() -> str:
+    clients = collect_clients()
+    now_date = datetime.datetime.now(tz=TZ).date()
+    no_orders = sum(1 for client in clients if client["orders_count"] == 0)
+    buyers = sum(1 for client in clients if client["orders_count"] > 0)
+    return_clients = sum(
+        1 for client in clients
+        if client["orders_count"] > 0
+        and client["last_order_at"]
+        and (now_date - client["last_order_at"].astimezone(TZ).date()).days > 30
+    )
+    premium = sum(1 for client in clients if client["status"] in {"Premium", "Ambassador"})
+    return (
+        "👥 <b>Клиенты</b>\n"
+        f"Всего клиентов: <b>{len(clients)}</b>\n"
+        f"🆕 Без покупок: <b>{no_orders}</b>\n"
+        f"💰 Покупатели: <b>{buyers}</b>\n"
+        f"🔄 Не покупали более 30 дней: <b>{return_clients}</b>\n"
+        f"💎 Premium/VIP: <b>{premium}</b>"
+    )
+
+
+def clients_dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🆕 Без покупок", callback_data="clients_cat:no_orders")],
+        [InlineKeyboardButton("💰 Покупатели", callback_data="clients_cat:buyers")],
+        [InlineKeyboardButton("🔄 Вернуть клиентов", callback_data="clients_cat:return")],
+        [InlineKeyboardButton("💎 Топ клиенты", callback_data="clients_cat:top")],
+        [InlineKeyboardButton("🔍 Найти клиента", callback_data="clients_search")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def client_list_text(category: str) -> str:
+    title = CLIENT_CATEGORY_TITLES.get(category, "👥 Клиенты")
+    items = client_category_items(category)
+    if not items:
+        return f"{title}\n\nКлиентов в этой категории нет."
+    lines = [title, "", "Последние 20 клиентов:" if category != "top" else "ТОП-20 клиентов:", ""]
+    for client in items:
+        lines.append(f"{html_escape(client_display_name(client['user_id'], client['profile']))} — <b>{format_usd_cents(client['total_spent'])}</b>")
+    return "\n".join(lines)
+
+
+def client_list_keyboard(category: str) -> InlineKeyboardMarkup:
+    rows = []
+    for client in client_category_items(category):
+        name = client_display_name(client["user_id"], client["profile"])
+        rows.append([InlineKeyboardButton(f"{name} — {format_usd(client['total_spent'])}", callback_data=f"client_card:{client['user_id']}:{category}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
+    return InlineKeyboardMarkup(rows)
+
+
+def find_client(user_id: str) -> dict | None:
+    return next((client for client in collect_clients() if client["user_id"] == str(user_id)), None)
+
+
+def client_card_text(user_id: str) -> str:
+    client = find_client(user_id)
+    if not client:
+        return "Клиент не найден."
+    profile = client["profile"]
+    username = str(profile.get("username") or "").strip().lstrip("@")
+    username_text = f"@{username}" if username else "—"
+    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    return (
+        f"👤 <b>{html_escape(client_display_name(user_id, profile))}</b>\n"
+        f"🆔 Telegram ID: <code>{html_escape(user_id)}</code>\n"
+        "Username:\n"
+        f"{html_escape(username_text)}\n"
+        f"📦 Заказов: <b>{client['orders_count']}</b>\n"
+        "💰 Потрачено:\n"
+        f"<b>{format_usd_cents(client['total_spent'])}</b>\n"
+        "💵 SLIK Balance:\n"
+        f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        "🏅 Статус:\n"
+        f"<b>{html_escape(format_status(client['status']))}</b>\n"
+        "👥 Приглашено друзей:\n"
+        f"<b>{len(referrals)}</b>\n"
+        "📅 Последний заказ:\n"
+        f"<b>{html_escape(days_ago_text(client['last_order_at']))}</b>"
+    )
+
+
+def client_card_keyboard(user_id: str, back: str = "buyers", user=None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("📦 Заказы клиента", callback_data=f"client_orders:{user_id}")]]
+    if get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}:
+        rows.append([InlineKeyboardButton("💰 Изменить баланс", callback_data=f"client_balance:{user_id}")])
+        rows.append([InlineKeyboardButton("✉️ Написать клиенту", callback_data=f"client_message:{user_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"clients_cat:{back}" if back in CLIENT_CATEGORY_TITLES else "admin_clients")])
+    return InlineKeyboardMarkup(rows)
+
+
+def client_orders_text(user_id: str) -> str:
+    client = find_client(user_id)
+    if not client:
+        return "Клиент не найден."
+    if not client["orders"]:
+        return f"📦 <b>Заказы клиента</b>\n\nУ клиента {html_escape(client_display_name(user_id, client['profile']))} пока нет заказов."
+    return f"📦 <b>Заказы клиента</b>\n\n{html_escape(client_display_name(user_id, client['profile']))}: <b>{len(client['orders'])}</b>"
+
+
+def client_orders_keyboard(user_id: str) -> InlineKeyboardMarkup:
+    client = find_client(user_id)
+    rows = []
+    if client:
+        for order in client["orders"]:
+            rows.append([InlineKeyboardButton(format_order_button_text(order), callback_data=f"client_order_card:{user_id}:{order.get('id')}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")])
+    return InlineKeyboardMarkup(rows)
+
+
+def search_clients(query_text: str) -> list[dict]:
+    query = query_text.strip().lower().lstrip("@")
+    if not query:
+        return []
+    results = []
+    for client in collect_clients():
+        profile = client["profile"]
+        haystack = " ".join([
+            client["user_id"],
+            str(profile.get("telegram_id") or ""),
+            str(profile.get("username") or "").lower().lstrip("@"),
+            str(profile.get("full_name") or "").lower(),
+        ])
+        if query in haystack:
+            results.append(client)
+    return results[:20]
+
+
+def search_results_text(results: list[dict], query_text: str) -> str:
+    if not results:
+        return f"🔍 <b>Поиск клиента</b>\n\nПо запросу <b>{html_escape(query_text)}</b> ничего не найдено."
+    lines = ["🔍 <b>Поиск клиента</b>", "", f"Найдено: <b>{len(results)}</b>", ""]
+    for client in results:
+        lines.append(f"{html_escape(client_display_name(client['user_id'], client['profile']))} — <b>{format_usd_cents(client['total_spent'])}</b>")
+    return "\n".join(lines)
+
+
+def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"{client_display_name(client['user_id'], client['profile'])} — {format_usd(client['total_spent'])}", callback_data=f"client_card:{client['user_id']}:search")]
+        for client in results
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def notify_client_order_status(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
@@ -2217,6 +2504,106 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(order_id))
 
 
+# ─── Вводы Clients CRM ───────────────────────────────────────────────────────
+
+async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    input_mode = context.user_data.get("client_input")
+    if not input_mode:
+        return
+    if not has_admin_access(update.effective_user):
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await deny_admin_access(update)
+        return
+
+    if input_mode == CLIENT_INPUT_SEARCH:
+        query_text = msg.text.strip()
+        context.user_data.pop("client_input", None)
+        results = search_clients(query_text)
+        await msg.reply_text(
+            search_results_text(results, query_text),
+            parse_mode="HTML",
+            reply_markup=search_results_keyboard(results),
+        )
+        return
+
+    user_id = str(context.user_data.get("client_target_id") or "")
+    if not user_id or not find_client(user_id):
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text("Клиент не найден.")
+        return
+
+    if input_mode == CLIENT_INPUT_BALANCE:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может менять баланс.")
+            return
+        raw_amount = msg.text.strip().replace(",", ".")
+        try:
+            amount = float(raw_amount)
+        except ValueError:
+            await msg.reply_text("Введите сумму в формате +5, -3 или +10.5.")
+            return
+        if amount == 0:
+            await msg.reply_text("Сумма не должна быть равна 0.")
+            return
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await msg.reply_text("Клиент не найден.")
+            return
+        old_balance = float(profile.get("slik_balance", profile.get("bonus_balance", 0)) or 0)
+        new_balance = round(old_balance + amount, 2)
+        profile["slik_balance"] = new_balance
+        profile["bonus_balance"] = new_balance
+        users[user_id] = profile
+        save_users(users)
+        append_balance_log(update.effective_user.id, int(user_id), amount)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text(
+            "✅ Баланс обновлён.\n\n"
+            f"Было: <b>{format_usd_cents(old_balance)}</b>\n"
+            f"Изменение: <b>{format_usd_cents(amount)}</b>\n"
+            f"Стало: <b>{format_usd_cents(new_balance)}</b>",
+            parse_mode="HTML",
+            reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user),
+        )
+        return
+
+    if input_mode == CLIENT_INPUT_MESSAGE:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может писать клиентам.")
+            return
+        text = msg.text.strip()
+        if not text:
+            await msg.reply_text("Введите непустое сообщение.")
+            return
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id),
+                text=f"👨‍💻 <b>Сообщение от SLIK Mobile:</b>\n\n{html_escape(text)}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
+                ]),
+            )
+            await msg.reply_text("✅ Сообщение отправлено.", reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user))
+        except Exception:
+            logger.exception("Не удалось доставить сообщение клиенту %s", user_id)
+            await msg.reply_text("❌ Не удалось доставить сообщение.", reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user))
+
+
 # ─── Ответ админа клиенту через reply ────────────────────────────────────────
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2656,7 +3043,7 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
         return
-    await update.message.reply_text("👥 Раздел клиентов подготовлен для будущей CRM.")
+    await update.message.reply_text(clients_dashboard_text(), parse_mode="HTML", reply_markup=clients_dashboard_keyboard())
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2673,7 +3060,7 @@ def admin_panel_text(user) -> str:
         f"Роль: <b>{role}</b>\n\n"
         "Доступные разделы:\n"
         "• 📋 Заказы и статистика\n"
-        "• 👥 Клиенты — заготовка для CRM\n"
+        "• 👥 Клиенты — CRM клиентов\n"
         "• 📰 Новости — заготовка для CRM\n"
         + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
     )
@@ -2703,7 +3090,7 @@ async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, "👥 <b>Клиенты</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard(query.from_user))
+    await edit_or_send(query, context, clients_dashboard_text(), clients_dashboard_keyboard())
 
 
 async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2781,7 +3168,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_cleanup_prompt",
         "backup_cleanup_yes",
     }
-    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:")
+    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
     if data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
     elif (data.startswith(admin_prefixes) or data == "orders_stats") and not has_admin_access(query.from_user):
@@ -2800,6 +3187,63 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(order_id))
+    elif data.startswith("clients_cat:"):
+        await query.answer()
+        category = data.split(":", 1)[1]
+        await edit_or_send(query, context, client_list_text(category), client_list_keyboard(category))
+    elif data == "clients_search":
+        await query.answer()
+        context.user_data["client_input"] = CLIENT_INPUT_SEARCH
+        await edit_or_send(
+            query, context,
+            "🔍 <b>Найти клиента</b>\n\nВведите Telegram ID, username или имя клиента.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")]]),
+        )
+    elif data.startswith("client_card:"):
+        _prefix, user_id, back = data.split(":", 2)
+        if not find_client(user_id):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, back, query.from_user))
+    elif data.startswith("client_orders:"):
+        user_id = data.split(":", 1)[1]
+        await query.answer()
+        await edit_or_send(query, context, client_orders_text(user_id), client_orders_keyboard(user_id))
+    elif data.startswith("client_order_card:"):
+        _prefix, user_id, order_id_raw = data.split(":", 2)
+        order = find_order(int(order_id_raw))
+        if not order:
+            await query.answer("Заявка не найдена.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(int(order_id_raw), f"client_orders:{user_id}"))
+    elif data.startswith("client_balance:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять баланс.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        context.user_data["client_input"] = CLIENT_INPUT_BALANCE
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "💰 <b>Изменить баланс</b>\n\nВведите сумму.\nПримеры:\n<code>+5</code>\n<code>-3</code>\n<code>+10.5</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("client_message:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может писать клиентам.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        context.user_data["client_input"] = CLIENT_INPUT_MESSAGE
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✉️ <b>Написать клиенту</b>\n\nВведите сообщение для отправки клиенту.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
     elif data == "orders_stats":
         await query.answer()
         await edit_or_send(
@@ -2977,6 +3421,12 @@ def main() -> None:
 
     # ── Навигационные callback'и ──────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # ── Вводы админа в Clients CRM ──────────────────────────────────────────
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_client_crm_input,
+    ), group=-1)
 
     # ── Reply администратора → клиенту (в группе) ────────────────────────────
     app.add_handler(MessageHandler(
