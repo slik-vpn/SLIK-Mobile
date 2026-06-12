@@ -75,6 +75,9 @@ BACKUP_FILES = [
     (CONFIG_FILE, "bot/config.json", "config.json"),
     (BALANCE_LOG_FILE, "bot/balance_changes.json", "balance_changes.json"),
 ]
+BACKUP_EMPTY_DEFAULTS = {
+    BALANCE_LOG_FILE: "[]\n",
+}
 
 # Экраны с баннерами
 BANNER_SCREENS = {
@@ -253,6 +256,7 @@ def default_user_profile(user) -> dict:
         "bonus_balance": 0,
         "slik_balance": 0,
         "referrals": [],
+        "referral_clicks": 0,
         "referrer": None,
         "referral_bonus_awarded": False,
         "status": "Traveller",
@@ -555,6 +559,45 @@ def credit_slik_balance(profile: dict, amount: float) -> None:
     profile["bonus_balance"] = balance
 
 
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def referral_analytics_for_profile(profile: dict) -> dict:
+    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    bought = sum(
+        1 for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    )
+    bonuses_awarded = round(sum(
+        safe_float(entry.get("bonus_amount"))
+        for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    ), 2)
+    referrals_count = len(referrals)
+    return {
+        "clicks": max(safe_int(profile.get("referral_clicks")), 0),
+        "referrals": referrals_count,
+        "bought": bought,
+        "not_bought": max(referrals_count - bought, 0),
+        "bonuses_awarded": bonuses_awarded,
+    }
+
+
+def increment_referral_click(referrer_profile: dict) -> None:
+    referrer_profile["referral_clicks"] = max(safe_int(referrer_profile.get("referral_clicks")), 0) + 1
+
+
 def register_start_referral(user, referrer_id: int | None) -> None:
     if referrer_id is None or str(referrer_id) == str(user.id):
         return
@@ -562,10 +605,14 @@ def register_start_referral(user, referrer_id: int | None) -> None:
     user_key = str(user.id)
     referrer_key = str(referrer_id)
     profile = users.get(user_key) if isinstance(users.get(user_key), dict) else default_user_profile(user)
-    if profile.get("referrer"):
-        return
     referrer_profile = users.get(referrer_key)
     if not isinstance(referrer_profile, dict):
+        return
+
+    increment_referral_click(referrer_profile)
+    if profile.get("referrer"):
+        users[referrer_key] = referrer_profile
+        save_users(users)
         return
 
     profile["referrer"] = referrer_id
@@ -691,6 +738,7 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("bonus_balance", 0)
         profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
         profile.setdefault("referrals", [])
+        profile.setdefault("referral_clicks", 0)
         profile.setdefault("referrer", None)
         profile.setdefault("referral_bonus_awarded", False)
         profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
@@ -895,21 +943,40 @@ def cleanup_old_backups(keep_limit: int = BACKUP_KEEP_LIMIT) -> list[Path]:
     return deleted
 
 
+def ensure_backup_source_file(source_path: Path, display_name: str) -> str | None:
+    if source_path.exists():
+        return None
+    default_content = BACKUP_EMPTY_DEFAULTS.get(source_path)
+    if default_content is None:
+        return f"{display_name} отсутствует и пропущен"
+    try:
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(default_content, encoding="utf-8")
+    except Exception as error:
+        logger.warning("Не удалось создать пустой файл для бэкапа %s: %s", source_path, error)
+        return f"{display_name} отсутствует и пропущен"
+    return f"{display_name} отсутствовал, создан пустой файл"
+
+
 def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
     created_at = created_at or datetime.datetime.now(tz=TZ)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     archive_path = BACKUPS_DIR / f"backup_{created_at.strftime('%Y-%m-%d_%H-%M')}.zip"
     included: list[str] = []
     skipped: list[str] = []
+    warnings: list[str] = []
 
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
         for source_path, archive_name, display_name in BACKUP_FILES:
+            warning = ensure_backup_source_file(source_path, display_name)
+            if warning:
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, source_path)
             if source_path.exists():
                 zip_file.write(source_path, arcname=archive_name)
                 included.append(display_name)
             else:
                 skipped.append(display_name)
-                logger.warning("Файл для бэкапа отсутствует и пропущен: %s", source_path)
 
     cleanup_old_backups()
     logger.info("Создан бэкап runtime-данных: %s", archive_path)
@@ -918,6 +985,31 @@ def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
         "created_at": created_at,
         "included": included,
         "skipped": skipped,
+        "warnings": warnings,
+    }
+
+
+def restore_backup_archive(archive_path: Path) -> dict:
+    restored: list[str] = []
+    warnings: list[str] = []
+
+    with zipfile.ZipFile(archive_path, "r") as zip_file:
+        archive_names = set(zip_file.namelist())
+        for target_path, archive_name, display_name in BACKUP_FILES:
+            if archive_name not in archive_names:
+                warning = f"{display_name} отсутствует в архиве"
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, archive_path)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(zip_file.read(archive_name))
+            restored.append(display_name)
+
+    logger.info("Восстановлен бэкап runtime-данных: %s", archive_path)
+    return {
+        "path": archive_path,
+        "restored": restored,
+        "warnings": warnings,
     }
 
 
@@ -925,6 +1017,7 @@ def format_backup_caption(backup_info: dict) -> str:
     created_at = backup_info["created_at"].strftime("%d.%m.%Y %H:%M")
     included = backup_info.get("included") or []
     skipped = backup_info.get("skipped") or []
+    warnings = backup_info.get("warnings") or []
     included_text = "\n".join(f"• {name}" for name in included) or "• —"
     text = (
         "💾 Автоматический бэкап SLIK Mobile\n\n"
@@ -936,6 +1029,9 @@ def format_backup_caption(backup_info: dict) -> str:
     if skipped:
         skipped_text = "\n".join(f"• {name}" for name in skipped)
         text += f"\n\nПропущено:\n{skipped_text}"
+    if warnings:
+        warnings_text = "\n".join(f"• {warning}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
     return text
 
 
@@ -984,7 +1080,7 @@ async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     lines = ["💾 Последние бэкапы:", ""]
     lines.extend(f"{index}. {archive.name}" for index, archive in enumerate(archives, start=1))
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=backups_keyboard())
 
 
 def schedule_automatic_backups(app: Application) -> None:
@@ -1535,7 +1631,7 @@ def client_card_text(user_id: str) -> str:
     profile = client["profile"]
     username = str(profile.get("username") or "").strip().lstrip("@")
     username_text = f"@{username}" if username else "—"
-    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    referral_stats = referral_analytics_for_profile(profile)
     return (
         f"👤 <b>{html_escape(client_display_name(user_id, profile))}</b>\n"
         f"🆔 Telegram ID: <code>{html_escape(user_id)}</code>\n"
@@ -1548,8 +1644,11 @@ def client_card_text(user_id: str) -> str:
         f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         "🏅 Статус:\n"
         f"<b>{html_escape(format_status(client['status']))}</b>\n"
-        "👥 Приглашено друзей:\n"
-        f"<b>{len(referrals)}</b>\n"
+        "👥 Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n"
         "📅 Последний заказ:\n"
         f"<b>{html_escape(days_ago_text(client['last_order_at']))}</b>"
     )
@@ -1673,8 +1772,16 @@ def backups_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📥 Скачать последний", callback_data="backup_download_latest")],
         [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
         [InlineKeyboardButton("📋 Список архивов", callback_data="backup_list")],
+        [InlineKeyboardButton("♻️ Восстановить последний", callback_data="backup_restore_prompt")],
         [InlineKeyboardButton("🗑 Очистить старые", callback_data="backup_cleanup_prompt")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def backup_restore_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Восстановить", callback_data="backup_restore_latest")],
+        [InlineKeyboardButton("❌ Нет", callback_data="admin_backups")],
     ])
 
 
@@ -1693,6 +1800,22 @@ def build_backup_list_text() -> str:
     else:
         lines.append("Архивы не найдены.")
     return "\n".join(lines)
+
+
+def format_restore_result(restore_info: dict) -> str:
+    restored = restore_info.get("restored") or []
+    warnings = restore_info.get("warnings") or []
+    restored_text = "\n".join(f"• {name}" for name in restored) or "• —"
+    text = (
+        "✅ <b>Бэкап восстановлен</b>\n\n"
+        f"Файл: <code>{html_escape(restore_info['path'].name)}</code>\n\n"
+        "Восстановлено:\n"
+        f"{restored_text}"
+    )
+    if warnings:
+        warnings_text = "\n".join(f"• {html_escape(warning)}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
+    return text
 
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
@@ -2053,6 +2176,7 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
+    referral_stats = referral_analytics_for_profile(profile)
     username = await get_bot_username(context)
     referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
     text = (
@@ -2061,6 +2185,11 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
         "За первую заявку друга:\n"
         f"Вы получите: <b>{format_usd(referral_reward)}</b>\n"
         f"Друг получит: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>\n\n"
+        "Ваша статистика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Ваша ссылка:\n<code>{html_escape(referral_link)}</code>"
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -2070,12 +2199,7 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
-    referrals = profile.get("referrals", [])
-    referrals_count = len(referrals) if isinstance(referrals, list) else 0
-    awarded_count = sum(
-        1 for entry in referrals
-        if isinstance(entry, dict) and entry.get("bonus_awarded")
-    )
+    referral_stats = referral_analytics_for_profile(profile)
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
     text = (
@@ -2084,8 +2208,11 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Статус: <b>{html_escape(format_status(status))}</b>\n"
         f"Ваш кэшбэк: <b>{cashback_percent_for_status(status)}%</b>\n"
         f"Ваш бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
-        f"Приглашено друзей: <b>{referrals_count}</b>\n"
-        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
+        "Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -3167,6 +3294,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_list",
         "backup_cleanup_prompt",
         "backup_cleanup_yes",
+        "backup_restore_prompt",
+        "backup_restore_latest",
     }
     admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
     if data in backup_callbacks and not has_backup_access(query.from_user):
@@ -3273,6 +3402,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "backup_list":
         await query.answer()
         await edit_or_send(query, context, build_backup_list_text(), backups_keyboard())
+    elif data == "backup_restore_prompt":
+        await query.answer()
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        await edit_or_send(
+            query, context,
+            "⚠️ <b>Восстановить последний архив?</b>\n"
+            f"Файл: <code>{html_escape(archives[0].name)}</code>\n\n"
+            "Текущие runtime-файлы будут перезаписаны.",
+            backup_restore_confirm_keyboard(),
+        )
+    elif data == "backup_restore_latest":
+        await query.answer("Восстанавливаю бэкап...")
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        try:
+            restore_info = restore_backup_archive(archives[0])
+            await edit_or_send(query, context, format_restore_result(restore_info), backups_keyboard())
+        except Exception:
+            logger.exception("Не удалось восстановить последний бэкап")
+            await edit_or_send(query, context, "Не удалось восстановить бэкап. Ошибка записана в лог.", backups_keyboard())
     elif data == "backup_cleanup_prompt":
         await query.answer()
         await edit_or_send(
