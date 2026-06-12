@@ -1439,6 +1439,17 @@ CLIENT_CATEGORY_TITLES = {
 CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
 CLIENT_INPUT_SEARCH = "client_search"
+BROADCAST_INPUT_MESSAGE = "broadcast_message"
+BROADCAST_CATEGORIES = {
+    "all": "👥 Все клиенты",
+    "no_orders": "🆕 Без заказов",
+    "buyers": "💳 С заказами",
+    "balance": "💰 С балансом",
+    "vip": "👑 VIP / Premium / Ambassador",
+    "regular": "🧳 Traveller / Explorer / Nomad",
+    "referrers": "👥 Рефереры",
+    "inactive": "😴 Неактивные",
+}
 
 
 def load_balance_log() -> list:
@@ -1716,6 +1727,110 @@ def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
     return InlineKeyboardMarkup(rows)
+
+
+def has_broadcast_access(user) -> bool:
+    return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}
+
+
+def broadcast_category_title(category: str) -> str:
+    return BROADCAST_CATEGORIES.get(category, "📰 Рассылка")
+
+
+def broadcast_recipients(category: str) -> list[dict]:
+    clients = collect_clients()
+    now_date = datetime.datetime.now(tz=TZ).date()
+
+    def has_positive_balance(client: dict) -> bool:
+        profile = client["profile"]
+        return (
+            safe_float(profile.get("slik_balance", profile.get("bonus_balance", 0))) > 0
+            or safe_float(profile.get("bonus_balance")) > 0
+        )
+
+    def is_referrer(client: dict) -> bool:
+        profile = client["profile"]
+        referrals = profile.get("referrals")
+        return (isinstance(referrals, list) and len(referrals) > 0) or safe_int(profile.get("referral_clicks")) > 0
+
+    def is_inactive(client: dict) -> bool:
+        if client["orders_count"] == 0:
+            return True
+        last_order_at = client.get("last_order_at")
+        return bool(last_order_at and (now_date - last_order_at.astimezone(TZ).date()).days > 30)
+
+    filters_by_category = {
+        "all": lambda client: True,
+        "no_orders": lambda client: client["orders_count"] == 0,
+        "buyers": lambda client: client["orders_count"] > 0,
+        "balance": has_positive_balance,
+        "vip": lambda client: client["status"] in {"Premium", "Ambassador"},
+        "regular": lambda client: client["status"] in {"Traveller", "Explorer", "Nomad"},
+        "referrers": is_referrer,
+        "inactive": is_inactive,
+    }
+    predicate = filters_by_category.get(category)
+    if not predicate:
+        return []
+    return [client for client in clients if predicate(client)]
+
+
+def broadcast_menu_text() -> str:
+    return "📰 <b>Рассылки</b>\n\nВыберите категорию получателей:"
+
+
+def broadcast_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(title, callback_data=f"broadcast_cat:{category}")]
+        for category, title in BROADCAST_CATEGORIES.items()
+    ] + [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+
+
+def broadcast_category_text(category: str) -> str:
+    recipients_count = len(broadcast_recipients(category))
+    return (
+        "📰 <b>Рассылки</b>\n\n"
+        f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+        f"Примерно получателей: <b>{recipients_count}</b>"
+    )
+
+
+def broadcast_category_keyboard(category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Написать сообщение", callback_data=f"broadcast_compose:{category}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_news")],
+    ])
+
+
+def broadcast_preview_text(category: str, message_text: str) -> str:
+    recipients_count = len(broadcast_recipients(category))
+    return (
+        "📰 <b>Предпросмотр рассылки</b>\n\n"
+        f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+        f"Получателей: <b>{recipients_count}</b>\n\n"
+        "Текст сообщения:\n"
+        f"{html_escape(message_text)}"
+    )
+
+
+def broadcast_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="broadcast_send")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel")],
+    ])
+
+
+async def send_broadcast_message(context: ContextTypes.DEFAULT_TYPE, recipients: list[dict], message_text: str) -> tuple[int, int]:
+    sent = 0
+    failed = 0
+    for client in recipients:
+        try:
+            await context.bot.send_message(chat_id=int(client["user_id"]), text=message_text)
+            sent += 1
+        except Exception as error:
+            failed += 1
+            logger.warning("Не удалось отправить рассылку пользователю %s: %s", client.get("user_id"), error)
+    return sent, failed
 
 
 async def notify_client_order_status(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
@@ -2646,6 +2761,36 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         await deny_admin_access(update)
         return
 
+    if input_mode == BROADCAST_INPUT_MESSAGE:
+        if not has_broadcast_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("⛔ Рассылки доступны только ADMIN и OWNER.")
+            return
+        category = str(context.user_data.get("broadcast_category") or "")
+        if category not in BROADCAST_CATEGORIES:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("Категория рассылки не найдена.", reply_markup=broadcast_menu_keyboard(), parse_mode="HTML")
+            return
+        text = msg.text.strip()
+        if not text:
+            await msg.reply_text("Введите непустой текст рассылки.")
+            return
+        if not broadcast_recipients(category):
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("В выбранной категории нет получателей. Рассылка не отправлена.", reply_markup=broadcast_menu_keyboard(), parse_mode="HTML")
+            return
+        context.user_data["broadcast_text"] = text
+        context.user_data.pop("client_input", None)
+        await msg.reply_text(
+            broadcast_preview_text(category, text),
+            parse_mode="HTML",
+            reply_markup=broadcast_preview_keyboard(),
+        )
+        return
+
     if input_mode == CLIENT_INPUT_SEARCH:
         query_text = msg.text.strip()
         context.user_data.pop("client_input", None)
@@ -3174,10 +3319,10 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user):
+    if not has_broadcast_access(update.effective_user):
         await deny_admin_access(update)
         return
-    await update.message.reply_text("📰 Раздел новостей подготовлен для будущей CRM.")
+    await update.message.reply_text(broadcast_menu_text(), parse_mode="HTML", reply_markup=broadcast_menu_keyboard())
 
 
 def admin_panel_text(user) -> str:
@@ -3188,7 +3333,7 @@ def admin_panel_text(user) -> str:
         "Доступные разделы:\n"
         "• 📋 Заказы и статистика\n"
         "• 👥 Клиенты — CRM клиентов\n"
-        "• 📰 Новости — заготовка для CRM\n"
+        "• 📰 Новости — CRM рассылки\n"
         + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
     )
 
@@ -3222,11 +3367,11 @@ async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not has_admin_access(query.from_user):
+    if not has_broadcast_access(query.from_user):
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, "📰 <b>Новости</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard(query.from_user))
+    await edit_or_send(query, context, broadcast_menu_text(), broadcast_menu_keyboard())
 
 
 async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3297,8 +3442,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_restore_prompt",
         "backup_restore_latest",
     }
+    broadcast_callbacks = {"admin_news", "broadcast_send", "broadcast_cancel"}
     admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
     if data in backup_callbacks and not has_backup_access(query.from_user):
+        await deny_admin_access(update)
+    elif (data in broadcast_callbacks or data.startswith(("broadcast_cat:", "broadcast_compose:"))) and not has_broadcast_access(query.from_user):
         await deny_admin_access(update)
     elif (data.startswith(admin_prefixes) or data == "orders_stats") and not has_admin_access(query.from_user):
         await deny_admin_access(update)
@@ -3372,6 +3520,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             query, context,
             "✉️ <b>Написать клиенту</b>\n\nВведите сообщение для отправки клиенту.",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("broadcast_cat:"):
+        category = data.split(":", 1)[1]
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория не найдена.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, broadcast_category_text(category), broadcast_category_keyboard(category))
+    elif data.startswith("broadcast_compose:"):
+        category = data.split(":", 1)[1]
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория не найдена.", show_alert=True)
+            return
+        if not broadcast_recipients(category):
+            await query.answer("В категории нет получателей.", show_alert=True)
+            return
+        context.user_data["client_input"] = BROADCAST_INPUT_MESSAGE
+        context.user_data["broadcast_category"] = category
+        context.user_data.pop("broadcast_text", None)
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✍️ <b>Текст рассылки</b>\n\n"
+            f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+            f"Получателей: <b>{len(broadcast_recipients(category))}</b>\n\n"
+            "Введите текст сообщения. В v1 поддерживается только текст.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"broadcast_cat:{category}")]]),
+        )
+    elif data == "broadcast_cancel":
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("broadcast_category", None)
+        context.user_data.pop("broadcast_text", None)
+        await query.answer("Рассылка отменена.")
+        await edit_or_send(query, context, broadcast_menu_text(), broadcast_menu_keyboard())
+    elif data == "broadcast_send":
+        category = str(context.user_data.get("broadcast_category") or "")
+        message_text = str(context.user_data.get("broadcast_text") or "").strip()
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория рассылки не найдена.", show_alert=True)
+            return
+        if not message_text:
+            await query.answer("Текст рассылки пустой.", show_alert=True)
+            return
+        recipients = broadcast_recipients(category)
+        if not recipients:
+            await query.answer("В категории нет получателей.", show_alert=True)
+            return
+        await query.answer("Отправляю рассылку...")
+        sent, failed = await send_broadcast_message(context, recipients, message_text)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("broadcast_category", None)
+        context.user_data.pop("broadcast_text", None)
+        await edit_or_send(
+            query, context,
+            "✅ <b>Рассылка завершена</b>\n\n"
+            f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+            f"Отправлено: <b>{sent}</b>\n"
+            f"Ошибок: <b>{failed}</b>",
+            broadcast_menu_keyboard(),
         )
     elif data == "orders_stats":
         await query.answer()
@@ -3482,7 +3689,7 @@ async def post_init(app: Application) -> None:
         BotCommand("start",           "Главное меню"),
         BotCommand("admin",           "Админ-панель"),
         BotCommand("clients",         "Клиенты CRM"),
-        BotCommand("news",            "Новости CRM"),
+        BotCommand("news",            "CRM рассылки"),
         BotCommand("orders",          "Последние 50 заказов"),
         BotCommand("orders_today",    "Заказы за сегодня"),
         BotCommand("orders_7d",       "Заказы за 7 дней"),
