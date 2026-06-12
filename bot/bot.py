@@ -253,6 +253,7 @@ def default_user_profile(user) -> dict:
         "bonus_balance": 0,
         "slik_balance": 0,
         "referrals": [],
+        "referral_clicks": 0,
         "referrer": None,
         "referral_bonus_awarded": False,
         "status": "Traveller",
@@ -555,6 +556,45 @@ def credit_slik_balance(profile: dict, amount: float) -> None:
     profile["bonus_balance"] = balance
 
 
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def referral_analytics_for_profile(profile: dict) -> dict:
+    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    bought = sum(
+        1 for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    )
+    bonuses_awarded = round(sum(
+        safe_float(entry.get("bonus_amount"))
+        for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    ), 2)
+    referrals_count = len(referrals)
+    return {
+        "clicks": max(safe_int(profile.get("referral_clicks")), 0),
+        "referrals": referrals_count,
+        "bought": bought,
+        "not_bought": max(referrals_count - bought, 0),
+        "bonuses_awarded": bonuses_awarded,
+    }
+
+
+def increment_referral_click(referrer_profile: dict) -> None:
+    referrer_profile["referral_clicks"] = max(safe_int(referrer_profile.get("referral_clicks")), 0) + 1
+
+
 def register_start_referral(user, referrer_id: int | None) -> None:
     if referrer_id is None or str(referrer_id) == str(user.id):
         return
@@ -562,10 +602,14 @@ def register_start_referral(user, referrer_id: int | None) -> None:
     user_key = str(user.id)
     referrer_key = str(referrer_id)
     profile = users.get(user_key) if isinstance(users.get(user_key), dict) else default_user_profile(user)
-    if profile.get("referrer"):
-        return
     referrer_profile = users.get(referrer_key)
     if not isinstance(referrer_profile, dict):
+        return
+
+    increment_referral_click(referrer_profile)
+    if profile.get("referrer"):
+        users[referrer_key] = referrer_profile
+        save_users(users)
         return
 
     profile["referrer"] = referrer_id
@@ -691,6 +735,7 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("bonus_balance", 0)
         profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
         profile.setdefault("referrals", [])
+        profile.setdefault("referral_clicks", 0)
         profile.setdefault("referrer", None)
         profile.setdefault("referral_bonus_awarded", False)
         profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
@@ -1535,7 +1580,7 @@ def client_card_text(user_id: str) -> str:
     profile = client["profile"]
     username = str(profile.get("username") or "").strip().lstrip("@")
     username_text = f"@{username}" if username else "—"
-    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    referral_stats = referral_analytics_for_profile(profile)
     return (
         f"👤 <b>{html_escape(client_display_name(user_id, profile))}</b>\n"
         f"🆔 Telegram ID: <code>{html_escape(user_id)}</code>\n"
@@ -1548,8 +1593,11 @@ def client_card_text(user_id: str) -> str:
         f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         "🏅 Статус:\n"
         f"<b>{html_escape(format_status(client['status']))}</b>\n"
-        "👥 Приглашено друзей:\n"
-        f"<b>{len(referrals)}</b>\n"
+        "👥 Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n"
         "📅 Последний заказ:\n"
         f"<b>{html_escape(days_ago_text(client['last_order_at']))}</b>"
     )
@@ -2053,6 +2101,7 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
+    referral_stats = referral_analytics_for_profile(profile)
     username = await get_bot_username(context)
     referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
     text = (
@@ -2061,6 +2110,11 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
         "За первую заявку друга:\n"
         f"Вы получите: <b>{format_usd(referral_reward)}</b>\n"
         f"Друг получит: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>\n\n"
+        "Ваша статистика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Ваша ссылка:\n<code>{html_escape(referral_link)}</code>"
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -2070,12 +2124,7 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
-    referrals = profile.get("referrals", [])
-    referrals_count = len(referrals) if isinstance(referrals, list) else 0
-    awarded_count = sum(
-        1 for entry in referrals
-        if isinstance(entry, dict) and entry.get("bonus_awarded")
-    )
+    referral_stats = referral_analytics_for_profile(profile)
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
     text = (
@@ -2084,8 +2133,11 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Статус: <b>{html_escape(format_status(status))}</b>\n"
         f"Ваш кэшбэк: <b>{cashback_percent_for_status(status)}%</b>\n"
         f"Ваш бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
-        f"Приглашено друзей: <b>{referrals_count}</b>\n"
-        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
+        "Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
