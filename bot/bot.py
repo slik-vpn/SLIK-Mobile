@@ -75,6 +75,9 @@ BACKUP_FILES = [
     (CONFIG_FILE, "bot/config.json", "config.json"),
     (BALANCE_LOG_FILE, "bot/balance_changes.json", "balance_changes.json"),
 ]
+BACKUP_EMPTY_DEFAULTS = {
+    BALANCE_LOG_FILE: "[]\n",
+}
 
 # Экраны с баннерами
 BANNER_SCREENS = {
@@ -253,6 +256,7 @@ def default_user_profile(user) -> dict:
         "bonus_balance": 0,
         "slik_balance": 0,
         "referrals": [],
+        "referral_clicks": 0,
         "referrer": None,
         "referral_bonus_awarded": False,
         "status": "Traveller",
@@ -555,6 +559,45 @@ def credit_slik_balance(profile: dict, amount: float) -> None:
     profile["bonus_balance"] = balance
 
 
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def referral_analytics_for_profile(profile: dict) -> dict:
+    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    bought = sum(
+        1 for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    )
+    bonuses_awarded = round(sum(
+        safe_float(entry.get("bonus_amount"))
+        for entry in referrals
+        if isinstance(entry, dict) and entry.get("bonus_awarded")
+    ), 2)
+    referrals_count = len(referrals)
+    return {
+        "clicks": max(safe_int(profile.get("referral_clicks")), 0),
+        "referrals": referrals_count,
+        "bought": bought,
+        "not_bought": max(referrals_count - bought, 0),
+        "bonuses_awarded": bonuses_awarded,
+    }
+
+
+def increment_referral_click(referrer_profile: dict) -> None:
+    referrer_profile["referral_clicks"] = max(safe_int(referrer_profile.get("referral_clicks")), 0) + 1
+
+
 def register_start_referral(user, referrer_id: int | None) -> None:
     if referrer_id is None or str(referrer_id) == str(user.id):
         return
@@ -562,10 +605,14 @@ def register_start_referral(user, referrer_id: int | None) -> None:
     user_key = str(user.id)
     referrer_key = str(referrer_id)
     profile = users.get(user_key) if isinstance(users.get(user_key), dict) else default_user_profile(user)
-    if profile.get("referrer"):
-        return
     referrer_profile = users.get(referrer_key)
     if not isinstance(referrer_profile, dict):
+        return
+
+    increment_referral_click(referrer_profile)
+    if profile.get("referrer"):
+        users[referrer_key] = referrer_profile
+        save_users(users)
         return
 
     profile["referrer"] = referrer_id
@@ -691,6 +738,7 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("bonus_balance", 0)
         profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
         profile.setdefault("referrals", [])
+        profile.setdefault("referral_clicks", 0)
         profile.setdefault("referrer", None)
         profile.setdefault("referral_bonus_awarded", False)
         profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
@@ -895,21 +943,40 @@ def cleanup_old_backups(keep_limit: int = BACKUP_KEEP_LIMIT) -> list[Path]:
     return deleted
 
 
+def ensure_backup_source_file(source_path: Path, display_name: str) -> str | None:
+    if source_path.exists():
+        return None
+    default_content = BACKUP_EMPTY_DEFAULTS.get(source_path)
+    if default_content is None:
+        return f"{display_name} отсутствует и пропущен"
+    try:
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(default_content, encoding="utf-8")
+    except Exception as error:
+        logger.warning("Не удалось создать пустой файл для бэкапа %s: %s", source_path, error)
+        return f"{display_name} отсутствует и пропущен"
+    return f"{display_name} отсутствовал, создан пустой файл"
+
+
 def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
     created_at = created_at or datetime.datetime.now(tz=TZ)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     archive_path = BACKUPS_DIR / f"backup_{created_at.strftime('%Y-%m-%d_%H-%M')}.zip"
     included: list[str] = []
     skipped: list[str] = []
+    warnings: list[str] = []
 
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
         for source_path, archive_name, display_name in BACKUP_FILES:
+            warning = ensure_backup_source_file(source_path, display_name)
+            if warning:
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, source_path)
             if source_path.exists():
                 zip_file.write(source_path, arcname=archive_name)
                 included.append(display_name)
             else:
                 skipped.append(display_name)
-                logger.warning("Файл для бэкапа отсутствует и пропущен: %s", source_path)
 
     cleanup_old_backups()
     logger.info("Создан бэкап runtime-данных: %s", archive_path)
@@ -918,6 +985,31 @@ def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
         "created_at": created_at,
         "included": included,
         "skipped": skipped,
+        "warnings": warnings,
+    }
+
+
+def restore_backup_archive(archive_path: Path) -> dict:
+    restored: list[str] = []
+    warnings: list[str] = []
+
+    with zipfile.ZipFile(archive_path, "r") as zip_file:
+        archive_names = set(zip_file.namelist())
+        for target_path, archive_name, display_name in BACKUP_FILES:
+            if archive_name not in archive_names:
+                warning = f"{display_name} отсутствует в архиве"
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, archive_path)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(zip_file.read(archive_name))
+            restored.append(display_name)
+
+    logger.info("Восстановлен бэкап runtime-данных: %s", archive_path)
+    return {
+        "path": archive_path,
+        "restored": restored,
+        "warnings": warnings,
     }
 
 
@@ -925,6 +1017,7 @@ def format_backup_caption(backup_info: dict) -> str:
     created_at = backup_info["created_at"].strftime("%d.%m.%Y %H:%M")
     included = backup_info.get("included") or []
     skipped = backup_info.get("skipped") or []
+    warnings = backup_info.get("warnings") or []
     included_text = "\n".join(f"• {name}" for name in included) or "• —"
     text = (
         "💾 Автоматический бэкап SLIK Mobile\n\n"
@@ -936,6 +1029,9 @@ def format_backup_caption(backup_info: dict) -> str:
     if skipped:
         skipped_text = "\n".join(f"• {name}" for name in skipped)
         text += f"\n\nПропущено:\n{skipped_text}"
+    if warnings:
+        warnings_text = "\n".join(f"• {warning}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
     return text
 
 
@@ -984,7 +1080,7 @@ async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     lines = ["💾 Последние бэкапы:", ""]
     lines.extend(f"{index}. {archive.name}" for index, archive in enumerate(archives, start=1))
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=backups_keyboard())
 
 
 def schedule_automatic_backups(app: Application) -> None:
@@ -1334,6 +1430,100 @@ def build_orders_stats_text() -> str:
     )
 
 
+def is_revenue_order(order: dict) -> bool:
+    return normalize_order_status(order.get("status")) not in {"cancelled", "canceled"}
+
+
+def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
+    return [
+        order for order in orders
+        if (moment := parse_order_datetime(order)) and moment.astimezone(TZ).date() >= since
+    ]
+
+
+def analytics_order_stats(orders: list) -> tuple[int, float]:
+    revenue_orders = [order for order in orders if is_revenue_order(order)]
+    revenue = round(sum(parse_price(order.get("price", "0")) for order in revenue_orders), 2)
+    return len(revenue_orders), revenue
+
+
+def parse_user_created_datetime(value: str | None) -> datetime.datetime | None:
+    parsed = parse_iso_datetime(value)
+    if parsed:
+        return parsed
+    raw_value = str(value or "")
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(raw_value[:16], fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def new_clients_count_for_date(users: dict, target_date: datetime.date) -> int:
+    count = 0
+    for profile in users.values():
+        if not isinstance(profile, dict):
+            continue
+        created_at = parse_user_created_datetime(str(profile.get("created_at") or ""))
+        if created_at and created_at.astimezone(TZ).date() == target_date:
+            count += 1
+    return count
+
+
+def top_countries_by_orders(orders: list, limit: int = 5) -> list[tuple[str, int]]:
+    country_counts: dict[str, int] = {}
+    for order in orders:
+        if not is_revenue_order(order):
+            continue
+        country = str(order.get("country") or "Россия").strip() or "Россия"
+        country_counts[country] = country_counts.get(country, 0) + 1
+    return sorted(country_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
+def build_analytics_text() -> str:
+    orders = load_orders()
+    users = load_users()
+    today = local_date()
+    today_orders = analytics_orders_since(orders, today)
+    week_orders = analytics_orders_since(orders, today - datetime.timedelta(days=6))
+    month_orders = analytics_orders_since(orders, today - datetime.timedelta(days=29))
+
+    today_count, today_revenue = analytics_order_stats(today_orders)
+    week_count, week_revenue = analytics_order_stats(week_orders)
+    month_count, month_revenue = analytics_order_stats(month_orders)
+    all_count, all_revenue = analytics_order_stats(orders)
+    average_order = round(all_revenue / all_count, 2) if all_count else 0
+    new_clients_today = new_clients_count_for_date(users, today)
+    top_countries = top_countries_by_orders(orders)
+    top_countries_text = (
+        "\n".join(f"{index}. {html_escape(country)} — <b>{count}</b>" for index, (country, count) in enumerate(top_countries, start=1))
+        if top_countries else "—"
+    )
+
+    return (
+        "📊 <b>Аналитика</b>\n\n"
+        "📅 <b>Сегодня</b>\n"
+        f"• Заказов: <b>{today_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(today_revenue)}</b>\n"
+        f"• Новых клиентов: <b>{new_clients_today}</b>\n\n"
+        "📅 <b>Последние 7 дней</b>\n"
+        f"• Заказов: <b>{week_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(week_revenue)}</b>\n\n"
+        "📅 <b>Последние 30 дней</b>\n"
+        f"• Заказов: <b>{month_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(month_revenue)}</b>\n\n"
+        "💰 <b>Средний чек</b>\n"
+        f"<b>{format_usd_cents(average_order)}</b>\n\n"
+        "🌍 <b>Топ-5 стран по количеству заказов</b>\n"
+        f"{top_countries_text}"
+    )
+
+
+def analytics_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+
+
 CLIENT_CATEGORY_TITLES = {
     "no_orders": "🆕 Без покупок",
     "buyers": "💰 Покупатели",
@@ -1343,6 +1533,17 @@ CLIENT_CATEGORY_TITLES = {
 CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
 CLIENT_INPUT_SEARCH = "client_search"
+BROADCAST_INPUT_MESSAGE = "broadcast_message"
+BROADCAST_CATEGORIES = {
+    "all": "👥 Все клиенты",
+    "no_orders": "🆕 Без заказов",
+    "buyers": "💳 С заказами",
+    "balance": "💰 С балансом",
+    "vip": "👑 VIP / Premium / Ambassador",
+    "regular": "🧳 Traveller / Explorer / Nomad",
+    "referrers": "👥 Рефереры",
+    "inactive": "😴 Неактивные",
+}
 
 
 def load_balance_log() -> list:
@@ -1535,7 +1736,7 @@ def client_card_text(user_id: str) -> str:
     profile = client["profile"]
     username = str(profile.get("username") or "").strip().lstrip("@")
     username_text = f"@{username}" if username else "—"
-    referrals = profile.get("referrals") if isinstance(profile.get("referrals"), list) else []
+    referral_stats = referral_analytics_for_profile(profile)
     return (
         f"👤 <b>{html_escape(client_display_name(user_id, profile))}</b>\n"
         f"🆔 Telegram ID: <code>{html_escape(user_id)}</code>\n"
@@ -1548,8 +1749,11 @@ def client_card_text(user_id: str) -> str:
         f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         "🏅 Статус:\n"
         f"<b>{html_escape(format_status(client['status']))}</b>\n"
-        "👥 Приглашено друзей:\n"
-        f"<b>{len(referrals)}</b>\n"
+        "👥 Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n"
         "📅 Последний заказ:\n"
         f"<b>{html_escape(days_ago_text(client['last_order_at']))}</b>"
     )
@@ -1619,6 +1823,110 @@ def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def has_broadcast_access(user) -> bool:
+    return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}
+
+
+def broadcast_category_title(category: str) -> str:
+    return BROADCAST_CATEGORIES.get(category, "📰 Рассылка")
+
+
+def broadcast_recipients(category: str) -> list[dict]:
+    clients = collect_clients()
+    now_date = datetime.datetime.now(tz=TZ).date()
+
+    def has_positive_balance(client: dict) -> bool:
+        profile = client["profile"]
+        return (
+            safe_float(profile.get("slik_balance", profile.get("bonus_balance", 0))) > 0
+            or safe_float(profile.get("bonus_balance")) > 0
+        )
+
+    def is_referrer(client: dict) -> bool:
+        profile = client["profile"]
+        referrals = profile.get("referrals")
+        return (isinstance(referrals, list) and len(referrals) > 0) or safe_int(profile.get("referral_clicks")) > 0
+
+    def is_inactive(client: dict) -> bool:
+        if client["orders_count"] == 0:
+            return True
+        last_order_at = client.get("last_order_at")
+        return bool(last_order_at and (now_date - last_order_at.astimezone(TZ).date()).days > 30)
+
+    filters_by_category = {
+        "all": lambda client: True,
+        "no_orders": lambda client: client["orders_count"] == 0,
+        "buyers": lambda client: client["orders_count"] > 0,
+        "balance": has_positive_balance,
+        "vip": lambda client: client["status"] in {"Premium", "Ambassador"},
+        "regular": lambda client: client["status"] in {"Traveller", "Explorer", "Nomad"},
+        "referrers": is_referrer,
+        "inactive": is_inactive,
+    }
+    predicate = filters_by_category.get(category)
+    if not predicate:
+        return []
+    return [client for client in clients if predicate(client)]
+
+
+def broadcast_menu_text() -> str:
+    return "📰 <b>Рассылки</b>\n\nВыберите категорию получателей:"
+
+
+def broadcast_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(title, callback_data=f"broadcast_cat:{category}")]
+        for category, title in BROADCAST_CATEGORIES.items()
+    ] + [[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+
+
+def broadcast_category_text(category: str) -> str:
+    recipients_count = len(broadcast_recipients(category))
+    return (
+        "📰 <b>Рассылки</b>\n\n"
+        f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+        f"Примерно получателей: <b>{recipients_count}</b>"
+    )
+
+
+def broadcast_category_keyboard(category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Написать сообщение", callback_data=f"broadcast_compose:{category}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_news")],
+    ])
+
+
+def broadcast_preview_text(category: str, message_text: str) -> str:
+    recipients_count = len(broadcast_recipients(category))
+    return (
+        "📰 <b>Предпросмотр рассылки</b>\n\n"
+        f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+        f"Получателей: <b>{recipients_count}</b>\n\n"
+        "Текст сообщения:\n"
+        f"{html_escape(message_text)}"
+    )
+
+
+def broadcast_preview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Отправить", callback_data="broadcast_send")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel")],
+    ])
+
+
+async def send_broadcast_message(context: ContextTypes.DEFAULT_TYPE, recipients: list[dict], message_text: str) -> tuple[int, int]:
+    sent = 0
+    failed = 0
+    for client in recipients:
+        try:
+            await context.bot.send_message(chat_id=int(client["user_id"]), text=message_text)
+            sent += 1
+        except Exception as error:
+            failed += 1
+            logger.warning("Не удалось отправить рассылку пользователю %s: %s", client.get("user_id"), error)
+    return sent, failed
+
+
 async def notify_client_order_status(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     user_id = order.get("user_id")
     if user_id is None:
@@ -1673,8 +1981,16 @@ def backups_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📥 Скачать последний", callback_data="backup_download_latest")],
         [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
         [InlineKeyboardButton("📋 Список архивов", callback_data="backup_list")],
+        [InlineKeyboardButton("♻️ Восстановить последний", callback_data="backup_restore_prompt")],
         [InlineKeyboardButton("🗑 Очистить старые", callback_data="backup_cleanup_prompt")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def backup_restore_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Восстановить", callback_data="backup_restore_latest")],
+        [InlineKeyboardButton("❌ Нет", callback_data="admin_backups")],
     ])
 
 
@@ -1695,6 +2011,22 @@ def build_backup_list_text() -> str:
     return "\n".join(lines)
 
 
+def format_restore_result(restore_info: dict) -> str:
+    restored = restore_info.get("restored") or []
+    warnings = restore_info.get("warnings") or []
+    restored_text = "\n".join(f"• {name}" for name in restored) or "• —"
+    text = (
+        "✅ <b>Бэкап восстановлен</b>\n\n"
+        f"Файл: <code>{html_escape(restore_info['path'].name)}</code>\n\n"
+        "Восстановлено:\n"
+        f"{restored_text}"
+    )
+    if warnings:
+        warnings_text = "\n".join(f"• {html_escape(warning)}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
+    return text
+
+
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
@@ -1712,6 +2044,7 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
 def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Заказы",       callback_data="admin_orders")],
+        [InlineKeyboardButton("📊 Аналитика",    callback_data="admin_analytics")],
         [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
     ]
@@ -2053,6 +2386,7 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
+    referral_stats = referral_analytics_for_profile(profile)
     username = await get_bot_username(context)
     referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
     text = (
@@ -2061,6 +2395,11 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
         "За первую заявку друга:\n"
         f"Вы получите: <b>{format_usd(referral_reward)}</b>\n"
         f"Друг получит: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>\n\n"
+        "Ваша статистика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Ваша ссылка:\n<code>{html_escape(referral_link)}</code>"
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -2070,12 +2409,7 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
-    referrals = profile.get("referrals", [])
-    referrals_count = len(referrals) if isinstance(referrals, list) else 0
-    awarded_count = sum(
-        1 for entry in referrals
-        if isinstance(entry, dict) and entry.get("bonus_awarded")
-    )
+    referral_stats = referral_analytics_for_profile(profile)
     status = profile.get("status", "Traveller")
     referral_reward = referral_reward_for_profile(profile)
     text = (
@@ -2084,8 +2418,11 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Статус: <b>{html_escape(format_status(status))}</b>\n"
         f"Ваш кэшбэк: <b>{cashback_percent_for_status(status)}%</b>\n"
         f"Ваш бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
-        f"Приглашено друзей: <b>{referrals_count}</b>\n"
-        f"Бонус начислен за друзей: <b>{awarded_count}</b>\n\n"
+        "Реферальная аналитика:\n"
+        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
+        f"Купили: <b>{referral_stats['bought']}</b>\n"
+        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
+        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
@@ -2517,6 +2854,36 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         context.user_data.pop("client_target_id", None)
         await deny_admin_access(update)
+        return
+
+    if input_mode == BROADCAST_INPUT_MESSAGE:
+        if not has_broadcast_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("⛔ Рассылки доступны только ADMIN и OWNER.")
+            return
+        category = str(context.user_data.get("broadcast_category") or "")
+        if category not in BROADCAST_CATEGORIES:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("Категория рассылки не найдена.", reply_markup=broadcast_menu_keyboard(), parse_mode="HTML")
+            return
+        text = msg.text.strip()
+        if not text:
+            await msg.reply_text("Введите непустой текст рассылки.")
+            return
+        if not broadcast_recipients(category):
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("broadcast_category", None)
+            await msg.reply_text("В выбранной категории нет получателей. Рассылка не отправлена.", reply_markup=broadcast_menu_keyboard(), parse_mode="HTML")
+            return
+        context.user_data["broadcast_text"] = text
+        context.user_data.pop("client_input", None)
+        await msg.reply_text(
+            broadcast_preview_text(category, text),
+            parse_mode="HTML",
+            reply_markup=broadcast_preview_keyboard(),
+        )
         return
 
     if input_mode == CLIENT_INPUT_SEARCH:
@@ -3047,10 +3414,10 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not has_admin_access(update.effective_user):
+    if not has_broadcast_access(update.effective_user):
         await deny_admin_access(update)
         return
-    await update.message.reply_text("📰 Раздел новостей подготовлен для будущей CRM.")
+    await update.message.reply_text(broadcast_menu_text(), parse_mode="HTML", reply_markup=broadcast_menu_keyboard())
 
 
 def admin_panel_text(user) -> str:
@@ -3060,8 +3427,9 @@ def admin_panel_text(user) -> str:
         f"Роль: <b>{role}</b>\n\n"
         "Доступные разделы:\n"
         "• 📋 Заказы и статистика\n"
+        "• 📊 Аналитика — метрики продаж и клиентов\n"
         "• 👥 Клиенты — CRM клиентов\n"
-        "• 📰 Новости — заготовка для CRM\n"
+        "• 📰 Новости — CRM рассылки\n"
         + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
     )
 
@@ -3084,6 +3452,15 @@ async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await edit_or_send(query, context, build_orders_dashboard(), orders_dashboard_keyboard())
 
 
+async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, build_analytics_text(), analytics_keyboard())
+
+
 async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not has_admin_access(query.from_user):
@@ -3095,11 +3472,11 @@ async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not has_admin_access(query.from_user):
+    if not has_broadcast_access(query.from_user):
         await deny_admin_access(update)
         return
     await query.answer()
-    await edit_or_send(query, context, "📰 <b>Новости</b>\n\nРаздел подготовлен для будущей CRM.", admin_panel_keyboard(query.from_user))
+    await edit_or_send(query, context, broadcast_menu_text(), broadcast_menu_keyboard())
 
 
 async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3167,9 +3544,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_list",
         "backup_cleanup_prompt",
         "backup_cleanup_yes",
+        "backup_restore_prompt",
+        "backup_restore_latest",
     }
+    broadcast_callbacks = {"admin_news", "broadcast_send", "broadcast_cancel"}
     admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
     if data in backup_callbacks and not has_backup_access(query.from_user):
+        await deny_admin_access(update)
+    elif (data in broadcast_callbacks or data.startswith(("broadcast_cat:", "broadcast_compose:"))) and not has_broadcast_access(query.from_user):
         await deny_admin_access(update)
     elif (data.startswith(admin_prefixes) or data == "orders_stats") and not has_admin_access(query.from_user):
         await deny_admin_access(update)
@@ -3244,6 +3626,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "✉️ <b>Написать клиенту</b>\n\nВведите сообщение для отправки клиенту.",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
         )
+    elif data.startswith("broadcast_cat:"):
+        category = data.split(":", 1)[1]
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория не найдена.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, broadcast_category_text(category), broadcast_category_keyboard(category))
+    elif data.startswith("broadcast_compose:"):
+        category = data.split(":", 1)[1]
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория не найдена.", show_alert=True)
+            return
+        if not broadcast_recipients(category):
+            await query.answer("В категории нет получателей.", show_alert=True)
+            return
+        context.user_data["client_input"] = BROADCAST_INPUT_MESSAGE
+        context.user_data["broadcast_category"] = category
+        context.user_data.pop("broadcast_text", None)
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✍️ <b>Текст рассылки</b>\n\n"
+            f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+            f"Получателей: <b>{len(broadcast_recipients(category))}</b>\n\n"
+            "Введите текст сообщения. В v1 поддерживается только текст.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"broadcast_cat:{category}")]]),
+        )
+    elif data == "broadcast_cancel":
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("broadcast_category", None)
+        context.user_data.pop("broadcast_text", None)
+        await query.answer("Рассылка отменена.")
+        await edit_or_send(query, context, broadcast_menu_text(), broadcast_menu_keyboard())
+    elif data == "broadcast_send":
+        category = str(context.user_data.get("broadcast_category") or "")
+        message_text = str(context.user_data.get("broadcast_text") or "").strip()
+        if category not in BROADCAST_CATEGORIES:
+            await query.answer("Категория рассылки не найдена.", show_alert=True)
+            return
+        if not message_text:
+            await query.answer("Текст рассылки пустой.", show_alert=True)
+            return
+        recipients = broadcast_recipients(category)
+        if not recipients:
+            await query.answer("В категории нет получателей.", show_alert=True)
+            return
+        await query.answer("Отправляю рассылку...")
+        sent, failed = await send_broadcast_message(context, recipients, message_text)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("broadcast_category", None)
+        context.user_data.pop("broadcast_text", None)
+        await edit_or_send(
+            query, context,
+            "✅ <b>Рассылка завершена</b>\n\n"
+            f"Категория: <b>{html_escape(broadcast_category_title(category))}</b>\n"
+            f"Отправлено: <b>{sent}</b>\n"
+            f"Ошибок: <b>{failed}</b>",
+            broadcast_menu_keyboard(),
+        )
     elif data == "orders_stats":
         await query.answer()
         await edit_or_send(
@@ -3273,6 +3714,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "backup_list":
         await query.answer()
         await edit_or_send(query, context, build_backup_list_text(), backups_keyboard())
+    elif data == "backup_restore_prompt":
+        await query.answer()
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        await edit_or_send(
+            query, context,
+            "⚠️ <b>Восстановить последний архив?</b>\n"
+            f"Файл: <code>{html_escape(archives[0].name)}</code>\n\n"
+            "Текущие runtime-файлы будут перезаписаны.",
+            backup_restore_confirm_keyboard(),
+        )
+    elif data == "backup_restore_latest":
+        await query.answer("Восстанавливаю бэкап...")
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        try:
+            restore_info = restore_backup_archive(archives[0])
+            await edit_or_send(query, context, format_restore_result(restore_info), backups_keyboard())
+        except Exception:
+            logger.exception("Не удалось восстановить последний бэкап")
+            await edit_or_send(query, context, "Не удалось восстановить бэкап. Ошибка записана в лог.", backups_keyboard())
     elif data == "backup_cleanup_prompt":
         await query.answer()
         await edit_or_send(
@@ -3288,6 +3754,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_admin_panel(update, context)
     elif data == "admin_orders":
         await show_admin_orders(update, context)
+    elif data == "admin_analytics":
+        await show_admin_analytics(update, context)
     elif data == "admin_clients":
         await show_admin_clients(update, context)
     elif data == "admin_news":
@@ -3328,7 +3796,7 @@ async def post_init(app: Application) -> None:
         BotCommand("start",           "Главное меню"),
         BotCommand("admin",           "Админ-панель"),
         BotCommand("clients",         "Клиенты CRM"),
-        BotCommand("news",            "Новости CRM"),
+        BotCommand("news",            "CRM рассылки"),
         BotCommand("orders",          "Последние 50 заказов"),
         BotCommand("orders_today",    "Заказы за сегодня"),
         BotCommand("orders_7d",       "Заказы за 7 дней"),
