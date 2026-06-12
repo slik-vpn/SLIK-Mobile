@@ -1430,6 +1430,100 @@ def build_orders_stats_text() -> str:
     )
 
 
+def is_revenue_order(order: dict) -> bool:
+    return normalize_order_status(order.get("status")) not in {"cancelled", "canceled"}
+
+
+def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
+    return [
+        order for order in orders
+        if (moment := parse_order_datetime(order)) and moment.astimezone(TZ).date() >= since
+    ]
+
+
+def analytics_order_stats(orders: list) -> tuple[int, float]:
+    revenue_orders = [order for order in orders if is_revenue_order(order)]
+    revenue = round(sum(parse_price(order.get("price", "0")) for order in revenue_orders), 2)
+    return len(revenue_orders), revenue
+
+
+def parse_user_created_datetime(value: str | None) -> datetime.datetime | None:
+    parsed = parse_iso_datetime(value)
+    if parsed:
+        return parsed
+    raw_value = str(value or "")
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(raw_value[:16], fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def new_clients_count_for_date(users: dict, target_date: datetime.date) -> int:
+    count = 0
+    for profile in users.values():
+        if not isinstance(profile, dict):
+            continue
+        created_at = parse_user_created_datetime(str(profile.get("created_at") or ""))
+        if created_at and created_at.astimezone(TZ).date() == target_date:
+            count += 1
+    return count
+
+
+def top_countries_by_orders(orders: list, limit: int = 5) -> list[tuple[str, int]]:
+    country_counts: dict[str, int] = {}
+    for order in orders:
+        if not is_revenue_order(order):
+            continue
+        country = str(order.get("country") or "Россия").strip() or "Россия"
+        country_counts[country] = country_counts.get(country, 0) + 1
+    return sorted(country_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
+def build_analytics_text() -> str:
+    orders = load_orders()
+    users = load_users()
+    today = local_date()
+    today_orders = analytics_orders_since(orders, today)
+    week_orders = analytics_orders_since(orders, today - datetime.timedelta(days=6))
+    month_orders = analytics_orders_since(orders, today - datetime.timedelta(days=29))
+
+    today_count, today_revenue = analytics_order_stats(today_orders)
+    week_count, week_revenue = analytics_order_stats(week_orders)
+    month_count, month_revenue = analytics_order_stats(month_orders)
+    all_count, all_revenue = analytics_order_stats(orders)
+    average_order = round(all_revenue / all_count, 2) if all_count else 0
+    new_clients_today = new_clients_count_for_date(users, today)
+    top_countries = top_countries_by_orders(orders)
+    top_countries_text = (
+        "\n".join(f"{index}. {html_escape(country)} — <b>{count}</b>" for index, (country, count) in enumerate(top_countries, start=1))
+        if top_countries else "—"
+    )
+
+    return (
+        "📊 <b>Аналитика</b>\n\n"
+        "📅 <b>Сегодня</b>\n"
+        f"• Заказов: <b>{today_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(today_revenue)}</b>\n"
+        f"• Новых клиентов: <b>{new_clients_today}</b>\n\n"
+        "📅 <b>Последние 7 дней</b>\n"
+        f"• Заказов: <b>{week_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(week_revenue)}</b>\n\n"
+        "📅 <b>Последние 30 дней</b>\n"
+        f"• Заказов: <b>{month_count}</b>\n"
+        f"• Выручка: <b>{format_usd_cents(month_revenue)}</b>\n\n"
+        "💰 <b>Средний чек</b>\n"
+        f"<b>{format_usd_cents(average_order)}</b>\n\n"
+        "🌍 <b>Топ-5 стран по количеству заказов</b>\n"
+        f"{top_countries_text}"
+    )
+
+
+def analytics_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+
+
 CLIENT_CATEGORY_TITLES = {
     "no_orders": "🆕 Без покупок",
     "buyers": "💰 Покупатели",
@@ -1950,6 +2044,7 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
 def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Заказы",       callback_data="admin_orders")],
+        [InlineKeyboardButton("📊 Аналитика",    callback_data="admin_analytics")],
         [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
     ]
@@ -3332,6 +3427,7 @@ def admin_panel_text(user) -> str:
         f"Роль: <b>{role}</b>\n\n"
         "Доступные разделы:\n"
         "• 📋 Заказы и статистика\n"
+        "• 📊 Аналитика — метрики продаж и клиентов\n"
         "• 👥 Клиенты — CRM клиентов\n"
         "• 📰 Новости — CRM рассылки\n"
         + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
@@ -3354,6 +3450,15 @@ async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await query.answer()
     await edit_or_send(query, context, build_orders_dashboard(), orders_dashboard_keyboard())
+
+
+async def show_admin_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, build_analytics_text(), analytics_keyboard())
 
 
 async def show_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3649,6 +3754,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_admin_panel(update, context)
     elif data == "admin_orders":
         await show_admin_orders(update, context)
+    elif data == "admin_analytics":
+        await show_admin_analytics(update, context)
     elif data == "admin_clients":
         await show_admin_clients(update, context)
     elif data == "admin_news":
