@@ -75,6 +75,9 @@ BACKUP_FILES = [
     (CONFIG_FILE, "bot/config.json", "config.json"),
     (BALANCE_LOG_FILE, "bot/balance_changes.json", "balance_changes.json"),
 ]
+BACKUP_EMPTY_DEFAULTS = {
+    BALANCE_LOG_FILE: "[]\n",
+}
 
 # Экраны с баннерами
 BANNER_SCREENS = {
@@ -940,21 +943,40 @@ def cleanup_old_backups(keep_limit: int = BACKUP_KEEP_LIMIT) -> list[Path]:
     return deleted
 
 
+def ensure_backup_source_file(source_path: Path, display_name: str) -> str | None:
+    if source_path.exists():
+        return None
+    default_content = BACKUP_EMPTY_DEFAULTS.get(source_path)
+    if default_content is None:
+        return f"{display_name} отсутствует и пропущен"
+    try:
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(default_content, encoding="utf-8")
+    except Exception as error:
+        logger.warning("Не удалось создать пустой файл для бэкапа %s: %s", source_path, error)
+        return f"{display_name} отсутствует и пропущен"
+    return f"{display_name} отсутствовал, создан пустой файл"
+
+
 def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
     created_at = created_at or datetime.datetime.now(tz=TZ)
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     archive_path = BACKUPS_DIR / f"backup_{created_at.strftime('%Y-%m-%d_%H-%M')}.zip"
     included: list[str] = []
     skipped: list[str] = []
+    warnings: list[str] = []
 
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
         for source_path, archive_name, display_name in BACKUP_FILES:
+            warning = ensure_backup_source_file(source_path, display_name)
+            if warning:
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, source_path)
             if source_path.exists():
                 zip_file.write(source_path, arcname=archive_name)
                 included.append(display_name)
             else:
                 skipped.append(display_name)
-                logger.warning("Файл для бэкапа отсутствует и пропущен: %s", source_path)
 
     cleanup_old_backups()
     logger.info("Создан бэкап runtime-данных: %s", archive_path)
@@ -963,6 +985,31 @@ def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
         "created_at": created_at,
         "included": included,
         "skipped": skipped,
+        "warnings": warnings,
+    }
+
+
+def restore_backup_archive(archive_path: Path) -> dict:
+    restored: list[str] = []
+    warnings: list[str] = []
+
+    with zipfile.ZipFile(archive_path, "r") as zip_file:
+        archive_names = set(zip_file.namelist())
+        for target_path, archive_name, display_name in BACKUP_FILES:
+            if archive_name not in archive_names:
+                warning = f"{display_name} отсутствует в архиве"
+                warnings.append(warning)
+                logger.warning("%s: %s", warning, archive_path)
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(zip_file.read(archive_name))
+            restored.append(display_name)
+
+    logger.info("Восстановлен бэкап runtime-данных: %s", archive_path)
+    return {
+        "path": archive_path,
+        "restored": restored,
+        "warnings": warnings,
     }
 
 
@@ -970,6 +1017,7 @@ def format_backup_caption(backup_info: dict) -> str:
     created_at = backup_info["created_at"].strftime("%d.%m.%Y %H:%M")
     included = backup_info.get("included") or []
     skipped = backup_info.get("skipped") or []
+    warnings = backup_info.get("warnings") or []
     included_text = "\n".join(f"• {name}" for name in included) or "• —"
     text = (
         "💾 Автоматический бэкап SLIK Mobile\n\n"
@@ -981,6 +1029,9 @@ def format_backup_caption(backup_info: dict) -> str:
     if skipped:
         skipped_text = "\n".join(f"• {name}" for name in skipped)
         text += f"\n\nПропущено:\n{skipped_text}"
+    if warnings:
+        warnings_text = "\n".join(f"• {warning}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
     return text
 
 
@@ -1029,7 +1080,7 @@ async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     lines = ["💾 Последние бэкапы:", ""]
     lines.extend(f"{index}. {archive.name}" for index, archive in enumerate(archives, start=1))
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), reply_markup=backups_keyboard())
 
 
 def schedule_automatic_backups(app: Application) -> None:
@@ -1721,8 +1772,16 @@ def backups_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📥 Скачать последний", callback_data="backup_download_latest")],
         [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
         [InlineKeyboardButton("📋 Список архивов", callback_data="backup_list")],
+        [InlineKeyboardButton("♻️ Восстановить последний", callback_data="backup_restore_prompt")],
         [InlineKeyboardButton("🗑 Очистить старые", callback_data="backup_cleanup_prompt")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def backup_restore_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Восстановить", callback_data="backup_restore_latest")],
+        [InlineKeyboardButton("❌ Нет", callback_data="admin_backups")],
     ])
 
 
@@ -1741,6 +1800,22 @@ def build_backup_list_text() -> str:
     else:
         lines.append("Архивы не найдены.")
     return "\n".join(lines)
+
+
+def format_restore_result(restore_info: dict) -> str:
+    restored = restore_info.get("restored") or []
+    warnings = restore_info.get("warnings") or []
+    restored_text = "\n".join(f"• {name}" for name in restored) or "• —"
+    text = (
+        "✅ <b>Бэкап восстановлен</b>\n\n"
+        f"Файл: <code>{html_escape(restore_info['path'].name)}</code>\n\n"
+        "Восстановлено:\n"
+        f"{restored_text}"
+    )
+    if warnings:
+        warnings_text = "\n".join(f"• {html_escape(warning)}" for warning in warnings)
+        text += f"\n\nПредупреждения:\n{warnings_text}"
+    return text
 
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
@@ -3219,6 +3294,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_list",
         "backup_cleanup_prompt",
         "backup_cleanup_yes",
+        "backup_restore_prompt",
+        "backup_restore_latest",
     }
     admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
     if data in backup_callbacks and not has_backup_access(query.from_user):
@@ -3325,6 +3402,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "backup_list":
         await query.answer()
         await edit_or_send(query, context, build_backup_list_text(), backups_keyboard())
+    elif data == "backup_restore_prompt":
+        await query.answer()
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        await edit_or_send(
+            query, context,
+            "⚠️ <b>Восстановить последний архив?</b>\n"
+            f"Файл: <code>{html_escape(archives[0].name)}</code>\n\n"
+            "Текущие runtime-файлы будут перезаписаны.",
+            backup_restore_confirm_keyboard(),
+        )
+    elif data == "backup_restore_latest":
+        await query.answer("Восстанавливаю бэкап...")
+        archives = list_backup_archives()
+        if not archives:
+            await edit_or_send(query, context, "Архивы не найдены.", backups_keyboard())
+            return
+        try:
+            restore_info = restore_backup_archive(archives[0])
+            await edit_or_send(query, context, format_restore_result(restore_info), backups_keyboard())
+        except Exception:
+            logger.exception("Не удалось восстановить последний бэкап")
+            await edit_or_send(query, context, "Не удалось восстановить бэкап. Ошибка записана в лог.", backups_keyboard())
     elif data == "backup_cleanup_prompt":
         await query.answer()
         await edit_or_send(
