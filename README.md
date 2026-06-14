@@ -112,6 +112,46 @@ export ADMIN_CHAT_ID="-1001234567890"
 python run_mvp.py
 ```
 
+
+## Telegram Mini App (TMA)
+
+В проект добавлен базовый Telegram Mini App foundation без переноса бизнес-логики заказов, оплат, CRM, бэкапов, аналитики или рассылок. TMA находится в `frontend/tma` и содержит статические foundation-экраны: `Главная`, `Заказы`, `Баланс`, `Рефералка`, `Профиль`.
+
+### Переменная `TMA_URL`
+
+Чтобы бот показал кнопку `🚀 Открыть приложение` в главном меню пользователя, задайте публичный HTTPS URL Mini App:
+
+```env
+TMA_URL=https://your-domain.example/slik-tma
+```
+
+Если `TMA_URL` не задан или пустой, бот продолжит работать как раньше и не покажет кнопку Mini App. Админ-панель не меняется.
+
+### Локальный запуск TMA
+
+```bash
+pnpm install
+pnpm --filter @workspace/tma dev
+```
+
+Для production-сборки:
+
+```bash
+pnpm --filter @workspace/tma build
+```
+
+Собранные статические файлы появятся в `frontend/tma/dist/`. Их можно разместить на любом HTTPS-хостинге, который подходит для Telegram Mini Apps.
+
+### Подключение Web App URL в BotFather
+
+1. Откройте `@BotFather` в Telegram.
+2. Выберите вашего бота через `/mybots`.
+3. Откройте `Bot Settings` → `Menu Button` или `Configure Mini App` / `Web App` в зависимости от интерфейса BotFather.
+4. Укажите тот же публичный HTTPS URL, что и в `TMA_URL`.
+5. Перезапустите бота с обновлённой переменной окружения.
+
+В этом PR TMA не содержит backend API, сложной авторизации и покупки eSIM внутри приложения. Telegram WebApp SDK используется только для `ready()`, `expand()` и чтения `initDataUnsafe.user`, если Telegram передал эти данные.
+
 ## Личный кабинет клиента
 
 Личный кабинет открывается кнопкой `👤 Личный кабинет` в главном меню. При первом `/start` бот автоматически создаёт профиль клиента в `users.json` и сохраняет Telegram ID, username, имя, дату создания, статус `Traveller`, счётчики активных заявок, сумму покупок, SLIK Balance в USD и реферальные поля.

@@ -22,6 +22,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -78,6 +79,12 @@ BACKUP_FILES = [
 BACKUP_EMPTY_DEFAULTS = {
     BALANCE_LOG_FILE: "[]\n",
 }
+RUNTIME_JSON_FILES = [
+    (USERS_FILE, "users.json"),
+    (ORDERS_FILE, "orders.json"),
+    (CONFIG_FILE, "config.json"),
+    (BALANCE_LOG_FILE, "balance_changes.json"),
+]
 
 # Экраны с баннерами
 BANNER_SCREENS = {
@@ -188,39 +195,82 @@ DEFAULT_CONFIG = {
 }
 
 
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
+def runtime_default_value(path: Path):
+    if path == CONFIG_FILE:
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    if path in {ORDERS_FILE, BALANCE_LOG_FILE}:
+        return []
+    return {}
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with tmp_path.open("wb") as tmp_file:
+        tmp_file.write(payload)
+        tmp_file.flush()
+        os.fsync(tmp_file.fileno())
+    os.replace(tmp_path, path)
+
+
+def atomic_write_json(path: Path, data) -> None:
+    payload = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    atomic_write_bytes(path, payload)
+
+
+def corrupt_file_path(path: Path) -> Path:
+    timestamp = datetime.datetime.now(tz=TZ).strftime("%Y%m%d_%H%M%S")
+    candidate = path.with_name(f"{path.name}.corrupt.{timestamp}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.corrupt.{timestamp}.{counter}")
+        counter += 1
+    return candidate
+
+
+def load_runtime_json(path: Path, default_value, expected_type):
+    if not path.exists():
+        atomic_write_json(path, default_value)
+        return default_value
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, expected_type):
+            raise ValueError(f"Expected {expected_type.__name__}, got {type(data).__name__}")
+        return data
+    except Exception:
+        backup_path = corrupt_file_path(path)
         try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            for k, v in DEFAULT_CONFIG.items():
-                data.setdefault(k, v)
-            return data
+            os.replace(path, backup_path)
+            logger.exception("Повреждённый JSON перемещён в %s", backup_path)
         except Exception:
-            pass
-    return dict(DEFAULT_CONFIG)
+            logger.exception("Не удалось сохранить повреждённый JSON %s", path)
+        atomic_write_json(path, default_value)
+        return default_value
+
+
+def save_runtime_json(path: Path, data) -> None:
+    atomic_write_json(path, data)
+
+
+def load_config() -> dict:
+    data = load_runtime_json(CONFIG_FILE, runtime_default_value(CONFIG_FILE), dict)
+    for k, v in DEFAULT_CONFIG.items():
+        data.setdefault(k, json.loads(json.dumps(v)))
+    return data
 
 
 def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    save_runtime_json(CONFIG_FILE, cfg)
 
 
 # ─── orders.json ──────────────────────────────────────────────────────────────
 
 def load_orders() -> list:
-    if ORDERS_FILE.exists():
-        try:
-            return json.loads(ORDERS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
+    return load_runtime_json(ORDERS_FILE, runtime_default_value(ORDERS_FILE), list)
 
 
 def save_orders(orders: list) -> None:
-    ORDERS_FILE.write_text(
-        json.dumps(orders, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    save_runtime_json(ORDERS_FILE, orders)
 
 
 # ─── users.json ───────────────────────────────────────────────────────────────
@@ -231,18 +281,11 @@ def ensure_users_file() -> None:
 
 
 def load_users() -> dict:
-    ensure_users_file()
-    try:
-        data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return load_runtime_json(USERS_FILE, runtime_default_value(USERS_FILE), dict)
 
 
 def save_users(users: dict) -> None:
-    USERS_FILE.write_text(
-        json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    save_runtime_json(USERS_FILE, users)
 
 
 def default_user_profile(user) -> dict:
@@ -946,16 +989,30 @@ def cleanup_old_backups(keep_limit: int = BACKUP_KEEP_LIMIT) -> list[Path]:
 def ensure_backup_source_file(source_path: Path, display_name: str) -> str | None:
     if source_path.exists():
         return None
-    default_content = BACKUP_EMPTY_DEFAULTS.get(source_path)
-    if default_content is None:
-        return f"{display_name} отсутствует и пропущен"
     try:
-        source_path.parent.mkdir(parents=True, exist_ok=True)
-        source_path.write_text(default_content, encoding="utf-8")
+        save_runtime_json(source_path, runtime_default_value(source_path))
     except Exception as error:
         logger.warning("Не удалось создать пустой файл для бэкапа %s: %s", source_path, error)
         return f"{display_name} отсутствует и пропущен"
     return f"{display_name} отсутствовал, создан пустой файл"
+
+
+def validate_backup_archive(archive_path: Path) -> dict:
+    errors: list[str] = []
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zip_file:
+            archive_names = set(zip_file.namelist())
+            for _source_path, archive_name, display_name in BACKUP_FILES:
+                if archive_name not in archive_names:
+                    errors.append(f"{display_name} отсутствует в архиве")
+                    continue
+                try:
+                    json.loads(zip_file.read(archive_name).decode("utf-8"))
+                except Exception as error:
+                    errors.append(f"{display_name} невалидный JSON: {error}")
+    except Exception as error:
+        errors.append(f"архив не открывается: {error}")
+    return {"ok": not errors, "errors": errors}
 
 
 def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
@@ -978,6 +1035,11 @@ def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
             else:
                 skipped.append(display_name)
 
+    validation = validate_backup_archive(archive_path)
+    if not validation["ok"]:
+        warnings.extend(validation["errors"])
+        logger.warning("Бэкап %s создан с ошибками проверки: %s", archive_path, validation["errors"])
+
     cleanup_old_backups()
     logger.info("Создан бэкап runtime-данных: %s", archive_path)
     return {
@@ -986,6 +1048,7 @@ def create_backup_archive(created_at: datetime.datetime | None = None) -> dict:
         "included": included,
         "skipped": skipped,
         "warnings": warnings,
+        "validation": validation,
     }
 
 
@@ -1001,8 +1064,7 @@ def restore_backup_archive(archive_path: Path) -> dict:
                 warnings.append(warning)
                 logger.warning("%s: %s", warning, archive_path)
                 continue
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            target_path.write_bytes(zip_file.read(archive_name))
+            atomic_write_bytes(target_path, zip_file.read(archive_name))
             restored.append(display_name)
 
     logger.info("Восстановлен бэкап runtime-данных: %s", archive_path)
@@ -1018,13 +1080,15 @@ def format_backup_caption(backup_info: dict) -> str:
     included = backup_info.get("included") or []
     skipped = backup_info.get("skipped") or []
     warnings = backup_info.get("warnings") or []
+    validation = backup_info.get("validation") or validate_backup_archive(backup_info["path"])
     included_text = "\n".join(f"• {name}" for name in included) or "• —"
     text = (
         "💾 Автоматический бэкап SLIK Mobile\n\n"
         "Дата:\n"
         f"{created_at}\n\n"
         "В архиве:\n"
-        f"{included_text}"
+        f"{included_text}\n\n"
+        + ("✅ Бэкап проверен" if validation.get("ok") else "⚠️ Есть ошибки проверки")
     )
     if skipped:
         skipped_text = "\n".join(f"• {name}" for name in skipped)
@@ -1547,13 +1611,7 @@ BROADCAST_CATEGORIES = {
 
 
 def load_balance_log() -> list:
-    if BALANCE_LOG_FILE.exists():
-        try:
-            data = json.loads(BALANCE_LOG_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
-    return []
+    return load_runtime_json(BALANCE_LOG_FILE, runtime_default_value(BALANCE_LOG_FILE), list)
 
 
 def append_balance_log(admin_id: int, user_id: int, amount: float) -> None:
@@ -1564,7 +1622,7 @@ def append_balance_log(admin_id: int, user_id: int, amount: float) -> None:
         "amount": amount,
         "created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"),
     })
-    BALANCE_LOG_FILE.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_runtime_json(BALANCE_LOG_FILE, log)
 
 
 def parse_order_datetime(order: dict) -> datetime.datetime | None:
@@ -1957,7 +2015,13 @@ def format_file_size(size: int) -> str:
 
 
 def backup_info_from_path(path: Path) -> dict:
-    return {"path": path, "created_at": datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=TZ), "included": [], "skipped": []}
+    return {
+        "path": path,
+        "created_at": datetime.datetime.fromtimestamp(path.stat().st_mtime, tz=TZ),
+        "included": [],
+        "skipped": [],
+        "validation": validate_backup_archive(path),
+    }
 
 
 def build_backups_dashboard() -> str:
@@ -2011,6 +2075,50 @@ def build_backup_list_text() -> str:
     return "\n".join(lines)
 
 
+
+
+def read_runtime_json_status(path: Path) -> dict:
+    if not path.exists():
+        return {"ok": False, "message": "файл отсутствует", "size": 0}
+    size = path.stat().st_size
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+        return {"ok": True, "message": "читается", "size": size}
+    except Exception as error:
+        return {"ok": False, "message": f"ошибка: {error}", "size": size}
+
+
+def build_healthcheck_text() -> str:
+    archives = list_backup_archives()
+    latest = archives[0] if archives else None
+    latest_text = (
+        f"<code>{html_escape(latest.name)}</code> — {format_file_size(latest.stat().st_size)}"
+        if latest else "—"
+    )
+    lines = ["🩺 <b>Проверка системы</b>", ""]
+    has_warnings = False
+    total_size = 0
+    for path, display_name in RUNTIME_JSON_FILES:
+        status = read_runtime_json_status(path)
+        total_size += status["size"]
+        icon = "✅" if status["ok"] else "⚠️"
+        has_warnings = has_warnings or not status["ok"]
+        lines.append(f"{icon} <code>{html_escape(display_name)}</code>: {html_escape(status['message'])}")
+    lines.extend([
+        "",
+        f"💾 Последний бэкап: {latest_text}",
+        f"📦 Количество бэкапов: <b>{len(archives)}</b>",
+        f"📁 Размер runtime-файлов: <b>{format_file_size(total_size)}</b>",
+        "",
+        "Статус: " + ("⚠️ есть предупреждения" if has_warnings else "✅ всё хорошо"),
+    ])
+    return "\n".join(lines)
+
+
+def healthcheck_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+
+
 def format_restore_result(restore_info: dict) -> str:
     restored = restore_info.get("restored") or []
     warnings = restore_info.get("warnings") or []
@@ -2029,6 +2137,11 @@ def format_restore_result(restore_info: dict) -> str:
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
+def get_tma_url() -> str | None:
+    tma_url = os.environ.get("TMA_URL", "").strip()
+    return tma_url or None
+
+
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
@@ -2036,6 +2149,9 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Реферальная программа",    callback_data="profile_invite")],
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
     ]
+    tma_url = get_tma_url()
+    if tma_url:
+        rows.append([InlineKeyboardButton("🚀 Открыть приложение", web_app=WebAppInfo(url=tma_url))])
     if has_admin_access(user):
         rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
@@ -2049,6 +2165,7 @@ def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
     ]
     if has_backup_access(user):
+        rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
@@ -3479,6 +3596,15 @@ async def show_admin_news(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await edit_or_send(query, context, broadcast_menu_text(), broadcast_menu_keyboard())
 
 
+async def show_admin_healthcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_backup_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, build_healthcheck_text(), healthcheck_keyboard())
+
+
 async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not has_backup_access(query.from_user):
@@ -3539,6 +3665,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     backup_callbacks = {
         "admin_backups",
+        "admin_healthcheck",
         "backup_download_latest",
         "backup_create",
         "backup_list",
@@ -3760,6 +3887,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_admin_clients(update, context)
     elif data == "admin_news":
         await show_admin_news(update, context)
+    elif data == "admin_healthcheck":
+        await show_admin_healthcheck(update, context)
     elif data == "admin_backups":
         await show_admin_backups(update, context)
     elif data == "buy_esim":
