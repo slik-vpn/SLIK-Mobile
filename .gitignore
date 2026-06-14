@@ -23,3 +23,6 @@ backups/
 # Deployment scratch
 *.bak
 *.tmp
+
+# Frontend build output
+frontend/tma/dist/

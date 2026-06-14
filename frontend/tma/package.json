@@ -1,0 +1,11 @@
+{
+  "name": "@workspace/tma",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "../../artifacts/mockup-sandbox/node_modules/.bin/vite --host 0.0.0.0",
+    "build": "../../node_modules/.bin/tsc -p tsconfig.json --noEmit && ../../artifacts/mockup-sandbox/node_modules/.bin/vite build",
+    "preview": "../../artifacts/mockup-sandbox/node_modules/.bin/vite preview --host 0.0.0.0"
+  }
+}

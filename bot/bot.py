@@ -22,6 +22,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardRemove,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -2136,6 +2137,11 @@ def format_restore_result(restore_info: dict) -> str:
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
+def get_tma_url() -> str | None:
+    tma_url = os.environ.get("TMA_URL", "").strip()
+    return tma_url or None
+
+
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
@@ -2143,6 +2149,9 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Реферальная программа",    callback_data="profile_invite")],
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
     ]
+    tma_url = get_tma_url()
+    if tma_url:
+        rows.append([InlineKeyboardButton("🚀 Открыть приложение", web_app=WebAppInfo(url=tma_url))])
     if has_admin_access(user):
         rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
