@@ -1521,7 +1521,7 @@ def build_analytics_text() -> str:
 
 
 def analytics_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_analytics_back")]])
 
 
 CLIENT_CATEGORY_TITLES = {
@@ -3750,7 +3750,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         cleanup_old_backups(keep_limit=10)
         await edit_or_send(query, context, "✅ Старые архивы удалены.", backups_keyboard())
-    elif data == "admin_panel":
+    elif data in {"admin_panel", "admin_analytics_back"}:
         await show_admin_panel(update, context)
     elif data == "admin_orders":
         await show_admin_orders(update, context)
