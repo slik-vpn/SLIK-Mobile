@@ -66,6 +66,15 @@ USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
 CARD_PAYMENT_MARKUP_PERCENT = 1.5
 CARD_RATE_LOCK_SECONDS = 5 * 60
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+ABANDONED_CHECKOUT_REMINDER_MINUTES = env_int("ABANDONED_CHECKOUT_REMINDER_MINUTES", 30)
+ABANDONED_CHECKOUT_MAX_AGE_HOURS = 24
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
 BACKUP_INTERVAL_SECONDS = 5 * 60 * 60
@@ -136,6 +145,7 @@ STATUS_ORDER = {
 STATUS_LEVELS_ASC = list(reversed(STATUS_LEVELS))
 ORDER_STATUS_LABELS = {
     "new": "Новый",
+    "waiting_payment": "Ожидает оплаты",
     "processing": "В работе",
     "in_progress": "В работе",
     "done": "Выдан",
@@ -146,6 +156,7 @@ ORDER_STATUS_LABELS = {
 }
 ORDER_STATUS_ICONS = {
     "new": "🟡",
+    "waiting_payment": "🟠",
     "in_progress": "🔵",
     "issued": "🟢",
     "cancelled": "🔴",
@@ -841,7 +852,7 @@ def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict
 
 def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list | None = None) -> dict:
     user_orders = orders if orders is not None else get_user_orders(user_id)
-    active_orders = [order for order in user_orders if order.get("status") not in {"cancelled", "canceled"}]
+    active_orders = [order for order in user_orders if is_revenue_order(order)]
     profile["orders_count"] = len(active_orders)
     profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
     profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
@@ -853,7 +864,7 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
 def award_cashback_if_needed(profile: dict, order: dict) -> float:
     if order.get("cashback_awarded"):
         return 0.0
-    if order.get("status") in {"cancelled", "canceled"}:
+    if not is_revenue_order(order):
         return 0.0
 
     order_amount = parse_price(order.get("price", "0"))
@@ -939,7 +950,7 @@ def record_user_order(user, order: dict) -> tuple[dict, str, str, float]:
         sum(
             parse_price(user_order.get("price", "0"))
             for user_order in previous_orders
-            if user_order.get("status") != "cancelled"
+            if is_revenue_order(user_order)
         ),
         2,
     )
@@ -984,7 +995,7 @@ def append_order(order: dict) -> dict:
     order_id = len(orders) + 1
     order["id"]                 = order_id
     order["number"]             = f"#{order_id:04d}"
-    order["status"]             = "new"
+    order.setdefault("status", "new")
     order["created_at"]         = now_str()
     order["created_date"]       = local_date().isoformat()
     order.setdefault("payment_provider", "card")
@@ -993,6 +1004,51 @@ def append_order(order: dict) -> dict:
     save_orders(orders)
     logger.info("Новый заказ: %s", order)
     return order
+
+
+def find_order(order_id: int) -> dict | None:
+    for order in load_orders():
+        try:
+            if int(order.get("id")) == int(order_id):
+                return order
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def create_checkout_order(user, plan_key: str, plan: dict) -> dict:
+    return append_order({
+        "gb": plan["gb"],
+        "days": plan["days"],
+        "price": plan["price"],
+        "country": "Россия",
+        "plan_key": plan_key,
+        "payment_method": "",
+        "payment_provider": "",
+        "name": "",
+        "tg_handle": user_tag(user),
+        "user_id": user.id,
+        "status": "waiting_payment",
+        "checkout_created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"),
+        "abandoned_reminder_sent": False,
+    })
+
+
+def update_checkout_order(order_id: int, **fields) -> dict | None:
+    if order_id is None:
+        return None
+    orders = load_orders()
+    for order in orders:
+        try:
+            current_id = int(order.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if current_id == int(order_id):
+            order.update(fields)
+            order["updated_at"] = now_str()
+            save_orders(orders)
+            return order
+    return None
 
 
 def update_order_status(order_id: int, status: str, updated_by: int | None = None) -> dict | None:
@@ -1503,8 +1559,12 @@ def build_orders_dashboard() -> str:
     def count_status(items: list, status: str) -> int:
         return sum(1 for order in items if normalize_order_status(order.get("status")) == status)
 
-    week_total = sum(parse_price(order.get("price", "0")) for order in week_orders)
-    month_total = sum(parse_price(order.get("price", "0")) for order in month_orders)
+    week_revenue_orders = [order for order in week_orders if is_revenue_order(order)]
+    month_revenue_orders = [order for order in month_orders if is_revenue_order(order)]
+    week_waiting_payment = count_status(week_orders, "waiting_payment")
+    month_waiting_payment = count_status(month_orders, "waiting_payment")
+    week_total = sum(parse_price(order.get("price", "0")) for order in week_revenue_orders)
+    month_total = sum(parse_price(order.get("price", "0")) for order in month_revenue_orders)
     return (
         "📋 <b>Заказы</b>\n\n"
         "<b>Сегодня:</b>\n"
@@ -1513,10 +1573,12 @@ def build_orders_dashboard() -> str:
         f"🟢 Выдано: <b>{count_status(today_orders, 'issued')}</b>\n"
         f"🔴 Отменено: <b>{count_status(today_orders, 'cancelled')}</b>\n\n"
         "<b>За 7 дней:</b>\n"
-        f"📦 Всего заказов: <b>{len(week_orders)}</b>\n"
+        f"📦 Всего заказов: <b>{len(week_revenue_orders)}</b>\n"
+        f"🟠 Ожидают оплаты: <b>{week_waiting_payment}</b>\n"
         f"💵 Сумма: <b>${week_total:.2f}</b>\n\n"
         "<b>За 30 дней:</b>\n"
-        f"📦 Всего заказов: <b>{len(month_orders)}</b>\n"
+        f"📦 Всего заказов: <b>{len(month_revenue_orders)}</b>\n"
+        f"🟠 Ожидают оплаты: <b>{month_waiting_payment}</b>\n"
         f"💵 Сумма: <b>${month_total:.2f}</b>\n\n"
         "<b>Быстрые действия:</b>\n"
         "🟡 Новые заявки\n"
@@ -1622,7 +1684,7 @@ def build_orders_stats_text() -> str:
 
 
 def is_revenue_order(order: dict) -> bool:
-    return normalize_order_status(order.get("status")) not in {"cancelled", "canceled"}
+    return normalize_order_status(order.get("status")) not in {"cancelled", "waiting_payment"}
 
 
 def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
@@ -1807,7 +1869,7 @@ def collect_clients() -> list[dict]:
         if not isinstance(profile, dict):
             continue
         user_orders = orders_by_user.get(str(user_id), [])
-        active_orders = [order for order in user_orders if normalize_order_status(order.get("status")) != "cancelled"]
+        active_orders = [order for order in user_orders if is_revenue_order(order)]
         total_spent = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
         order_dates = [date for date in (parse_order_datetime(order) for order in active_orders) if date]
         last_order_at = max(order_dates, default=None)
@@ -2442,6 +2504,14 @@ def payment_keyboard(plan_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def abandoned_checkout_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Продолжить оплату", callback_data=f"abandoned_continue:{order_id}")],
+        [InlineKeyboardButton("🌍 Выбрать другую eSIM", callback_data="buy_esim")],
+        [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
+    ])
+
+
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
@@ -2627,6 +2697,125 @@ async def show_support_screen(update: Update, context: ContextTypes.DEFAULT_TYPE
         await track_action(context, query.from_user, "нажал «Поддержка»")
 
 
+async def show_existing_checkout_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    order_id = int(query.data.split(":", 1)[1])
+    order = find_order(order_id)
+    if (
+        not order
+        or str(order.get("user_id")) != str(query.from_user.id)
+        or normalize_order_status(order.get("status")) != "waiting_payment"
+    ):
+        await edit_or_send(
+            query, context,
+            "Этот заказ уже оплачен, отменён или устарел. Выберите eSIM заново.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🌍 Выбрать eSIM", callback_data="buy_esim")]]),
+        )
+        return ConversationHandler.END
+
+    plan_key = str(order.get("plan_key") or "")
+    plan = PLAN_MAP.get(plan_key, {"gb": order.get("gb", "—"), "days": order.get("days", "—"), "price": order.get("price", "0")})
+    context.user_data["checkout_order_id"] = order_id
+    context.user_data["plan_key"] = plan_key
+    context.user_data["plan"] = plan
+    provider = order.get("payment_provider") or "card"
+    context.user_data["payment_provider"] = provider
+    context.user_data["payment_method"] = order.get("payment_method") or payment_provider_label(provider)
+
+    if provider == "cryptobot" and order.get("cryptobot_invoice_id"):
+        rows = []
+        if order.get("cryptobot_pay_url"):
+            rows.append([InlineKeyboardButton("🤖 Оплатить в CryptoBot", url=order["cryptobot_pay_url"])])
+        rows.extend([
+            [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{order['cryptobot_invoice_id']}")],
+            [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+        ])
+        await edit_or_send(
+            query, context,
+            "🤖 <b>Оплата через CryptoBot</b>\n\n"
+            f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
+            "Откройте уже созданный счёт, оплатите его и нажмите «Проверить оплату».",
+            InlineKeyboardMarkup(rows),
+        )
+        return WAITING_PAYMENT
+
+    cfg = load_config()
+    lock = await create_card_payment_lock(plan)
+    context.user_data["card_payment_lock"] = lock
+    update_checkout_order(order_id, payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
+    await edit_or_send(query, context, build_card_payment_text(plan, cfg["payment"].get("card", ""), lock), card_payment_keyboard())
+    return WAITING_PAYMENT
+
+
+def mark_abandoned_reminder_sent_if_still_waiting(order_id: int) -> bool:
+    fresh_orders = load_orders()
+    for fresh_order in fresh_orders:
+        try:
+            is_same_order = int(fresh_order.get("id")) == int(order_id)
+        except (TypeError, ValueError):
+            is_same_order = False
+        if not is_same_order:
+            continue
+        if normalize_order_status(fresh_order.get("status")) != "waiting_payment" or fresh_order.get("abandoned_reminder_sent"):
+            return False
+        fresh_order["abandoned_reminder_sent"] = True
+        fresh_order["abandoned_reminder_sent_at"] = now_str()
+        save_orders(fresh_orders)
+        return True
+    return False
+
+
+async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.datetime.now(tz=TZ)
+    candidate_orders = load_orders()
+    for order in candidate_orders:
+        if normalize_order_status(order.get("status")) != "waiting_payment" or order.get("abandoned_reminder_sent"):
+            continue
+        order_id = order.get("id")
+        if order_id is None:
+            continue
+        created_at = order.get("checkout_created_at")
+        try:
+            created_dt = datetime.datetime.fromisoformat(str(created_at)).astimezone(TZ)
+        except (TypeError, ValueError):
+            continue
+        age = now - created_dt
+        if age < datetime.timedelta(minutes=ABANDONED_CHECKOUT_REMINDER_MINUTES) or age > datetime.timedelta(hours=ABANDONED_CHECKOUT_MAX_AGE_HOURS):
+            continue
+        user_id = order.get("user_id")
+        if not user_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "Вы начали оформление eSIM, но не завершили оплату.\n\n"
+                    "Заказ ещё можно оплатить.\n"
+                    "Если поездка актуальна — продолжите оформление."
+                ),
+                reply_markup=abandoned_checkout_keyboard(order["id"]),
+            )
+        except Exception as e:
+            logger.error("Не удалось отправить abandoned checkout reminder для заказа %s: %s", order.get("number"), e)
+            continue
+
+        if mark_abandoned_reminder_sent_if_still_waiting(order_id):
+            logger.info("Abandoned checkout reminder sent for order %s", order.get("number"))
+        else:
+            logger.info(
+                "Abandoned checkout reminder was sent but order %s changed before flag update; leaving order unchanged",
+                order.get("number"),
+            )
+
+
+def schedule_abandoned_checkout_reminders(app: Application) -> None:
+    if not app.job_queue:
+        logger.warning("JobQueue недоступен; abandoned checkout reminders не запущены")
+        return
+    app.job_queue.run_repeating(abandoned_checkout_reminder_job, interval=60, first=60, name="abandoned_checkout_reminders")
+
+
 # ─── Личный кабинет ───────────────────────────────────────────────────────────
 
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2675,7 +2864,7 @@ def format_user_orders(orders: list) -> str:
         sum(
             parse_price(order.get("price", "0"))
             for order in orders
-            if order.get("status") not in {"cancelled", "canceled"}
+            if is_revenue_order(order)
         ),
         2,
     )
@@ -2783,6 +2972,8 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     context.user_data["plan_key"] = plan_key
     context.user_data["plan"]     = plan
+    order = create_checkout_order(query.from_user, plan_key, plan)
+    context.user_data["checkout_order_id"] = order["id"]
 
     methods = enabled_payment_methods()
     if list(methods.keys()) == ["card"] or not methods:
@@ -2792,6 +2983,7 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["payment_provider"] = "card"
         lock = await create_card_payment_lock(plan)
         context.user_data["card_payment_lock"] = lock
+        update_checkout_order(order["id"], payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
         await query.message.reply_text(
             build_card_payment_text(plan, card, lock),
             parse_mode="HTML",
@@ -2818,6 +3010,12 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     data = query.data
     plan = context.user_data.get("plan", {})
+    if not plan and (data in {"pay_card", "pay_cryptobot", "pay_freekassa", "pay_yookassa", "payment_done"} or data.startswith("check_payment_")):
+        await query.message.reply_text(
+            "Платёжная сессия устарела. Выберите eSIM заново.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌍 Выбрать eSIM", callback_data="buy_esim")]]),
+        )
+        return ConversationHandler.END
 
     if data in {"pay_freekassa", "pay_yookassa"}:
         provider = data.replace("pay_", "")
@@ -2862,6 +3060,13 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         invoice_id = invoice.get("invoice_id")
         pay_url = invoice.get("pay_url") or invoice.get("bot_invoice_url") or invoice.get("mini_app_invoice_url")
+        update_checkout_order(
+            context.user_data.get("checkout_order_id"),
+            payment_method=payment_provider_label("cryptobot"),
+            payment_provider="cryptobot",
+            cryptobot_invoice_id=invoice_id,
+            cryptobot_pay_url=pay_url,
+        )
         rows = []
         if pay_url:
             rows.append([InlineKeyboardButton("🤖 Оплатить в CryptoBot", url=pay_url)])
@@ -2914,6 +3119,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["payment_provider"] = "card"
         lock = await create_card_payment_lock(plan)
         context.user_data["card_payment_lock"] = lock
+        update_checkout_order(context.user_data.get("checkout_order_id"), payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
         await query.message.reply_text(
             build_card_payment_text(plan, card, lock),
             parse_mode="HTML",
@@ -3049,7 +3255,11 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     payment_details = order_payment_details_from_context(context)
     if payment_details:
         order_payload["payment_details"] = payment_details
-    order = append_order(order_payload)
+    checkout_order_id = context.user_data.get("checkout_order_id")
+    if checkout_order_id:
+        order = update_checkout_order(checkout_order_id, **order_payload, status="new") or append_order(order_payload)
+    else:
+        order = append_order(order_payload)
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
     await update.message.reply_text(
@@ -3083,6 +3293,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def cancel_order_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if context.user_data.get("checkout_order_id"):
+        update_checkout_order(context.user_data.get("checkout_order_id"), status="cancelled")
     context.user_data.clear()
     await query.message.reply_text(
         "Заявка отменена.",
@@ -3768,8 +3980,9 @@ async def cmd_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def calc_stats(orders: list, since: datetime.date) -> tuple[int, float]:
     filtered = orders_by_period(orders, since)
-    count = sum(1 for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
-    total = sum(parse_price(o.get("price", "0")) for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
+    revenue_orders = [order for order in filtered if is_revenue_order(order)]
+    count = len(revenue_orders)
+    total = sum(parse_price(o.get("price", "0")) for o in revenue_orders)
     return count, total
 
 
@@ -3789,8 +4002,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cancelled_orders = [o for o in orders if normalize_order_status(o.get("status")) == "cancelled"]
     cancelled_sum    = sum(parse_price(o.get("price", "0")) for o in cancelled_orders)
 
-    all_count = sum(1 for o in orders if normalize_order_status(o.get("status")) != "cancelled")
-    all_sum   = sum(parse_price(o.get("price", "0")) for o in orders if normalize_order_status(o.get("status")) != "cancelled")
+    revenue_orders = [order for order in orders if is_revenue_order(order)]
+    all_count = len(revenue_orders)
+    all_sum   = sum(parse_price(o.get("price", "0")) for o in revenue_orders)
 
     await update.message.reply_text(
         "📊 <b>Статистика продаж</b>\n\n"
@@ -4247,6 +4461,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_instructions(update, context)
     elif data == "support_screen":
         await show_support_screen(update, context)
+    elif data.startswith("abandoned_continue:"):
+        await show_existing_checkout_payment(update, context)
     elif data == "profile":
         await show_profile(update, context)
     elif data == "profile_orders":
@@ -4292,6 +4508,7 @@ async def post_init(app: Application) -> None:
     except (NetworkError, TimedOut) as exc:
         logger.warning("Telegram API timeout/network error during post_init; bot will continue: %s", exc)
     schedule_automatic_backups(app)
+    schedule_abandoned_checkout_reminders(app)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -4325,11 +4542,15 @@ def main() -> None:
 
     # ── ConversationHandler: покупка ─────────────────────────────────────────
     purchase_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_")],
+        entry_points=[
+            CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_"),
+            CallbackQueryHandler(show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"),
+        ],
         states={
             WAITING_PAYMENT: [
                 CallbackQueryHandler(choose_payment,
                     pattern=r"^(pay_card|pay_cryptobot|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
+                CallbackQueryHandler(show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"),
             ],
             WAITING_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_TELEGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_telegram)],
@@ -4348,6 +4569,9 @@ def main() -> None:
     # ── Кнопки ✅ / ❌ на уведомлениях ──────────────────────────────────────
     app.add_handler(CallbackQueryHandler(
         handle_admin_action, pattern=r"^((done|cancelled)_\d+|order_status:(in_progress|issued|cancelled):\d+)$"
+    ))
+    app.add_handler(CallbackQueryHandler(
+        show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"
     ))
 
     # ── Команды ──────────────────────────────────────────────────────────────

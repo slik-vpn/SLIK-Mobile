@@ -79,6 +79,9 @@ def check_bot_contract(bot_text: str) -> None:
         "check_payment_",
         "cancel_order",
         "support",
+        "abandoned_continue:",
+        "abandoned_reminder_sent",
+        "ABANDONED_CHECKOUT_REMINDER_MINUTES",
     ]
     for identifier in identifiers:
         check_contains(bot_text, identifier, "bot/bot.py callback/data identifiers")
@@ -99,11 +102,47 @@ def check_bot_contract(bot_text: str) -> None:
         "async def show_admin_payments(",
         "async def handle_callback(",
         "async def choose_payment(",
+        "async def show_existing_checkout_payment(",
+        "async def abandoned_checkout_reminder_job(",
         "async def notify_admin(",
         "def main(",
     ]
     for handler in handlers:
         check_contains(bot_text, handler, "bot/bot.py menu/handler functions")
+
+    record(
+        "is_revenue_order excludes waiting_payment",
+        bool(re.search(
+            r"def\s+is_revenue_order\(order: dict\).*?not in\s+\{[^}]*[\"']cancelled[\"'][^}]*[\"']waiting_payment[\"'][^}]*\}",
+            bot_text,
+            re.DOTALL,
+        )),
+    )
+
+    reminder_job = re.search(
+        r"async def abandoned_checkout_reminder_job\(.*?\n(?=\n\ndef |\n\nasync def |\n\n# ───)",
+        bot_text,
+        re.DOTALL,
+    )
+    reminder_job_text = reminder_job.group(0) if reminder_job else ""
+    send_message_index = reminder_job_text.find("await context.bot.send_message")
+    post_send_text = reminder_job_text[send_message_index:] if send_message_index >= 0 else ""
+    record(
+        "abandoned reminder updates fresh order after send",
+        "mark_abandoned_reminder_sent_if_still_waiting(order_id)" in post_send_text,
+    )
+    record(
+        "abandoned reminder does not save stale snapshot after send",
+        "save_orders(" not in post_send_text,
+    )
+    record(
+        "abandoned reminder fresh update helper reloads orders",
+        bool(re.search(
+            r"def\s+mark_abandoned_reminder_sent_if_still_waiting\(order_id: int\).*?fresh_orders\s*=\s*load_orders\(\).*?save_orders\(fresh_orders\)",
+            bot_text,
+            re.DOTALL,
+        )),
+    )
 
 
 def main() -> int:
