@@ -1,0 +1,12 @@
+[Unit]
+Description=SLIK Mobile Telegram Bot healthcheck watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/slik-mobile
+EnvironmentFile=/opt/slik-mobile/.env
+ExecStart=/opt/slik-mobile/.venv/bin/python /opt/slik-mobile/bot/bot_healthcheck.py
