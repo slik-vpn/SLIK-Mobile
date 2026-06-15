@@ -394,7 +394,7 @@ Systemd-запуск бота усилен автоматическим восс
 - состояние `systemctl is-active slik-mobile`;
 - доступность Telegram API через `getMe`;
 - наличие основного PID и состояние процесса;
-- серии `httpx.ConnectTimeout` и `telegram.error.TimedOut` в журнале systemd;
+- серии `httpx.ConnectTimeout` и `telegram.error.TimedOut` в журнале systemd за последние 3 минуты;
 - количество подряд неудачных проверок.
 
 Если несколько проверок подряд завершаются ошибкой, watchdog выполняет `systemctl restart slik-mobile`, пишет причину и время восстановления в `/var/log/slik-mobile-healthcheck.log`, сохраняет состояние в `/var/lib/slik-mobile/healthcheck-state.json` и отправляет администратору Telegram-уведомление:

@@ -27,7 +27,7 @@ LOG_FILE = Path(os.environ.get("SLIK_HEALTHCHECK_LOG", "/var/log/slik-mobile-hea
 FAILURE_THRESHOLD = int(os.environ.get("SLIK_HEALTHCHECK_FAILURE_THRESHOLD", "3"))
 TIMEOUT_SERIES_THRESHOLD = int(os.environ.get("SLIK_HEALTHCHECK_TIMEOUT_SERIES_THRESHOLD", "3"))
 TELEGRAM_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
-TIMEOUT_PATTERNS = ("httpx.ConnectTimeout", "telegram.error.TimedOut", "ConnectTimeout", "TimedOut")
+TIMEOUT_RE = re.compile(r"(?:httpx\.)?ConnectTimeout|(?:telegram\.error\.)?TimedOut")
 
 logging.basicConfig(
     filename=str(LOG_FILE),
@@ -82,9 +82,12 @@ def process_state(pid: int | None) -> str:
 
 
 def recent_timeout_count() -> int:
-    result = run_command(["journalctl", "-u", SERVICE_NAME, "-n", "120", "--no-pager"], timeout=20)
+    result = run_command(
+        ["journalctl", "-u", SERVICE_NAME, "--since", "-3 minutes", "--no-pager"],
+        timeout=20,
+    )
     text = f"{result.stdout}\n{result.stderr}"
-    return sum(len(re.findall(re.escape(pattern), text)) for pattern in TIMEOUT_PATTERNS)
+    return len(TIMEOUT_RE.findall(text))
 
 
 def telegram_api_ok() -> tuple[bool, str]:

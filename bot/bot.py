@@ -4397,16 +4397,10 @@ def main() -> None:
     ))
 
     logger.info("Бот SLIK Mobile запущен...")
-    while True:
-        try:
-            app.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                bootstrap_retries=int(os.environ.get("TELEGRAM_BOOTSTRAP_RETRIES", "-1")),
-            )
-            break
-        except (NetworkError, TimedOut) as exc:
-            logger.warning("Telegram polling network error; retrying without process exit: %s", exc)
-            continue
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=int(os.environ.get("TELEGRAM_BOOTSTRAP_RETRIES", "-1")),
+    )
 
 
 if __name__ == "__main__":
