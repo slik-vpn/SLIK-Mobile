@@ -197,6 +197,7 @@ DEFAULT_CONFIG = {
 
 PAYMENT_METHOD_LABELS = {
     "card": "Карта",
+    "cryptobot": "CryptoBot",
     "freekassa": "FreeKassa",
     "yookassa": "YooKassa",
 }
@@ -206,9 +207,22 @@ DEFAULT_PAYMENT_METHODS = {
         "enabled": True,
         "type": "manual",
         "title": "💳 Карта",
-        "client_title": "💳 Банковская карта",
+        "client_title": "💳 Карта",
         "description": "Текущий способ оплаты картой",
         "instructions": [],
+        "credentials": {},
+    },
+    "cryptobot": {
+        "enabled": True,
+        "type": "api",
+        "title": "🤖 CryptoBot",
+        "client_title": "🤖 CryptoBot",
+        "description": "Оплата через CryptoBot",
+        "instructions": [
+            "Откройте @CryptoBot в Telegram",
+            "Создайте приложение в Crypto Pay и получите API-токен",
+            "Сохраните токен в настройках оплаты бота",
+        ],
         "credentials": {},
     },
     "freekassa": {
@@ -315,9 +329,13 @@ def default_payment_methods() -> dict:
 
 
 def merge_payment_methods(data: dict) -> dict:
-    merged = default_payment_methods()
-    for key, defaults in merged.items():
-        method = data.get(key) if isinstance(data.get(key), dict) else {}
+    merged = {
+        key: json.loads(json.dumps(value))
+        for key, value in data.items()
+        if isinstance(value, dict)
+    }
+    for key, defaults in default_payment_methods().items():
+        method = merged.get(key) if isinstance(merged.get(key), dict) else {}
         for field, value in defaults.items():
             if field == "credentials":
                 credentials = method.get("credentials") if isinstance(method.get("credentials"), dict) else {}
@@ -2815,6 +2833,52 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return WAITING_PAYMENT
 
+    if data == "pay_cryptobot":
+        cfg = load_config()
+        token = cfg["payment"].get("cryptobot_token", "").strip()
+        if not token:
+            await query.message.reply_text(
+                "CryptoBot временно недоступен. Выберите оплату картой.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Оплатить картой", callback_data="pay_card")],
+                    [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+                ]),
+            )
+            return WAITING_PAYMENT
+
+        context.user_data["payment_method"] = payment_provider_label("cryptobot")
+        context.user_data["payment_provider"] = "cryptobot"
+        amount = parse_price(plan.get("price", "0"))
+        description = f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip()
+        invoice = await crypto_create_invoice(token, amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}")
+        if not invoice:
+            await query.message.reply_text(
+                "Не удалось создать счёт CryptoBot. Выберите оплату картой.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 Оплатить картой", callback_data="pay_card")],
+                    [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+                ]),
+            )
+            return WAITING_PAYMENT
+
+        invoice_id = invoice.get("invoice_id")
+        pay_url = invoice.get("pay_url") or invoice.get("bot_invoice_url") or invoice.get("mini_app_invoice_url")
+        rows = []
+        if pay_url:
+            rows.append([InlineKeyboardButton("🤖 Оплатить в CryptoBot", url=pay_url)])
+        rows.extend([
+            [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{invoice_id}")],
+            [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+        ])
+        await query.message.reply_text(
+            "🤖 <b>Оплата через CryptoBot</b>\n\n"
+            f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
+            "Откройте счёт, оплатите его и нажмите «Проверить оплату».",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return WAITING_PAYMENT
+
     if data == "payment_done":
         if context.user_data.get("payment_method") == "Карта" and not is_card_payment_lock_active(
             context.user_data.get("card_payment_lock")
@@ -4254,7 +4318,7 @@ def main() -> None:
         states={
             WAITING_PAYMENT: [
                 CallbackQueryHandler(choose_payment,
-                    pattern=r"^(pay_card|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
+                    pattern=r"^(pay_card|pay_cryptobot|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
             ],
             WAITING_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_TELEGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_telegram)],
