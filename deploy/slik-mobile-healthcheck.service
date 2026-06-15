@@ -5,8 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=root
-Group=root
-WorkingDirectory=/opt/slik-mobile
-EnvironmentFile=/opt/slik-mobile/.env
-ExecStart=/opt/slik-mobile/.venv/bin/python /opt/slik-mobile/bot/bot_healthcheck.py
+WorkingDirectory=/opt/SLIK-Mobile
+EnvironmentFile=/opt/SLIK-Mobile/.env
+ExecStart=/opt/SLIK-Mobile/venv/bin/python /opt/SLIK-Mobile/bot/bot_healthcheck.py

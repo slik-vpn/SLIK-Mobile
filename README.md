@@ -60,9 +60,9 @@ sudo systemctl enable --now docker
 ### Развёртывание проекта
 
 ```bash
-sudo mkdir -p /opt/slik-mobile
-sudo chown -R "$USER":"$USER" /opt/slik-mobile
-cd /opt/slik-mobile
+sudo mkdir -p /opt/SLIK-Mobile
+sudo chown -R "$USER":"$USER" /opt/SLIK-Mobile
+cd /opt/SLIK-Mobile
 git clone https://github.com/slik-vpn/SLIK-Mobile.git .
 cp .env.example .env
 nano .env
@@ -86,7 +86,7 @@ docker compose up -d
 Обновление после новых коммитов:
 
 ```bash
-cd /opt/slik-mobile
+cd /opt/SLIK-Mobile
 git pull
 docker compose up -d --build
 ```
@@ -264,7 +264,7 @@ unzip -o backups/backup_2026-06-10_15-00.zip
 4. Проверьте права на восстановленные файлы, если сервис запускается от отдельного пользователя:
 
 ```bash
-sudo chown slik-mobile:slik-mobile bot/users.json bot/orders.json bot/config.json bot/balance_changes.json
+sudo chown <service-user>:<service-group> bot/users.json bot/orders.json bot/config.json bot/balance_changes.json
 ```
 
 5. Запустите сервис снова:
@@ -298,25 +298,24 @@ CryptoBot создаёт счёт и проверяет статус по кно
 
 ## Установка на VPS через systemd
 
-Пример ниже рассчитан на Ubuntu/Debian и директорию `/opt/slik-mobile`.
+Пример ниже рассчитан на Ubuntu/Debian и фактическую production-директорию `/opt/SLIK-Mobile`. Unit-файлы из `deploy/` не задают `User=`/`Group=`, поэтому сервис запускается от системного пользователя systemd по умолчанию. Если нужен отдельный пользователь, сначала создайте его явно и отдельно обновите unit-файлы и права на директорию.
 
 ```bash
-sudo adduser --system --group --home /opt/slik-mobile slik-mobile
-sudo mkdir -p /opt/slik-mobile
-sudo chown -R slik-mobile:slik-mobile /opt/slik-mobile
+sudo mkdir -p /opt/SLIK-Mobile
+sudo chown -R "$USER":"$USER" /opt/SLIK-Mobile
 ```
 
-Загрузите проект на сервер в `/opt/slik-mobile`, затем:
+Загрузите проект на сервер в `/opt/SLIK-Mobile`, затем:
 
 ```bash
-cd /opt/slik-mobile
-sudo -u slik-mobile python3 -m venv .venv
-sudo -u slik-mobile .venv/bin/pip install -r bot/requirements.txt
-sudo -u slik-mobile cp bot/config.example.json bot/config.json
-sudo -u slik-mobile cp bot/orders.example.json bot/orders.json
-sudo -u slik-mobile cp bot/users.example.json bot/users.json
-sudo -u slik-mobile cp .env.example .env
-sudo nano /opt/slik-mobile/.env
+cd /opt/SLIK-Mobile
+python3 -m venv venv
+venv/bin/pip install -r bot/requirements.txt
+cp bot/config.example.json bot/config.json
+cp bot/orders.example.json bot/orders.json
+cp bot/users.example.json bot/users.json
+cp .env.example .env
+nano /opt/SLIK-Mobile/.env
 ```
 
 Установите unit:
@@ -410,7 +409,7 @@ Systemd-запуск бота усилен автоматическим восс
 Время: <timestamp>
 ```
 
-Для уведомления используются `TELEGRAM_BOT_TOKEN` и `ADMIN_CHAT_ID` из `/opt/slik-mobile/.env`. Если переменные не заданы, restart всё равно выполняется, а отправка уведомления пропускается с записью в лог.
+Для уведомления используются `TELEGRAM_BOT_TOKEN` и `ADMIN_CHAT_ID` из `/opt/SLIK-Mobile/.env`. Если переменные не заданы, restart всё равно выполняется, а отправка уведомления пропускается с записью в лог.
 
 Telegram HTTP client в боте имеет отдельные таймауты без бесконечного ожидания. Их можно переопределить в `.env`:
 
