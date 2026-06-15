@@ -852,7 +852,7 @@ def award_referral_bonus_if_needed(users: dict, profile: dict, user, order: dict
 
 def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list | None = None) -> dict:
     user_orders = orders if orders is not None else get_user_orders(user_id)
-    active_orders = [order for order in user_orders if normalize_order_status(order.get("status")) not in {"cancelled", "waiting_payment"}]
+    active_orders = [order for order in user_orders if is_revenue_order(order)]
     profile["orders_count"] = len(active_orders)
     profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
     profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
@@ -864,7 +864,7 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
 def award_cashback_if_needed(profile: dict, order: dict) -> float:
     if order.get("cashback_awarded"):
         return 0.0
-    if order.get("status") in {"cancelled", "canceled"}:
+    if not is_revenue_order(order):
         return 0.0
 
     order_amount = parse_price(order.get("price", "0"))
@@ -950,7 +950,7 @@ def record_user_order(user, order: dict) -> tuple[dict, str, str, float]:
         sum(
             parse_price(user_order.get("price", "0"))
             for user_order in previous_orders
-            if user_order.get("status") != "cancelled"
+            if is_revenue_order(user_order)
         ),
         2,
     )
@@ -1559,8 +1559,12 @@ def build_orders_dashboard() -> str:
     def count_status(items: list, status: str) -> int:
         return sum(1 for order in items if normalize_order_status(order.get("status")) == status)
 
-    week_total = sum(parse_price(order.get("price", "0")) for order in week_orders)
-    month_total = sum(parse_price(order.get("price", "0")) for order in month_orders)
+    week_revenue_orders = [order for order in week_orders if is_revenue_order(order)]
+    month_revenue_orders = [order for order in month_orders if is_revenue_order(order)]
+    week_waiting_payment = count_status(week_orders, "waiting_payment")
+    month_waiting_payment = count_status(month_orders, "waiting_payment")
+    week_total = sum(parse_price(order.get("price", "0")) for order in week_revenue_orders)
+    month_total = sum(parse_price(order.get("price", "0")) for order in month_revenue_orders)
     return (
         "📋 <b>Заказы</b>\n\n"
         "<b>Сегодня:</b>\n"
@@ -1569,10 +1573,12 @@ def build_orders_dashboard() -> str:
         f"🟢 Выдано: <b>{count_status(today_orders, 'issued')}</b>\n"
         f"🔴 Отменено: <b>{count_status(today_orders, 'cancelled')}</b>\n\n"
         "<b>За 7 дней:</b>\n"
-        f"📦 Всего заказов: <b>{len(week_orders)}</b>\n"
+        f"📦 Всего заказов: <b>{len(week_revenue_orders)}</b>\n"
+        f"🟠 Ожидают оплаты: <b>{week_waiting_payment}</b>\n"
         f"💵 Сумма: <b>${week_total:.2f}</b>\n\n"
         "<b>За 30 дней:</b>\n"
-        f"📦 Всего заказов: <b>{len(month_orders)}</b>\n"
+        f"📦 Всего заказов: <b>{len(month_revenue_orders)}</b>\n"
+        f"🟠 Ожидают оплаты: <b>{month_waiting_payment}</b>\n"
         f"💵 Сумма: <b>${month_total:.2f}</b>\n\n"
         "<b>Быстрые действия:</b>\n"
         "🟡 Новые заявки\n"
@@ -1678,7 +1684,7 @@ def build_orders_stats_text() -> str:
 
 
 def is_revenue_order(order: dict) -> bool:
-    return normalize_order_status(order.get("status")) not in {"cancelled", "canceled"}
+    return normalize_order_status(order.get("status")) not in {"cancelled", "waiting_payment"}
 
 
 def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
@@ -1863,7 +1869,7 @@ def collect_clients() -> list[dict]:
         if not isinstance(profile, dict):
             continue
         user_orders = orders_by_user.get(str(user_id), [])
-        active_orders = [order for order in user_orders if normalize_order_status(order.get("status")) != "cancelled"]
+        active_orders = [order for order in user_orders if is_revenue_order(order)]
         total_spent = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
         order_dates = [date for date in (parse_order_datetime(order) for order in active_orders) if date]
         last_order_at = max(order_dates, default=None)
@@ -2835,7 +2841,7 @@ def format_user_orders(orders: list) -> str:
         sum(
             parse_price(order.get("price", "0"))
             for order in orders
-            if order.get("status") not in {"cancelled", "canceled"}
+            if is_revenue_order(order)
         ),
         2,
     )
@@ -3951,8 +3957,9 @@ async def cmd_cancelled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def calc_stats(orders: list, since: datetime.date) -> tuple[int, float]:
     filtered = orders_by_period(orders, since)
-    count = sum(1 for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
-    total = sum(parse_price(o.get("price", "0")) for o in filtered if normalize_order_status(o.get("status")) != "cancelled")
+    revenue_orders = [order for order in filtered if is_revenue_order(order)]
+    count = len(revenue_orders)
+    total = sum(parse_price(o.get("price", "0")) for o in revenue_orders)
     return count, total
 
 
@@ -3972,8 +3979,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cancelled_orders = [o for o in orders if normalize_order_status(o.get("status")) == "cancelled"]
     cancelled_sum    = sum(parse_price(o.get("price", "0")) for o in cancelled_orders)
 
-    all_count = sum(1 for o in orders if normalize_order_status(o.get("status")) != "cancelled")
-    all_sum   = sum(parse_price(o.get("price", "0")) for o in orders if normalize_order_status(o.get("status")) != "cancelled")
+    revenue_orders = [order for order in orders if is_revenue_order(order)]
+    all_count = len(revenue_orders)
+    all_sum   = sum(parse_price(o.get("price", "0")) for o in revenue_orders)
 
     await update.message.reply_text(
         "📊 <b>Статистика продаж</b>\n\n"

@@ -110,6 +110,15 @@ def check_bot_contract(bot_text: str) -> None:
     for handler in handlers:
         check_contains(bot_text, handler, "bot/bot.py menu/handler functions")
 
+    record(
+        "is_revenue_order excludes waiting_payment",
+        bool(re.search(
+            r"def\s+is_revenue_order\(order: dict\).*?not in\s+\{[^}]*[\"']cancelled[\"'][^}]*[\"']waiting_payment[\"'][^}]*\}",
+            bot_text,
+            re.DOTALL,
+        )),
+    )
+
 
 def main() -> int:
     check_syntax("bot/bot.py")
