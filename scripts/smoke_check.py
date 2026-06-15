@@ -79,6 +79,9 @@ def check_bot_contract(bot_text: str) -> None:
         "check_payment_",
         "cancel_order",
         "support",
+        "abandoned_continue:",
+        "abandoned_reminder_sent",
+        "ABANDONED_CHECKOUT_REMINDER_MINUTES",
     ]
     for identifier in identifiers:
         check_contains(bot_text, identifier, "bot/bot.py callback/data identifiers")
@@ -99,6 +102,8 @@ def check_bot_contract(bot_text: str) -> None:
         "async def show_admin_payments(",
         "async def handle_callback(",
         "async def choose_payment(",
+        "async def show_existing_checkout_payment(",
+        "async def abandoned_checkout_reminder_job(",
         "async def notify_admin(",
         "def main(",
     ]
