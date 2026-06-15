@@ -345,6 +345,33 @@ sudo journalctl -u slik-mobile -f
 7. `/orders`, `/pending`, `/completed`, `/cancelled`, `/stats` не падают на пустом или старом `orders.json`.
 8. Ответ менеджера reply-сообщением в админ-чате доставляется клиенту.
 
+## Smoke test перед deploy
+
+Перед deploy или после merge запустите read-only smoke-test из корня проекта:
+
+```bash
+python scripts/smoke_check.py
+```
+
+Скрипт выполняет только статические проверки: проверяет синтаксис `bot/bot.py` и `bot/bot_healthcheck.py`, проверяет безопасные пути в systemd unit-файлах, отсутствие неявного `User=slik-mobile`/`Group=slik-mobile` без документированного создания пользователя, а также наличие ключевых callback/data identifiers и основных меню/хендлеров. Smoke-test не пишет в `users.json` или `orders.json`, не отправляет Telegram-сообщения, не создаёт платежи и не меняет `.env` или production-файлы.
+
+Ручной чек-лист после deploy:
+
+1. `/start`
+2. `Купить eSIM`
+3. `Личный кабинет`
+4. `Мои заказы`
+5. `Реферальная программа`
+6. `SLIK Balance`
+7. `Поддержка`
+8. `Админ-панель`
+9. `Методы оплаты`
+10. `CRM заказов`
+11. `CRM клиентов`
+12. `systemctl status slik-mobile`
+13. `systemctl status slik-mobile-healthcheck.timer`
+14. `journalctl -u slik-mobile-healthcheck.service`
+
 ## Файлы данных
 
 - `bot/config.json` при systemd-запуске или `data/config.json` при Docker-запуске — runtime-настройки, баннеры, админы, relay и платёжные реквизиты.
