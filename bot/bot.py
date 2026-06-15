@@ -2369,9 +2369,8 @@ def get_tma_url() -> str | None:
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
-        [InlineKeyboardButton("📦 Мои заказы",               callback_data="profile_orders")],
-        [InlineKeyboardButton("👥 Реферальная программа",    callback_data="profile_invite")],
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
+        [InlineKeyboardButton("👨‍💻 Поддержка",              url=SUPPORT_URL)],
     ]
     tma_url = get_tma_url()
     if tma_url:
