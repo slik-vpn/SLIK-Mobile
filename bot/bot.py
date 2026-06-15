@@ -2748,10 +2748,28 @@ async def show_existing_checkout_payment(update: Update, context: ContextTypes.D
     return WAITING_PAYMENT
 
 
+def mark_abandoned_reminder_sent_if_still_waiting(order_id: int) -> bool:
+    fresh_orders = load_orders()
+    for fresh_order in fresh_orders:
+        try:
+            is_same_order = int(fresh_order.get("id")) == int(order_id)
+        except (TypeError, ValueError):
+            is_same_order = False
+        if not is_same_order:
+            continue
+        if normalize_order_status(fresh_order.get("status")) != "waiting_payment" or fresh_order.get("abandoned_reminder_sent"):
+            return False
+        fresh_order["abandoned_reminder_sent"] = True
+        fresh_order["abandoned_reminder_sent_at"] = now_str()
+        save_orders(fresh_orders)
+        return True
+    return False
+
+
 async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.datetime.now(tz=TZ)
-    orders = load_orders()
-    for order in orders:
+    candidate_orders = load_orders()
+    for order in candidate_orders:
         if normalize_order_status(order.get("status")) != "waiting_payment" or order.get("abandoned_reminder_sent"):
             continue
         order_id = order.get("id")
@@ -2782,25 +2800,13 @@ async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Не удалось отправить abandoned checkout reminder для заказа %s: %s", order.get("number"), e)
             continue
 
-        fresh_orders = load_orders()
-        for fresh_order in fresh_orders:
-            try:
-                is_same_order = int(fresh_order.get("id")) == int(order_id)
-            except (TypeError, ValueError):
-                is_same_order = False
-            if not is_same_order:
-                continue
-            if normalize_order_status(fresh_order.get("status")) != "waiting_payment" or fresh_order.get("abandoned_reminder_sent"):
-                logger.info(
-                    "Abandoned checkout reminder was sent but order %s changed before flag update; leaving order unchanged",
-                    order.get("number"),
-                )
-                break
-            fresh_order["abandoned_reminder_sent"] = True
-            fresh_order["abandoned_reminder_sent_at"] = now_str()
-            save_orders(fresh_orders)
+        if mark_abandoned_reminder_sent_if_still_waiting(order_id):
             logger.info("Abandoned checkout reminder sent for order %s", order.get("number"))
-            break
+        else:
+            logger.info(
+                "Abandoned checkout reminder was sent but order %s changed before flag update; leaving order unchanged",
+                order.get("number"),
+            )
 
 
 def schedule_abandoned_checkout_reminders(app: Application) -> None:

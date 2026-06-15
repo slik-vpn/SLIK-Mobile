@@ -128,13 +128,20 @@ def check_bot_contract(bot_text: str) -> None:
     send_message_index = reminder_job_text.find("await context.bot.send_message")
     post_send_text = reminder_job_text[send_message_index:] if send_message_index >= 0 else ""
     record(
-        "abandoned reminder reloads orders after send",
-        "fresh_orders = load_orders()" in post_send_text
-        and "save_orders(fresh_orders)" in post_send_text,
+        "abandoned reminder updates fresh order after send",
+        "mark_abandoned_reminder_sent_if_still_waiting(order_id)" in post_send_text,
     )
     record(
-        "abandoned reminder does not save stale snapshot",
-        "save_orders(orders)" not in reminder_job_text,
+        "abandoned reminder does not save stale snapshot after send",
+        "save_orders(" not in post_send_text,
+    )
+    record(
+        "abandoned reminder fresh update helper reloads orders",
+        bool(re.search(
+            r"def\s+mark_abandoned_reminder_sent_if_still_waiting\(order_id: int\).*?fresh_orders\s*=\s*load_orders\(\).*?save_orders\(fresh_orders\)",
+            bot_text,
+            re.DOTALL,
+        )),
     )
 
 
