@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SLIK Mobile Telegram Bot healthcheck every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Unit=slik-mobile-healthcheck.service
+
+[Install]
+WantedBy=timers.target

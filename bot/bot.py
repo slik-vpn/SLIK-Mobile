@@ -4268,28 +4268,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("start",           "Главное меню"),
-        BotCommand("admin",           "Админ-панель"),
-        BotCommand("clients",         "Клиенты CRM"),
-        BotCommand("news",            "CRM рассылки"),
-        BotCommand("orders",          "Последние 50 заказов"),
-        BotCommand("orders_today",    "Заказы за сегодня"),
-        BotCommand("orders_7d",       "Заказы за 7 дней"),
-        BotCommand("orders_30d",      "Заказы за 30 дней"),
-        BotCommand("stats",           "Статистика продаж"),
-        BotCommand("pending",         "Активные заявки"),
-        BotCommand("completed",       "Выполненные заявки"),
-        BotCommand("cancelled",       "Отменённые заявки"),
-        BotCommand("admins",          "Управление администраторами"),
-        BotCommand("banners",         "Управление баннерами"),
-        BotCommand("payment_details", "Реквизиты оплаты"),
-        BotCommand("backup",          "Создать резервную копию"),
-        BotCommand("backups",         "Последние резервные копии"),
-        BotCommand("help",            "Справка администратора"),
-    ])
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start",           "Главное меню"),
+            BotCommand("admin",           "Админ-панель"),
+            BotCommand("clients",         "Клиенты CRM"),
+            BotCommand("news",            "CRM рассылки"),
+            BotCommand("orders",          "Последние 50 заказов"),
+            BotCommand("orders_today",    "Заказы за сегодня"),
+            BotCommand("orders_7d",       "Заказы за 7 дней"),
+            BotCommand("orders_30d",      "Заказы за 30 дней"),
+            BotCommand("stats",           "Статистика продаж"),
+            BotCommand("pending",         "Активные заявки"),
+            BotCommand("completed",       "Выполненные заявки"),
+            BotCommand("cancelled",       "Отменённые заявки"),
+            BotCommand("admins",          "Управление администраторами"),
+            BotCommand("banners",         "Управление баннерами"),
+            BotCommand("payment_details", "Реквизиты оплаты"),
+            BotCommand("backup",          "Создать резервную копию"),
+            BotCommand("backups",         "Последние резервные копии"),
+            BotCommand("help",            "Справка администратора"),
+        ])
+        logger.info("Команды зарегистрированы в Telegram")
+    except (NetworkError, TimedOut) as exc:
+        logger.warning("Telegram API timeout/network error during post_init; bot will continue: %s", exc)
     schedule_automatic_backups(app)
-    logger.info("Команды зарегистрированы в Telegram")
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
@@ -4299,7 +4302,16 @@ def main() -> None:
     if not token:
         raise RuntimeError("Переменная окружения TELEGRAM_BOT_TOKEN не задана")
 
-    app = Application.builder().token(token).connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(float(os.environ.get("TELEGRAM_CONNECT_TIMEOUT", "10")))
+        .read_timeout(float(os.environ.get("TELEGRAM_READ_TIMEOUT", "20")))
+        .write_timeout(float(os.environ.get("TELEGRAM_WRITE_TIMEOUT", "10")))
+        .pool_timeout(float(os.environ.get("TELEGRAM_POOL_TIMEOUT", "10")))
+        .post_init(post_init)
+        .build()
+    )
 
     # ── ConversationHandler: баннеры ─────────────────────────────────────────
     banner_conv = ConversationHandler(
@@ -4385,7 +4397,10 @@ def main() -> None:
     ))
 
     logger.info("Бот SLIK Mobile запущен...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=int(os.environ.get("TELEGRAM_BOOTSTRAP_RETRIES", "-1")),
+    )
 
 
 if __name__ == "__main__":
