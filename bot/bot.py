@@ -2751,9 +2751,11 @@ async def show_existing_checkout_payment(update: Update, context: ContextTypes.D
 async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.datetime.now(tz=TZ)
     orders = load_orders()
-    changed = False
     for order in orders:
         if normalize_order_status(order.get("status")) != "waiting_payment" or order.get("abandoned_reminder_sent"):
+            continue
+        order_id = order.get("id")
+        if order_id is None:
             continue
         created_at = order.get("checkout_created_at")
         try:
@@ -2776,14 +2778,29 @@ async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) ->
                 ),
                 reply_markup=abandoned_checkout_keyboard(order["id"]),
             )
-            order["abandoned_reminder_sent"] = True
-            order["abandoned_reminder_sent_at"] = now_str()
-            changed = True
-            logger.info("Abandoned checkout reminder sent for order %s", order.get("number"))
         except Exception as e:
             logger.error("Не удалось отправить abandoned checkout reminder для заказа %s: %s", order.get("number"), e)
-    if changed:
-        save_orders(orders)
+            continue
+
+        fresh_orders = load_orders()
+        for fresh_order in fresh_orders:
+            try:
+                is_same_order = int(fresh_order.get("id")) == int(order_id)
+            except (TypeError, ValueError):
+                is_same_order = False
+            if not is_same_order:
+                continue
+            if normalize_order_status(fresh_order.get("status")) != "waiting_payment" or fresh_order.get("abandoned_reminder_sent"):
+                logger.info(
+                    "Abandoned checkout reminder was sent but order %s changed before flag update; leaving order unchanged",
+                    order.get("number"),
+                )
+                break
+            fresh_order["abandoned_reminder_sent"] = True
+            fresh_order["abandoned_reminder_sent_at"] = now_str()
+            save_orders(fresh_orders)
+            logger.info("Abandoned checkout reminder sent for order %s", order.get("number"))
+            break
 
 
 def schedule_abandoned_checkout_reminders(app: Application) -> None:

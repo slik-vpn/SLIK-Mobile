@@ -119,6 +119,24 @@ def check_bot_contract(bot_text: str) -> None:
         )),
     )
 
+    reminder_job = re.search(
+        r"async def abandoned_checkout_reminder_job\(.*?\n(?=\n\ndef |\n\nasync def |\n\n# ───)",
+        bot_text,
+        re.DOTALL,
+    )
+    reminder_job_text = reminder_job.group(0) if reminder_job else ""
+    send_message_index = reminder_job_text.find("await context.bot.send_message")
+    post_send_text = reminder_job_text[send_message_index:] if send_message_index >= 0 else ""
+    record(
+        "abandoned reminder reloads orders after send",
+        "fresh_orders = load_orders()" in post_send_text
+        and "save_orders(fresh_orders)" in post_send_text,
+    )
+    record(
+        "abandoned reminder does not save stale snapshot",
+        "save_orders(orders)" not in reminder_job_text,
+    )
+
 
 def main() -> int:
     check_syntax("bot/bot.py")
