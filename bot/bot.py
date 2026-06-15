@@ -364,16 +364,6 @@ def payment_provider_label(provider: str | None) -> str:
     return PAYMENT_METHOD_LABELS.get(str(provider or ""), provider or "—")
 
 
-def get_cryptobot_token() -> str:
-    method = get_payment_method("cryptobot") or {}
-    credentials = method.get("credentials") if isinstance(method.get("credentials"), dict) else {}
-    for key in ("cryptobot_token", "api_token", "token"):
-        token = str(credentials.get(key) or "").strip()
-        if token:
-            return token
-    return load_config()["payment"].get("cryptobot_token", "").strip()
-
-
 def payment_method_client_title(provider: str) -> str:
     method = get_payment_method(provider) or {}
     return str(method.get("client_title") or PAYMENT_METHOD_LABELS.get(provider, provider))
@@ -2822,60 +2812,6 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
     plan = context.user_data.get("plan", {})
 
-    if data == "pay_cryptobot":
-        token = get_cryptobot_token()
-        context.user_data["payment_method"] = payment_provider_label("cryptobot")
-        context.user_data["payment_provider"] = "cryptobot"
-        if not token:
-            await query.message.reply_text(
-                "🤖 <b>CryptoBot</b>\n\nОплата через CryptoBot ещё не настроена.\n\n"
-                "Выберите другой способ или напишите менеджеру.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Переводом на карту",  callback_data="pay_card")],
-                    [InlineKeyboardButton("👨‍💻 Написать менеджеру", url=SUPPORT_URL)],
-                    [InlineKeyboardButton("❌ Отменить заявку",     callback_data="cancel_order")],
-                ]),
-            )
-            return WAITING_PAYMENT
-
-        amount      = parse_price(plan.get("price", "0"))
-        description = f"eSIM {plan.get('gb')} / {plan.get('days')} — SLIK Mobile"
-        payload     = f"user_{query.from_user.id}"
-
-        await query.message.reply_text("⏳ Создаю счёт...")
-        invoice = await crypto_create_invoice(token, amount, description, payload)
-
-        if not invoice:
-            await query.message.reply_text(
-                "❌ Не удалось создать счёт через CryptoBot. Попробуйте позже или выберите другой способ оплаты.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Переводом на карту",  callback_data="pay_card")],
-                    [InlineKeyboardButton("❌ Отменить заявку",     callback_data="cancel_order")],
-                ]),
-            )
-            return WAITING_PAYMENT
-
-        invoice_id  = invoice["invoice_id"]
-        pay_url     = invoice["pay_url"]
-        context.user_data["invoice_id"] = invoice_id
-
-        await query.message.reply_text(
-            f"🤖 <b>Оплата через CryptoBot</b>\n\n"
-            f"📶 Тариф: <b>{plan.get('gb')} / {plan.get('days')}</b>\n"
-            f"💵 Сумма: <b>{amount} USDT</b>\n\n"
-            "Нажмите кнопку ниже для оплаты.\n"
-            "После перевода нажмите «✅ Проверить оплату».",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"💸 Оплатить {amount} USDT", url=pay_url)],
-                [InlineKeyboardButton("✅ Проверить оплату",
-                                      callback_data=f"check_payment_{invoice_id}")],
-                [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
-            ]),
-        )
-        return WAITING_PAYMENT
-
     if data in {"pay_freekassa", "pay_yookassa"}:
         provider = data.replace("pay_", "")
         context.user_data["payment_method"] = payment_provider_label(provider)
@@ -2934,7 +2870,8 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif data.startswith("check_payment_"):
         invoice_id = int(data.replace("check_payment_", ""))
-        token = get_cryptobot_token()
+        cfg   = load_config()
+        token = cfg["payment"].get("cryptobot_token", "").strip()
         await query.answer("⏳ Проверяю оплату...", show_alert=False)
         status = await crypto_check_invoice(token, invoice_id)
         if status == "paid":
@@ -3263,12 +3200,6 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             cfg = load_config()
             cfg.setdefault("payment", {})["card"] = credentials["card_details"]
             save_config(cfg)
-        if method_key == "cryptobot":
-            token = credentials.get("cryptobot_token") or credentials.get("api_token") or credentials.get("token")
-            if token:
-                cfg = load_config()
-                cfg.setdefault("payment", {})["cryptobot_token"] = token
-                save_config(cfg)
         context.user_data.pop("client_input", None)
         context.user_data.pop("payment_method_key", None)
         await msg.reply_text(
@@ -4333,7 +4264,7 @@ def main() -> None:
         states={
             WAITING_PAYMENT: [
                 CallbackQueryHandler(choose_payment,
-                    pattern=r"^(pay_card|pay_cryptobot|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
+                    pattern=r"^(pay_card|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
             ],
             WAITING_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_TELEGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_telegram)],
