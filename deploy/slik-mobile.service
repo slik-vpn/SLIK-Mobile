@@ -5,11 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=slik-mobile
-Group=slik-mobile
-WorkingDirectory=/opt/slik-mobile/bot
-EnvironmentFile=/opt/slik-mobile/.env
-ExecStart=/opt/slik-mobile/.venv/bin/python /opt/slik-mobile/bot/run_mvp.py
+WorkingDirectory=/opt/SLIK-Mobile/bot
+EnvironmentFile=/opt/SLIK-Mobile/.env
+ExecStart=/opt/SLIK-Mobile/venv/bin/python /opt/SLIK-Mobile/bot/run_mvp.py
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
@@ -17,7 +15,7 @@ KillMode=mixed
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/opt/slik-mobile/bot
+ReadWritePaths=/opt/SLIK-Mobile/bot
 
 [Install]
 WantedBy=multi-user.target
