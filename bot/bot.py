@@ -59,6 +59,7 @@ CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
 BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
+PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
 USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
@@ -194,6 +195,60 @@ DEFAULT_CONFIG = {
     "payment":  {"card": "", "cryptobot_token": ""},
 }
 
+PAYMENT_METHOD_LABELS = {
+    "card": "Карта",
+    "cryptobot": "CryptoBot",
+    "freekassa": "FreeKassa",
+    "yookassa": "YooKassa",
+}
+
+DEFAULT_PAYMENT_METHODS = {
+    "card": {
+        "enabled": True,
+        "type": "manual",
+        "title": "💳 Карта",
+        "client_title": "💳 Банковская карта",
+        "description": "Текущий способ оплаты картой",
+        "instructions": [],
+        "credentials": {},
+    },
+    "cryptobot": {
+        "enabled": True,
+        "type": "api",
+        "title": "🤖 CryptoBot",
+        "client_title": "🤖 CryptoBot",
+        "description": "Оплата через CryptoBot",
+        "instructions": [],
+        "credentials": {},
+    },
+    "freekassa": {
+        "enabled": False,
+        "type": "api",
+        "title": "🔗 FreeKassa",
+        "client_title": "🔗 FreeKassa",
+        "description": "Оплата через FreeKassa",
+        "instructions": [
+            "Необходимо зарегистрироваться на сайте FreeKassa (freekassa.com)",
+            "Далее необходимо в личном кабинете получить API ключ",
+            "Затем скопируйте API ключ и отправьте его боту",
+            "Все готово!",
+        ],
+        "credentials": {"api_key": ""},
+    },
+    "yookassa": {
+        "enabled": False,
+        "type": "api",
+        "title": "🟣 YooKassa",
+        "client_title": "🟣 YooKassa",
+        "description": "Оплата через YooKassa",
+        "instructions": [],
+        "credentials": {},
+    },
+}
+
+PAYMENT_ADMIN_INPUT_TITLE = "payment_title"
+PAYMENT_ADMIN_INPUT_CREDENTIALS = "payment_credentials"
+
 
 def runtime_default_value(path: Path):
     if path == CONFIG_FILE:
@@ -261,6 +316,78 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     save_runtime_json(CONFIG_FILE, cfg)
+
+
+# ─── payment_methods.json ─────────────────────────────────────────────────────
+
+def default_payment_methods() -> dict:
+    return json.loads(json.dumps(DEFAULT_PAYMENT_METHODS))
+
+
+def merge_payment_methods(data: dict) -> dict:
+    merged = default_payment_methods()
+    for key, defaults in merged.items():
+        method = data.get(key) if isinstance(data.get(key), dict) else {}
+        for field, value in defaults.items():
+            if field == "credentials":
+                credentials = method.get("credentials") if isinstance(method.get("credentials"), dict) else {}
+                method_credentials = dict(value)
+                method_credentials.update(credentials)
+                method["credentials"] = method_credentials
+            else:
+                method.setdefault(field, value)
+        merged[key] = method
+    return merged
+
+
+def load_payment_methods() -> dict:
+    data = load_runtime_json(PAYMENT_METHODS_FILE, default_payment_methods(), dict)
+    merged = merge_payment_methods(data)
+    if merged != data:
+        save_payment_methods(merged)
+    return merged
+
+
+def save_payment_methods(methods: dict) -> None:
+    save_runtime_json(PAYMENT_METHODS_FILE, merge_payment_methods(methods))
+
+
+def get_payment_method(method_key: str) -> dict | None:
+    return load_payment_methods().get(method_key)
+
+
+def enabled_payment_methods() -> dict:
+    return {key: method for key, method in load_payment_methods().items() if method.get("enabled")}
+
+
+def payment_provider_label(provider: str | None) -> str:
+    return PAYMENT_METHOD_LABELS.get(str(provider or ""), provider or "—")
+
+
+def get_cryptobot_token() -> str:
+    method = get_payment_method("cryptobot") or {}
+    credentials = method.get("credentials") if isinstance(method.get("credentials"), dict) else {}
+    for key in ("cryptobot_token", "api_token", "token"):
+        token = str(credentials.get(key) or "").strip()
+        if token:
+            return token
+    return load_config()["payment"].get("cryptobot_token", "").strip()
+
+
+def payment_method_client_title(provider: str) -> str:
+    method = get_payment_method(provider) or {}
+    return str(method.get("client_title") or PAYMENT_METHOD_LABELS.get(provider, provider))
+
+
+def update_payment_method(method_key: str, **fields) -> dict | None:
+    methods = load_payment_methods()
+    method = methods.get(method_key)
+    if not method:
+        return None
+    method.update(fields)
+    methods[method_key] = method
+    save_payment_methods(methods)
+    return method
 
 
 # ─── orders.json ──────────────────────────────────────────────────────────────
@@ -479,7 +606,7 @@ def card_payment_keyboard() -> InlineKeyboardMarkup:
 
 
 def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
-    if context.user_data.get("payment_method") != "Карта":
+    if context.user_data.get("payment_provider") != "card":
         return None
     lock = context.user_data.get("card_payment_lock")
     if not isinstance(lock, dict):
@@ -862,6 +989,7 @@ def append_order(order: dict) -> dict:
     order["status"]             = "new"
     order["created_at"]         = now_str()
     order["created_date"]       = local_date().isoformat()
+    order.setdefault("payment_provider", "card")
     order["cashback_awarded"]   = False
     orders.append(order)
     save_orders(orders)
@@ -1443,10 +1571,11 @@ def find_order(order_id: int) -> dict | None:
 
 
 def build_order_card_text(order: dict) -> str:
-    payment_method = order.get("payment_method") or "—"
+    payment_provider = order.get("payment_provider") or "card"
+    payment_method = payment_provider_label(payment_provider)
     payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
     card_lines = ""
-    if payment_method == "Карта":
+    if payment_provider == "card":
         rate = float(payment_details.get("usd_rub_rate") or 0)
         markup = float(payment_details.get("markup_percent") or 0)
         card_lines = (
@@ -2119,6 +2248,103 @@ def healthcheck_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")]])
 
 
+def payment_methods_admin_text() -> str:
+    methods = load_payment_methods()
+    lines = ["💳 <b>Платёжные способы</b>", ""]
+    for key, method in methods.items():
+        status = "включён" if method.get("enabled") else "выключен"
+        lines.extend([
+            f"{html_escape(method.get('title', key))}",
+            f"Статус: <b>{status}</b>",
+            f"Тип: <code>{html_escape(method.get('type', '—'))}</code>",
+            f"Публичное название: <b>{html_escape(method.get('client_title', '—'))}</b>",
+            "",
+        ])
+    lines.append("Выберите способ, чтобы изменить настройки.")
+    return "\n".join(lines)
+
+
+def payment_methods_admin_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(str(method.get("title") or key), callback_data=f"payment_method:{key}")]
+        for key, method in load_payment_methods().items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def credentials_summary(credentials: dict) -> str:
+    if not credentials:
+        return "—"
+    lines = []
+    for key, value in credentials.items():
+        display_value = "заполнено" if str(value or "").strip() else "пусто"
+        lines.append(f"• <code>{html_escape(key)}</code>: <b>{display_value}</b>")
+    return "\n".join(lines)
+
+
+def payment_method_admin_text(method_key: str) -> str:
+    method = get_payment_method(method_key)
+    if not method:
+        return "Способ оплаты не найден."
+    status = "включён" if method.get("enabled") else "выключен"
+    instructions = method.get("instructions") if isinstance(method.get("instructions"), list) else []
+    instruction_preview = "Есть инструкция" if instructions else "Инструкция не задана"
+    return (
+        f"{html_escape(method.get('title', method_key))}\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Тип: <code>{html_escape(method.get('type', '—'))}</code>\n"
+        f"Описание: {html_escape(method.get('description', '—'))}\n"
+        f"Инструкция подключения: <b>{instruction_preview}</b>\n"
+        f"Публичное название для клиента: <b>{html_escape(method.get('client_title', '—'))}</b>\n\n"
+        "<b>Технические поля/API данные:</b>\n"
+        f"{credentials_summary(method.get('credentials') if isinstance(method.get('credentials'), dict) else {})}"
+    )
+
+
+def payment_method_admin_keyboard(method_key: str) -> InlineKeyboardMarkup:
+    method = get_payment_method(method_key) or {}
+    toggle_text = "🔴 Выключить" if method.get("enabled") else "🟢 Включить"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data=f"payment_toggle:{method_key}")],
+        [InlineKeyboardButton("📖 Инструкция подключения", callback_data=f"payment_instructions:{method_key}")],
+        [InlineKeyboardButton("✏️ Публичное название", callback_data=f"payment_edit_title:{method_key}")],
+        [InlineKeyboardButton("🔐 API данные / реквизиты", callback_data=f"payment_edit_credentials:{method_key}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_payments")],
+    ])
+
+
+def payment_method_instructions_text(method_key: str) -> str:
+    method = get_payment_method(method_key)
+    if not method:
+        return "Способ оплаты не найден."
+    instructions = method.get("instructions") if isinstance(method.get("instructions"), list) else []
+    if method_key == "freekassa":
+        header = "🔗 <b>FreeKassa (Физ.лицо)</b>"
+    else:
+        header = f"{html_escape(method.get('title', method_key))}"
+    if not instructions:
+        return f"{header}\n\nИнструкция подключения пока не задана."
+    steps = "\n".join(f"{index}. {html_escape(step)}" for index, step in enumerate(instructions, start=1))
+    return f"{header}\n\n{steps}"
+
+
+def parse_credentials_input(text: str, method_key: str) -> dict:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    parsed = {}
+    for line in lines:
+        if "=" in line:
+            key, value = line.split("=", 1)
+        elif ":" in line:
+            key, value = line.split(":", 1)
+        else:
+            default_key = "card_details" if method_key == "card" else "api_key"
+            key, value = default_key, line
+        key = key.strip().lower().replace(" ", "_")
+        parsed[key] = value.strip()
+    return parsed
+
+
 def format_restore_result(restore_info: dict) -> str:
     restored = restore_info.get("restored") or []
     warnings = restore_info.get("warnings") or []
@@ -2163,6 +2389,7 @@ def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Аналитика",    callback_data="admin_analytics")],
         [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
+        [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
     ]
     if has_backup_access(user):
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
@@ -2205,14 +2432,17 @@ def plan_card_keyboard(plan_key: str) -> InlineKeyboardMarkup:
 
 
 def payment_keyboard(plan_key: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 CryptoBot",        callback_data="pay_crypto")],
-        [InlineKeyboardButton("💳 Переводом на карту", callback_data="pay_card")],
-        [
-            InlineKeyboardButton("⬅️ Назад",       callback_data=f"back_to_plan_{plan_key}"),
-            InlineKeyboardButton("🏠 Главное меню", callback_data="back_main"),
-        ],
+    rows = [
+        [InlineKeyboardButton(str(method.get("client_title") or method.get("title")), callback_data=f"pay_{key}")]
+        for key, method in enabled_payment_methods().items()
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("💳 Банковская карта", callback_data="pay_card")])
+    rows.append([
+        InlineKeyboardButton("⬅️ Назад",       callback_data=f"back_to_plan_{plan_key}"),
+        InlineKeyboardButton("🏠 Главное меню", callback_data="back_main"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def cancel_keyboard() -> InlineKeyboardMarkup:
@@ -2557,18 +2787,29 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data["plan_key"] = plan_key
     context.user_data["plan"]     = plan
 
-    cfg = load_config()
-    card    = cfg["payment"].get("card", "")
-    cryptobot = cfg["payment"].get("cryptobot", "")
-    text = (
-        f"💳 <b>Выберите способ оплаты</b>\n\n"
-        f"📶 Тариф: <b>{plan['gb']} / {plan['days']}</b>\n"
-        f"💵 Цена: <b>{plan['price']}</b>"
-    )
-    await query.message.reply_text(
-        text, parse_mode="HTML",
-        reply_markup=payment_keyboard(plan_key),
-    )
+    methods = enabled_payment_methods()
+    if list(methods.keys()) == ["card"] or not methods:
+        cfg = load_config()
+        card = cfg["payment"].get("card", "")
+        context.user_data["payment_method"] = payment_provider_label("card")
+        context.user_data["payment_provider"] = "card"
+        lock = await create_card_payment_lock(plan)
+        context.user_data["card_payment_lock"] = lock
+        await query.message.reply_text(
+            build_card_payment_text(plan, card, lock),
+            parse_mode="HTML",
+            reply_markup=card_payment_keyboard(),
+        )
+    else:
+        text = (
+            f"💳 <b>Выберите способ оплаты</b>\n\n"
+            f"📶 Тариф: <b>{plan['gb']} / {plan['days']}</b>\n"
+            f"💵 Цена: <b>{plan['price']}</b>"
+        )
+        await query.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=payment_keyboard(plan_key),
+        )
     if not is_admin(query.from_user):
         await track_action(context, query.from_user, "нажал «Купить»",
                            f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}")
@@ -2581,10 +2822,10 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
     plan = context.user_data.get("plan", {})
 
-    if data == "pay_crypto":
-        cfg = load_config()
-        token = cfg["payment"].get("cryptobot_token", "").strip()
-        context.user_data["payment_method"] = "CryptoBot"
+    if data == "pay_cryptobot":
+        token = get_cryptobot_token()
+        context.user_data["payment_method"] = payment_provider_label("cryptobot")
+        context.user_data["payment_provider"] = "cryptobot"
         if not token:
             await query.message.reply_text(
                 "🤖 <b>CryptoBot</b>\n\nОплата через CryptoBot ещё не настроена.\n\n"
@@ -2635,7 +2876,20 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return WAITING_PAYMENT
 
-    elif data == "payment_done":
+    if data in {"pay_freekassa", "pay_yookassa"}:
+        provider = data.replace("pay_", "")
+        context.user_data["payment_method"] = payment_provider_label(provider)
+        context.user_data["payment_provider"] = provider
+        await query.message.reply_text(
+            "Этот способ оплаты скоро будет доступен. Выберите оплату картой.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Оплатить картой", callback_data="pay_card")],
+                [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+            ]),
+        )
+        return WAITING_PAYMENT
+
+    if data == "payment_done":
         if context.user_data.get("payment_method") == "Карта" and not is_card_payment_lock_active(
             context.user_data.get("card_payment_lock")
         ):
@@ -2667,7 +2921,8 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "pay_card":
         cfg = load_config()
         card = cfg["payment"].get("card", "")
-        context.user_data["payment_method"] = "Карта"
+        context.user_data["payment_method"] = payment_provider_label("card")
+        context.user_data["payment_provider"] = "card"
         lock = await create_card_payment_lock(plan)
         context.user_data["card_payment_lock"] = lock
         await query.message.reply_text(
@@ -2679,8 +2934,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif data.startswith("check_payment_"):
         invoice_id = int(data.replace("check_payment_", ""))
-        cfg   = load_config()
-        token = cfg["payment"].get("cryptobot_token", "").strip()
+        token = get_cryptobot_token()
         await query.answer("⏳ Проверяю оплату...", show_alert=False)
         status = await crypto_check_invoice(token, invoice_id)
         if status == "paid":
@@ -2787,7 +3041,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     user    = update.effective_user
     plan    = context.user_data["plan"]
     name    = context.user_data["name"]
-    payment = context.user_data.get("payment_method", "—")
+    payment_provider = context.user_data.get("payment_provider", "card")
+    payment = context.user_data.get("payment_method", payment_provider_label(payment_provider))
 
     order_payload = {
         "gb":             plan["gb"],
@@ -2796,6 +3051,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "country":        "Россия",
         "plan_key":       context.user_data["plan_key"],
         "payment_method": payment,
+        "payment_provider": payment_provider,
         "name":           name,
         "tg_handle":      tg_handle,
         "user_id":        user.id,
@@ -2971,6 +3227,54 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         context.user_data.pop("client_target_id", None)
         await deny_admin_access(update)
+        return
+
+    if input_mode in {PAYMENT_ADMIN_INPUT_TITLE, PAYMENT_ADMIN_INPUT_CREDENTIALS}:
+        method_key = str(context.user_data.get("payment_method_key") or "")
+        method = get_payment_method(method_key)
+        if not method:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("payment_method_key", None)
+            await msg.reply_text("Способ оплаты не найден.", reply_markup=payment_methods_admin_keyboard())
+            return
+
+        if input_mode == PAYMENT_ADMIN_INPUT_TITLE:
+            client_title = msg.text.strip()
+            if not client_title:
+                await msg.reply_text("Введите непустое публичное название.")
+                return
+            update_payment_method(method_key, client_title=client_title)
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("payment_method_key", None)
+            await msg.reply_text(
+                "✅ Публичное название сохранено.",
+                reply_markup=payment_method_admin_keyboard(method_key),
+            )
+            return
+
+        credentials = parse_credentials_input(msg.text.strip(), method_key)
+        if not credentials:
+            await msg.reply_text("Введите API данные или реквизиты.")
+            return
+        method_credentials = method.get("credentials") if isinstance(method.get("credentials"), dict) else {}
+        method_credentials.update(credentials)
+        update_payment_method(method_key, credentials=method_credentials)
+        if method_key == "card" and credentials.get("card_details"):
+            cfg = load_config()
+            cfg.setdefault("payment", {})["card"] = credentials["card_details"]
+            save_config(cfg)
+        if method_key == "cryptobot":
+            token = credentials.get("cryptobot_token") or credentials.get("api_token") or credentials.get("token")
+            if token:
+                cfg = load_config()
+                cfg.setdefault("payment", {})["cryptobot_token"] = token
+                save_config(cfg)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("payment_method_key", None)
+        await msg.reply_text(
+            "✅ Технические поля сохранены.",
+            reply_markup=payment_method_admin_keyboard(method_key),
+        )
         return
 
     if input_mode == BROADCAST_INPUT_MESSAGE:
@@ -3547,6 +3851,7 @@ def admin_panel_text(user) -> str:
         "• 📊 Аналитика — метрики продаж и клиентов\n"
         "• 👥 Клиенты — CRM клиентов\n"
         "• 📰 Новости — CRM рассылки\n"
+        "• 💳 Платёжные способы\n"
         + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
     )
 
@@ -3614,6 +3919,15 @@ async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await edit_or_send(query, context, build_backups_dashboard(), backups_keyboard())
 
 
+async def show_admin_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(query, context, payment_methods_admin_text(), payment_methods_admin_keyboard())
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
@@ -3675,7 +3989,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_restore_latest",
     }
     broadcast_callbacks = {"admin_news", "broadcast_send", "broadcast_cancel"}
-    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:")
+    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:", "payment_method:", "payment_toggle:", "payment_instructions:", "payment_edit_")
     if data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
     elif (data in broadcast_callbacks or data.startswith(("broadcast_cat:", "broadcast_compose:"))) and not has_broadcast_access(query.from_user):
@@ -3811,6 +4125,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Отправлено: <b>{sent}</b>\n"
             f"Ошибок: <b>{failed}</b>",
             broadcast_menu_keyboard(),
+        )
+    elif data == "admin_payments":
+        await show_admin_payments(update, context)
+    elif data.startswith("payment_method:"):
+        method_key = data.split(":", 1)[1]
+        if not get_payment_method(method_key):
+            await query.answer("Способ оплаты не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, payment_method_admin_text(method_key), payment_method_admin_keyboard(method_key))
+    elif data.startswith("payment_toggle:"):
+        method_key = data.split(":", 1)[1]
+        method = get_payment_method(method_key)
+        if not method:
+            await query.answer("Способ оплаты не найден.", show_alert=True)
+            return
+        update_payment_method(method_key, enabled=not bool(method.get("enabled")))
+        await query.answer("Настройки сохранены.")
+        await edit_or_send(query, context, payment_method_admin_text(method_key), payment_method_admin_keyboard(method_key))
+    elif data.startswith("payment_instructions:"):
+        method_key = data.split(":", 1)[1]
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            payment_method_instructions_text(method_key),
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"payment_method:{method_key}")]]),
+        )
+    elif data.startswith("payment_edit_title:"):
+        method_key = data.split(":", 1)[1]
+        context.user_data["client_input"] = PAYMENT_ADMIN_INPUT_TITLE
+        context.user_data["payment_method_key"] = method_key
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✏️ <b>Публичное название</b>\n\nВведите название, которое увидит клиент.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"payment_method:{method_key}")]]),
+        )
+    elif data.startswith("payment_edit_credentials:"):
+        method_key = data.split(":", 1)[1]
+        context.user_data["client_input"] = PAYMENT_ADMIN_INPUT_CREDENTIALS
+        context.user_data["payment_method_key"] = method_key
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "🔐 <b>API данные / реквизиты</b>\n\n"
+            "Введите данные в формате <code>ключ=значение</code>.\n"
+            "Можно отправить несколько строк. Для карты можно отправить реквизиты одной строкой.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"payment_method:{method_key}")]]),
         )
     elif data == "orders_stats":
         await query.answer()
@@ -3971,7 +4333,7 @@ def main() -> None:
         states={
             WAITING_PAYMENT: [
                 CallbackQueryHandler(choose_payment,
-                    pattern=r"^(pay_crypto|pay_card|payment_done|check_payment_\d+|back_to_plan_.+)$"),
+                    pattern=r"^(pay_card|pay_cryptobot|pay_freekassa|pay_yookassa|payment_done|check_payment_\d+|back_to_plan_.+)$"),
             ],
             WAITING_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_TELEGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_telegram)],
