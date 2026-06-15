@@ -26,3 +26,6 @@ backups/
 
 # Frontend build output
 frontend/tma/dist/
+
+# Payment methods runtime settings
+bot/payment_methods.json
