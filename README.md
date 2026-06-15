@@ -384,3 +384,86 @@ sudo journalctl -u slik-mobile -f
 ### Поиск клиента
 
 Кнопка `🔍 Найти клиента` просит администратора ввести Telegram ID, username или имя клиента. Бот показывает до 20 найденных совпадений кнопками, из которых можно открыть карточку клиента.
+
+## Bot Reliability & Auto Recovery
+
+Systemd-запуск бота усилен автоматическим восстановлением. Основной unit `slik-mobile.service` настроен с `Restart=always`, задержкой `RestartSec=5`, корректным завершением `TimeoutStopSec=10` и `KillMode=mixed`, поэтому systemd перезапускает процесс при аварийном выходе.
+
+Дополнительно добавлен watchdog `bot/bot_healthcheck.py`, который запускается через `slik-mobile-healthcheck.timer` каждую минуту и проверяет:
+
+- состояние `systemctl is-active slik-mobile`;
+- доступность Telegram API через `getMe`;
+- наличие основного PID и состояние процесса;
+- серии `httpx.ConnectTimeout` и `telegram.error.TimedOut` в журнале systemd;
+- количество подряд неудачных проверок.
+
+Если несколько проверок подряд завершаются ошибкой, watchdog выполняет `systemctl restart slik-mobile`, пишет причину и время восстановления в `/var/log/slik-mobile-healthcheck.log`, сохраняет состояние в `/var/lib/slik-mobile/healthcheck-state.json` и отправляет администратору Telegram-уведомление:
+
+```text
+⚠️ SLIK Mobile Bot Recovery
+
+Причина:
+<ошибка>
+
+Сервис автоматически перезапущен.
+
+Время: <timestamp>
+```
+
+Для уведомления используются `TELEGRAM_BOT_TOKEN` и `ADMIN_CHAT_ID` из `/opt/slik-mobile/.env`. Если переменные не заданы, restart всё равно выполняется, а отправка уведомления пропускается с записью в лог.
+
+Telegram HTTP client в боте имеет отдельные таймауты без бесконечного ожидания. Их можно переопределить в `.env`:
+
+```env
+TELEGRAM_CONNECT_TIMEOUT=10
+TELEGRAM_READ_TIMEOUT=20
+TELEGRAM_WRITE_TIMEOUT=10
+TELEGRAM_POOL_TIMEOUT=10
+TELEGRAM_BOOTSTRAP_RETRIES=-1
+```
+
+Сетевые ошибки Telegram API (`TimedOut`, `NetworkError`, `ConnectTimeout`) логируются и не должны останавливать процесс бота во время регистрации команд или polling; при аварийном выходе systemd и watchdog восстановят сервис.
+
+### Установка watchdog на сервере
+
+```bash
+sudo cp deploy/slik-mobile.service /etc/systemd/system/slik-mobile.service
+sudo cp deploy/slik-mobile-healthcheck.service /etc/systemd/system/slik-mobile-healthcheck.service
+sudo cp deploy/slik-mobile-healthcheck.timer /etc/systemd/system/slik-mobile-healthcheck.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now slik-mobile.service
+sudo systemctl enable --now slik-mobile-healthcheck.timer
+```
+
+### Как проверить сервис
+
+```bash
+systemctl status slik-mobile
+```
+
+### Как посмотреть таймер
+
+```bash
+systemctl list-timers
+systemctl status slik-mobile-healthcheck.timer
+```
+
+### Как посмотреть логи
+
+```bash
+journalctl -u slik-mobile
+journalctl -u slik-mobile-healthcheck.service
+sudo tail -f /var/log/slik-mobile-healthcheck.log
+```
+
+### Как отключить watchdog
+
+```bash
+sudo systemctl disable --now slik-mobile-healthcheck.timer
+```
+
+Основной autorestart `slik-mobile.service` при этом останется включённым. Чтобы вернуть watchdog, выполните:
+
+```bash
+sudo systemctl enable --now slik-mobile-healthcheck.timer
+```
