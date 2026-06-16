@@ -78,6 +78,10 @@ ESIM_EXPIRY_REMINDER_DAYS_BEFORE = env_int("ESIM_EXPIRY_REMINDER_DAYS_BEFORE", 1
 ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS = env_int("ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS", 60)
 ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS = 60 * 60
 
+
+def is_cashback_enabled() -> bool:
+    return str(os.environ.get("CASHBACK_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
 BACKUP_INTERVAL_SECONDS = 5 * 60 * 60
@@ -973,6 +977,8 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
 
 
 def award_cashback_if_needed(profile: dict, order: dict) -> float:
+    if not is_cashback_enabled():
+        return 0.0
     if order.get("cashback_awarded"):
         return 0.0
     if not is_revenue_order(order):
@@ -1583,7 +1589,7 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
     """Отправляет уведомление о действии клиента в выбранный чат."""
     admin_id = get_client_activity_chat_id()
     _route_chat_id, source = get_client_activity_chat_source()
-    logger.info("client activity route: client_activity chat %s (source: %s, helper: get_client_activity_chat_id)", admin_id, source)
+    logger.info("notification route selected: type=client_activity chat_id=%s source=%s helper=get_client_activity_chat_id", admin_id, source)
     if not admin_id:
         return
     text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
@@ -1593,7 +1599,8 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
         f"\n\n👤 Имя: {html_escape(user.full_name)}\n"
         f"📨 Username: {user_tag_html(user)}\n"
         f"🆔 Telegram ID: <code>{user.id}</code>\n"
-        f"🕒 Время: {now_str()}"
+        f"🕒 Время: {now_str()}\n"
+        f"Маршрут: client_activity · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
     )
     try:
         await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
@@ -1619,6 +1626,8 @@ async def notify_new_client(
         return
 
     chat_id = get_new_clients_chat_id()
+    _route_chat_id, route_source = get_new_clients_chat_source()
+    logger.info("notification route selected: type=new_clients chat_id=%s source=%s helper=get_new_clients_chat_id", chat_id, route_source)
     if not chat_id:
         return
 
@@ -2716,7 +2725,14 @@ def notification_routes_text() -> str:
         chat_id, source = get_notification_chat_source(kind)
         chat_text = str(chat_id) if chat_id is not None else "не задан"
         lines.append(f"• <b>{html_escape(title)}</b>: <code>{html_escape(chat_text)}</code> — {html_escape(source)}")
-    return "🔔 <b>Реальные маршруты уведомлений</b>\n\n" + "\n".join(lines)
+    cfg = load_config()
+    chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
+    return (
+        "🔔 <b>Реальные маршруты уведомлений</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\nconfig.json: <code>{html_escape(str(CONFIG_FILE))}</code>"
+        + f"\nnotification_chats: <code>{html_escape(json.dumps(chats, ensure_ascii=False))}</code>"
+    )
 
 
 def notification_chat_detail_keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -3788,7 +3804,7 @@ async def send_admin_order_message(
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     admin_id = get_orders_chat_id()
     _route_chat_id, source = get_orders_chat_source()
-    logger.info("order notification route: orders chat %s (source: %s, helper: get_orders_chat_id)", admin_id, source)
+    logger.info("notification route selected: type=orders chat_id=%s source=%s helper=get_orders_chat_id", admin_id, source)
     order_number = order.get("number", "—")
     order_id = order.get("id")
     if not admin_id:
@@ -3826,7 +3842,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         f"{payment_details_line}\n"
         f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
         f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
-        f"🕒 {html_escape(order.get('created_at', '—'))}"
+        f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+        f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
     )
     await send_admin_order_message(context, admin_id, text, order_id)
 
