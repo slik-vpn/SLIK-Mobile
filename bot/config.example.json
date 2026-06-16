@@ -6,5 +6,11 @@
   "payment": {
     "card": "",
     "cryptobot_token": ""
+  },
+  "notification_chats": {
+    "orders": "",
+    "client_activity": "",
+    "payments": "",
+    "tech_alerts": ""
   }
 }

@@ -72,6 +72,8 @@ def check_bot_contract(bot_text: str) -> None:
         "admin_orders",
         "admin_clients",
         "admin_payments",
+        "admin_notification_chats",
+        "notification_chat:",
         "order_status:",
         "client_card:",
         "client_balance:",
@@ -112,10 +114,52 @@ def check_bot_contract(bot_text: str) -> None:
         "async def abandoned_checkout_reminder_job(",
         "async def esim_expiry_reminder_job(",
         "async def notify_admin(",
+        "async def cmd_chatid(",
+        "def notification_chats_admin_text(",
+        "def notification_chats_keyboard(",
+        "def get_notification_chat_id(",
+        "def get_orders_chat_id(",
+        "def get_client_activity_chat_id(",
+        "def get_payments_chat_id(",
+        "def get_tech_alerts_chat_id(",
         "def main(",
     ]
     for handler in handlers:
         check_contains(bot_text, handler, "bot/bot.py menu/handler functions")
+
+
+    for needle in [
+        '"notification_chats"',
+        'ORDERS_CHAT_ID',
+        'CLIENT_ACTIVITY_CHAT_ID',
+        'PAYMENTS_CHAT_ID',
+        'TECH_ALERTS_CHAT_ID',
+        'CommandHandler("chatid",          cmd_chatid)',
+        'get_client_activity_chat_id()',
+        'get_orders_chat_id()',
+    ]:
+        check_contains(bot_text, needle, "bot/bot.py notification chats")
+
+
+    admin_prefix_match = re.search(r"admin_prefixes\s*=\s*\((.*?)\)", bot_text, re.DOTALL)
+    admin_prefix_text = admin_prefix_match.group(1) if admin_prefix_match else ""
+    for prefix in [
+        '"admin_"',
+        '"notification_chat:"',
+        '"notification_chat_edit:"',
+        '"notification_chat_test:"',
+        '"notification_chat_clear:"',
+    ]:
+        check_contains(admin_prefix_text, prefix, "bot/bot.py admin_prefixes notification gate")
+
+    record(
+        "track_action uses get_client_activity_chat_id",
+        bool(re.search(r"async def track_action\(.*?get_client_activity_chat_id\(\)", bot_text, re.DOTALL)),
+    )
+    record(
+        "notify_admin/order notifications use get_orders_chat_id",
+        bool(re.search(r"async def notify_admin\(.*?get_orders_chat_id\(\)", bot_text, re.DOTALL)),
+    )
 
     record(
         "is_revenue_order excludes waiting_payment",
@@ -188,6 +232,8 @@ def main() -> int:
 
     bot_text = read_text("bot/bot.py")
     readme_text = read_text("README.md")
+    env_example_text = read_text(".env.example")
+    config_example_text = read_text("bot/config.example.json")
     service_text = read_text("deploy/slik-mobile.service")
     healthcheck_text = read_text("deploy/slik-mobile-healthcheck.service")
 
@@ -205,6 +251,15 @@ def main() -> int:
         readme_text,
     )
     check_bot_contract(bot_text)
+    for needle in [
+        'ORDERS_CHAT_ID',
+        'CLIENT_ACTIVITY_CHAT_ID',
+        'PAYMENTS_CHAT_ID',
+        'TECH_ALERTS_CHAT_ID',
+    ]:
+        check_contains(env_example_text, needle, ".env.example notification routing")
+    check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
+    check_contains(readme_text, "Разделение уведомлений по чатам", "README.md")
 
     failed = [(name, detail) for name, ok, detail in CHECKS if not ok]
     for name, ok, detail in CHECKS:
