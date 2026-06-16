@@ -195,7 +195,7 @@ def check_bot_contract(bot_text: str) -> None:
     )
     record(
         "track_action logs client activity route",
-        "client activity route: client_activity chat" in track_action_text,
+        "type=client_activity" in track_action_text and "source=%s" in track_action_text,
     )
     record(
         "notify_admin/order notifications use get_orders_chat_id",
@@ -203,7 +203,7 @@ def check_bot_contract(bot_text: str) -> None:
     )
     record(
         "notify_admin/order notifications log orders route",
-        "order notification route: orders chat" in notify_admin_text,
+        "type=orders" in notify_admin_text and "source=%s" in notify_admin_text,
     )
     record(
         "send_admin_order_message does not call get_admin_chat_id",
@@ -240,6 +240,24 @@ def check_bot_contract(bot_text: str) -> None:
             bot_text,
             re.DOTALL,
         )),
+    )
+
+
+    record(
+        "cashback feature flag env exists",
+        "CASHBACK_ENABLED" in bot_text or "CASHBACK_ENABLED" in env_example_text,
+    )
+    record(
+        "is_cashback_enabled helper exists",
+        "def is_cashback_enabled()" in bot_text,
+    )
+    record(
+        "award_cashback_if_needed checks is_cashback_enabled before awarding",
+        bool(re.search(r"def\s+award_cashback_if_needed\(.*?if\s+not\s+is_cashback_enabled\(\).*?credit_slik_balance", bot_text, re.DOTALL)),
+    )
+    record(
+        "notify_cashback_awarded only called after positive cashback",
+        bool(re.search(r"if\s+cashback_amount\s*>\s*0\s*:\s*\n\s*await\s+notify_cashback_awarded", bot_text)),
     )
 
     record(
@@ -338,6 +356,7 @@ def main() -> int:
         'NEW_CLIENTS_CHAT_ID',
         'PAYMENTS_CHAT_ID',
         'TECH_ALERTS_CHAT_ID',
+        'CASHBACK_ENABLED=false',
     ]:
         check_contains(env_example_text, needle, ".env.example notification routing")
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
