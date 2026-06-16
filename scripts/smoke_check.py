@@ -73,6 +73,7 @@ def check_bot_contract(bot_text: str) -> None:
         "admin_clients",
         "admin_payments",
         "admin_notification_chats",
+        "notification_chats_help",
         "notification_chat:",
         "order_status:",
         "client_card:",
@@ -117,6 +118,8 @@ def check_bot_contract(bot_text: str) -> None:
         "async def cmd_chatid(",
         "def notification_chats_admin_text(",
         "def notification_chats_keyboard(",
+        "def notification_chats_help_text(",
+        "def notification_chats_help_keyboard(",
         "def get_notification_chat_id(",
         "def get_orders_chat_id(",
         "def get_client_activity_chat_id(",
@@ -137,8 +140,19 @@ def check_bot_contract(bot_text: str) -> None:
         'CommandHandler("chatid",          cmd_chatid)',
         'get_client_activity_chat_id()',
         'get_orders_chat_id()',
+        'notification_chats_help',
+        '/chatid',
     ]:
         check_contains(bot_text, needle, "bot/bot.py notification chats")
+
+    record(
+        "notification_chats_help callback renders instruction",
+        bool(re.search(r'data == "notification_chats_help".*?notification_chats_help_text\(\)', bot_text, re.DOTALL)),
+    )
+    record(
+        "notification_chats_help instruction mentions /chatid",
+        bool(re.search(r"def notification_chats_help_text\(\).*?/chatid", bot_text, re.DOTALL)),
+    )
 
 
     admin_prefix_match = re.search(r"admin_prefixes\s*=\s*\((.*?)\)", bot_text, re.DOTALL)
@@ -149,8 +163,14 @@ def check_bot_contract(bot_text: str) -> None:
         '"notification_chat_edit:"',
         '"notification_chat_test:"',
         '"notification_chat_clear:"',
+        '"notification_chats_help"',
     ]:
         check_contains(admin_prefix_text, prefix, "bot/bot.py admin_prefixes notification gate")
+
+    record(
+        "notification_chats_help passes admin gate",
+        '"notification_chats_help"' in admin_prefix_text or '"admin_notification_chats_help"' in bot_text,
+    )
 
     record(
         "track_action uses get_client_activity_chat_id",

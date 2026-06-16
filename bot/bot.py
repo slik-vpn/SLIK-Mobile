@@ -2581,8 +2581,48 @@ def notification_chats_admin_text() -> str:
 
 def notification_chats_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(title, callback_data=f"notification_chat:{kind}")] for kind, (title, _env, _label) in NOTIFICATION_CHAT_META.items()]
+    rows.append([InlineKeyboardButton("📘 Инструкция", callback_data="notification_chats_help")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
+
+
+def notification_chats_help_text() -> str:
+    return (
+        "📘 <b>Как подключить чаты уведомлений</b>\n\n"
+        "1. Создайте отдельные Telegram-группы:\n"
+        "   • SLIK Заказы\n"
+        "   • SLIK Действия клиентов\n"
+        "   • SLIK Оплаты\n"
+        "   • SLIK Техника\n\n"
+        "2. Добавьте бота SLIK Mobile в нужную группу.\n\n"
+        "3. В этой группе напишите:\n"
+        "   <code>/chatid</code>\n\n"
+        "4. Бот пришлёт:\n"
+        "   <code>Chat ID: -1001234567890</code>\n\n"
+        "5. Скопируйте этот ID.\n\n"
+        "6. Вернитесь в бота:\n"
+        "   Админ-панель → 🔔 Чаты уведомлений\n\n"
+        "7. Выберите нужный тип:\n"
+        "   • Заказы\n"
+        "   • Действия клиентов\n"
+        "   • Оплаты\n"
+        "   • Техника\n\n"
+        "8. Нажмите “✏️ Изменить” и вставьте chat_id.\n\n"
+        "9. Нажмите “🧪 Тест”. Если сообщение пришло в группу — чат подключён.\n\n"
+        "10. Если тест не пришёл:\n"
+        "   • проверьте, что бот добавлен в группу;\n"
+        "   • проверьте, что chat_id скопирован полностью;\n"
+        "   • проверьте, что chat_id начинается с минуса;\n"
+        "   • повторите /chatid в нужной группе.\n\n"
+        "<b>Важно:</b> если отдельный чат не указан, уведомления идут в основной ADMIN_CHAT_ID."
+    )
+
+
+def notification_chats_help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 К настройкам чатов", callback_data="admin_notification_chats")],
+        [InlineKeyboardButton("⬅️ Админ-панель", callback_data="admin_panel")],
+    ])
 
 
 def notification_chat_detail_text(kind: str) -> str:
@@ -2595,6 +2635,7 @@ def notification_chat_detail_keyboard(kind: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✏️ Изменить", callback_data=f"notification_chat_edit:{kind}")],
         [InlineKeyboardButton("🧪 Тест", callback_data=f"notification_chat_test:{kind}")],
         [InlineKeyboardButton("🧹 Очистить", callback_data=f"notification_chat_clear:{kind}")],
+        [InlineKeyboardButton("📘 Инструкция", callback_data="notification_chats_help")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_notification_chats")],
     ])
 
@@ -4515,6 +4556,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "notification_chat_edit:",
         "notification_chat_test:",
         "notification_chat_clear:",
+        "notification_chats_help",
         "orders_list:",
         "order_card:",
         "order_status:",
@@ -4670,6 +4712,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "admin_notification_chats":
         await query.answer()
         await edit_or_send(query, context, notification_chats_admin_text(), notification_chats_keyboard())
+    elif data == "notification_chats_help":
+        await query.answer()
+        await edit_or_send(query, context, notification_chats_help_text(), notification_chats_help_keyboard())
     elif data.startswith("notification_chat:"):
         kind = data.split(":", 1)[1]
         if kind not in NOTIFICATION_CHAT_META:
