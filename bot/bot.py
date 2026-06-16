@@ -409,12 +409,24 @@ def get_orders_chat_id() -> int | None:
     return get_notification_chat_id("orders")
 
 
+def get_orders_chat_source() -> tuple[int | None, str]:
+    return get_notification_chat_source("orders")
+
+
 def get_client_activity_chat_id() -> int | None:
     return get_notification_chat_id("client_activity")
 
 
+def get_client_activity_chat_source() -> tuple[int | None, str]:
+    return get_notification_chat_source("client_activity")
+
+
 def get_new_clients_chat_id() -> int | None:
     return get_notification_chat_id("new_clients")
+
+
+def get_new_clients_chat_source() -> tuple[int | None, str]:
+    return get_notification_chat_source("new_clients")
 
 
 def get_payments_chat_id() -> int | None:
@@ -1570,6 +1582,8 @@ def user_tag_html(user) -> str:
 async def track_action(context, user, action: str, extra: str = "") -> None:
     """Отправляет уведомление о действии клиента в выбранный чат."""
     admin_id = get_client_activity_chat_id()
+    _route_chat_id, source = get_client_activity_chat_source()
+    logger.info("client activity route: client_activity chat %s (source: %s, helper: get_client_activity_chat_id)", admin_id, source)
     if not admin_id:
         return
     text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
@@ -2695,6 +2709,16 @@ def notification_chat_detail_text(kind: str) -> str:
     return f"⚙️ <b>{html_escape(title)}</b>\n\n" + notification_chat_line(kind)
 
 
+def notification_routes_text() -> str:
+    lines = []
+    for kind in ("orders", "client_activity", "new_clients", "payments", "tech_alerts"):
+        title, _env, _label = NOTIFICATION_CHAT_META[kind]
+        chat_id, source = get_notification_chat_source(kind)
+        chat_text = str(chat_id) if chat_id is not None else "не задан"
+        lines.append(f"• <b>{html_escape(title)}</b>: <code>{html_escape(chat_text)}</code> — {html_escape(source)}")
+    return "🔔 <b>Реальные маршруты уведомлений</b>\n\n" + "\n".join(lines)
+
+
 def notification_chat_detail_keyboard(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Изменить", callback_data=f"notification_chat_edit:{kind}")],
@@ -3736,8 +3760,8 @@ async def send_admin_order_message(
                 reply_markup=admin_order_keyboard(order_id),
             )
             logger.info(
-                "Админ-уведомление по заказу %s успешно отправлено в чат %s с попытки %s",
-                order_id, admin_id, attempt,
+                "order notification route: orders chat %s (order %s, attempt %s, helper: get_orders_chat_id)",
+                admin_id, order_id, attempt,
             )
             return True
         except (TimedOut, NetworkError) as e:
@@ -3763,6 +3787,8 @@ async def send_admin_order_message(
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     admin_id = get_orders_chat_id()
+    _route_chat_id, source = get_orders_chat_source()
+    logger.info("order notification route: orders chat %s (source: %s, helper: get_orders_chat_id)", admin_id, source)
     order_number = order.get("number", "—")
     order_id = order.get("id")
     if not admin_id:
@@ -4562,6 +4588,13 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
 
 
+async def cmd_notification_routes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    await update.message.reply_text(notification_routes_text(), parse_mode="HTML")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
@@ -4588,7 +4621,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Оплата:</b>\n"
         "/payment_details — реквизиты\n"
         "/setpayment card <i>номер</i>\n"
-        "/setpayment crypto <i>ссылка</i>\n\n"
+        "/setpayment crypto <i>ссылка</i>\n"
+        "/notification_routes — реальные маршруты уведомлений\n\n"
         "<b>Бэкапы:</b>\n"
         "/backup — создать и отправить ZIP сейчас\n"
         "/backups — последние 10 архивов\n\n"
@@ -4821,8 +4855,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if chat_id is None:
             await query.answer("Чат не настроен.", show_alert=True)
             return
+        _chat_id, source = get_notification_chat_source(kind)
         try:
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ Тест уведомлений SLIK Mobile: {NOTIFICATION_CHAT_META[kind][2]} подключён.")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ Тест уведомлений SLIK Mobile: {NOTIFICATION_CHAT_META[kind][2]} подключён.\nИсточник: {source}",
+            )
             await query.answer("Тест отправлен.")
         except Exception as exc:
             logger.warning("Notification chat test failed for %s/%s: %s", kind, chat_id, exc)
@@ -5105,6 +5143,7 @@ def main() -> None:
     app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_handler(CommandHandler("backups",         cmd_backups))
     app.add_handler(CommandHandler("chatid",          cmd_chatid))
+    app.add_handler(CommandHandler("notification_routes", cmd_notification_routes))
     app.add_handler(CommandHandler("help",            cmd_help))
 
     # ── Навигационные callback'и ──────────────────────────────────────────────
