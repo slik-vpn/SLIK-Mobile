@@ -2541,6 +2541,28 @@ def profile_back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def user_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
+    latest_orders = sorted(orders, key=order_sort_key, reverse=True)[:10]
+    rows = [
+        [InlineKeyboardButton(format_order_button_text(order), callback_data=f"user_order:{order.get('id')}")]
+        for order in latest_orders
+        if order.get("id") is not None
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile")])
+    return InlineKeyboardMarkup(rows)
+
+
+def user_order_card_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Повторить заказ", callback_data=f"repeat_order:{order_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="profile_orders")],
+    ])
+
+
+def unavailable_plan_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🌍 Выбрать eSIM", callback_data="buy_esim")]])
+
+
 # ─── Главное меню ─────────────────────────────────────────────────────────────
 
 MAIN_MENU_TEXT = (
@@ -2880,11 +2902,14 @@ def format_user_orders(orders: list) -> str:
         if index:
             lines.append("────────────")
         lines.extend([
+            f"🧾 Заказ: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>",
             f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>",
             f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>",
             f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>",
             f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>",
             f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>",
+            "",
+            "Откройте заказ кнопкой ниже, чтобы повторить покупку.",
         ])
     if total_orders > 10:
         lines.extend(["", "Показаны последние 10 заказов."])
@@ -2903,7 +2928,32 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await edit_or_send(query, context, format_user_orders(orders), profile_back_keyboard())
+    await edit_or_send(query, context, format_user_orders(orders), user_orders_keyboard(orders))
+
+
+def build_user_order_card_text(order: dict) -> str:
+    return (
+        "📦 <b>Заказ</b>\n\n"
+        f"🧾 Номер: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>\n"
+        f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>\n"
+        f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>\n"
+        f"📅 Срок: <b>{html_escape(order.get('days', '—'))}</b>\n"
+        f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>\n"
+        f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>\n"
+        f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>\n\n"
+        "Нажмите «Повторить заказ», чтобы создать новый checkout на такой же тариф. Старый заказ не изменится."
+    )
+
+
+async def show_user_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    order_id = int(query.data.split(":", 1)[1])
+    order = find_order(order_id)
+    if not order or str(order.get("user_id")) != str(query.from_user.id):
+        await query.answer("Заказ не найден.", show_alert=True)
+        return
+    await query.answer()
+    await edit_or_send(query, context, build_user_order_card_text(order), user_order_card_keyboard(order_id))
 
 
 async def get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -2963,13 +3013,8 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─── Диалог покупки ───────────────────────────────────────────────────────────
 
-async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_purchase_for_plan(update: Update, context: ContextTypes.DEFAULT_TYPE, plan_key: str, plan: dict, action_label: str = "нажал «Купить»") -> int:
     query = update.callback_query
-    await query.answer()
-    plan_key = query.data.replace("buy_", "")
-    plan = PLAN_MAP.get(plan_key)
-    if not plan:
-        return ConversationHandler.END
     context.user_data["plan_key"] = plan_key
     context.user_data["plan"]     = plan
     order = create_checkout_order(query.from_user, plan_key, plan)
@@ -3000,9 +3045,40 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=payment_keyboard(plan_key),
         )
     if not is_admin(query.from_user):
-        await track_action(context, query.from_user, "нажал «Купить»",
+        await track_action(context, query.from_user, action_label,
                            f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}")
     return WAITING_PAYMENT
+
+
+async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    plan_key = query.data.replace("buy_", "")
+    plan = PLAN_MAP.get(plan_key)
+    if not plan:
+        return ConversationHandler.END
+    return await start_purchase_for_plan(update, context, plan_key, plan)
+
+
+async def repeat_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    order_id = int(query.data.split(":", 1)[1])
+    order = find_order(order_id)
+    if not order or str(order.get("user_id")) != str(query.from_user.id):
+        await query.answer("Заказ не найден.", show_alert=True)
+        return ConversationHandler.END
+    plan_key = str(order.get("plan_key") or "")
+    plan = PLAN_MAP.get(plan_key)
+    if not plan:
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "Этот тариф больше недоступен. Выберите актуальный пакет.",
+            unavailable_plan_keyboard(),
+        )
+        return ConversationHandler.END
+    await query.answer()
+    return await start_purchase_for_plan(update, context, plan_key, plan, "нажал «Повторить заказ»")
 
 
 async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4467,6 +4543,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_profile(update, context)
     elif data == "profile_orders":
         await show_my_orders(update, context)
+    elif data.startswith("user_order:"):
+        await show_user_order(update, context)
+    elif data.startswith("repeat_order:"):
+        await repeat_order(update, context)
     elif data == "profile_invite":
         await show_profile_invite(update, context)
     elif data == "profile_bonuses":
@@ -4544,6 +4624,7 @@ def main() -> None:
     purchase_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_"),
+            CallbackQueryHandler(repeat_order, pattern=r"^repeat_order:\d+$"),
             CallbackQueryHandler(show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"),
         ],
         states={

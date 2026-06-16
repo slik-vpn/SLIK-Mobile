@@ -80,6 +80,8 @@ def check_bot_contract(bot_text: str) -> None:
         "cancel_order",
         "support",
         "abandoned_continue:",
+        "user_order:",
+        "repeat_order:",
         "abandoned_reminder_sent",
         "ABANDONED_CHECKOUT_REMINDER_MINUTES",
     ]
@@ -93,6 +95,8 @@ def check_bot_contract(bot_text: str) -> None:
         "async def show_buy_esim(",
         "async def show_profile(",
         "async def show_my_orders(",
+        "async def show_user_order(",
+        "async def repeat_order(",
         "async def show_profile_invite(",
         "async def show_profile_bonuses(",
         "async def show_support_screen(",
