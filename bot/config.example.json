@@ -10,6 +10,7 @@
   "notification_chats": {
     "orders": "",
     "client_activity": "",
+    "new_clients": "",
     "payments": "",
     "tech_alerts": ""
   }

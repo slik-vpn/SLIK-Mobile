@@ -123,6 +123,7 @@ def check_bot_contract(bot_text: str) -> None:
         "def get_notification_chat_id(",
         "def get_orders_chat_id(",
         "def get_client_activity_chat_id(",
+        "def get_new_clients_chat_id(",
         "def get_payments_chat_id(",
         "def get_tech_alerts_chat_id(",
         "def main(",
@@ -135,10 +136,12 @@ def check_bot_contract(bot_text: str) -> None:
         '"notification_chats"',
         'ORDERS_CHAT_ID',
         'CLIENT_ACTIVITY_CHAT_ID',
+        'NEW_CLIENTS_CHAT_ID',
         'PAYMENTS_CHAT_ID',
         'TECH_ALERTS_CHAT_ID',
         'CommandHandler("chatid",          cmd_chatid)',
         'get_client_activity_chat_id()',
+        'get_new_clients_chat_id()',
         'get_orders_chat_id()',
         'notification_chats_help',
         '/chatid',
@@ -179,6 +182,26 @@ def check_bot_contract(bot_text: str) -> None:
     record(
         "notify_admin/order notifications use get_orders_chat_id",
         bool(re.search(r"async def notify_admin\(.*?get_orders_chat_id\(\)", bot_text, re.DOTALL)),
+    )
+    record(
+        "new client notification uses get_new_clients_chat_id",
+        bool(re.search(r"async def notify_new_client\(.*?get_new_clients_chat_id\(\)", bot_text, re.DOTALL)),
+    )
+    record(
+        "new client notification text exists",
+        "🆕 <b>Новый клиент</b>" in bot_text,
+    )
+    record(
+        "user profile tracks new_client_notified",
+        '"new_client_notified": False' in bot_text and 'profile["new_client_notified"] = True' in bot_text,
+    )
+    record(
+        "start distinguishes new and existing users",
+        bool(re.search(
+            r"async def start\(.*?is_new_client\s*=\s*str\(user\.id\) not in users_before_start.*?if is_new_client:.*?notify_new_client\(.*?else:.*?track_action\(context, user, \"открыл бот\"",
+            bot_text,
+            re.DOTALL,
+        )),
     )
 
     record(
@@ -274,11 +297,13 @@ def main() -> int:
     for needle in [
         'ORDERS_CHAT_ID',
         'CLIENT_ACTIVITY_CHAT_ID',
+        'NEW_CLIENTS_CHAT_ID',
         'PAYMENTS_CHAT_ID',
         'TECH_ALERTS_CHAT_ID',
     ]:
         check_contains(env_example_text, needle, ".env.example notification routing")
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
+    check_contains(config_example_text, '"new_clients"', "bot/config.example.json")
     check_contains(readme_text, "Разделение уведомлений по чатам", "README.md")
 
     failed = [(name, detail) for name, ok, detail in CHECKS if not ok]
