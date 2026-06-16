@@ -325,11 +325,44 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     )
 
 
+def check_run_mvp_contract(run_mvp_text: str) -> None:
+    run_mvp_track_action_text = function_block(run_mvp_text, "track_action")
+    run_mvp_notify_admin_text = function_block(run_mvp_text, "notify_admin")
+    record(
+        "run_mvp notify_admin does not call bot.get_admin_chat_id",
+        "bot.get_admin_chat_id(" not in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action does not call bot.get_admin_chat_id",
+        "bot.get_admin_chat_id(" not in run_mvp_track_action_text,
+    )
+    record(
+        "run_mvp notify_admin uses orders route helper",
+        "bot.get_orders_chat_id(" in run_mvp_notify_admin_text
+        or "bot.get_orders_chat_source(" in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action uses client activity route helper",
+        "bot.get_client_activity_chat_id(" in run_mvp_track_action_text
+        or "bot.get_client_activity_chat_source(" in run_mvp_track_action_text,
+    )
+    record(
+        "run_mvp notify_admin includes route diagnostics",
+        "Маршрут: orders" in run_mvp_notify_admin_text and "route_source" in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action includes route diagnostics",
+        "Маршрут: client_activity" in run_mvp_track_action_text and "route_source" in run_mvp_track_action_text,
+    )
+
+
 def main() -> int:
     check_syntax("bot/bot.py")
+    check_syntax("bot/run_mvp.py")
     check_syntax("bot/bot_healthcheck.py")
 
     bot_text = read_text("bot/bot.py")
+    run_mvp_text = read_text("bot/run_mvp.py")
     readme_text = read_text("README.md")
     env_example_text = read_text(".env.example")
     config_example_text = read_text("bot/config.example.json")
@@ -350,6 +383,7 @@ def main() -> int:
         readme_text,
     )
     check_bot_contract(bot_text, env_example_text)
+    check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',
         'CLIENT_ACTIVITY_CHAT_ID',
