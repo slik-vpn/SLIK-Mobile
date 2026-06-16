@@ -67,7 +67,7 @@ def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> Non
     )
 
 
-def check_bot_contract(bot_text: str) -> None:
+def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
         "buy_esim",
         "profile",
@@ -349,7 +349,7 @@ def main() -> int:
         },
         readme_text,
     )
-    check_bot_contract(bot_text)
+    check_bot_contract(bot_text, env_example_text)
     for needle in [
         'ORDERS_CHAT_ID',
         'CLIENT_ACTIVITY_CHAT_ID',
