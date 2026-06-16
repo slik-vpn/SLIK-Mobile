@@ -43,6 +43,12 @@ def check_not_contains(text: str, needle: str, source: str) -> None:
     record(f"{source} does not contain {needle!r}", needle not in text)
 
 
+def function_block(text: str, name: str) -> str:
+    pattern = rf"^(async\s+def|def)\s+{re.escape(name)}\s*\(.*?\n(?=^(?:async\s+def|def)\s+|^# ───|\Z)"
+    match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    return match.group(0) if match else ""
+
+
 def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> None:
     uses_slik_user = any(
         re.search(r"^\s*(User|Group)=slik-mobile\s*$", text, re.MULTILINE)
@@ -126,6 +132,8 @@ def check_bot_contract(bot_text: str) -> None:
         "def get_new_clients_chat_id(",
         "def get_payments_chat_id(",
         "def get_tech_alerts_chat_id(",
+        "def notification_routes_text(",
+        "async def cmd_notification_routes(",
         "def main(",
     ]
     for handler in handlers:
@@ -145,6 +153,8 @@ def check_bot_contract(bot_text: str) -> None:
         'get_orders_chat_id()',
         'notification_chats_help',
         '/chatid',
+        '/notification_routes',
+        'CommandHandler("notification_routes", cmd_notification_routes)',
     ]:
         check_contains(bot_text, needle, "bot/bot.py notification chats")
 
@@ -175,13 +185,41 @@ def check_bot_contract(bot_text: str) -> None:
         '"notification_chats_help"' in admin_prefix_text or '"admin_notification_chats_help"' in bot_text,
     )
 
+    track_action_text = function_block(bot_text, "track_action")
+    notify_admin_text = function_block(bot_text, "notify_admin")
+    send_admin_order_message_text = function_block(bot_text, "send_admin_order_message")
+
     record(
         "track_action uses get_client_activity_chat_id",
-        bool(re.search(r"async def track_action\(.*?get_client_activity_chat_id\(\)", bot_text, re.DOTALL)),
+        "get_client_activity_chat_id()" in track_action_text,
+    )
+    record(
+        "track_action logs client activity route",
+        "client activity route: client_activity chat" in track_action_text,
     )
     record(
         "notify_admin/order notifications use get_orders_chat_id",
-        bool(re.search(r"async def notify_admin\(.*?get_orders_chat_id\(\)", bot_text, re.DOTALL)),
+        "get_orders_chat_id()" in notify_admin_text,
+    )
+    record(
+        "notify_admin/order notifications log orders route",
+        "order notification route: orders chat" in notify_admin_text,
+    )
+    record(
+        "send_admin_order_message does not call get_admin_chat_id",
+        "get_admin_chat_id(" not in send_admin_order_message_text,
+    )
+    record(
+        "new order notification is sent through notify_admin",
+        "await notify_admin(context, order)" in bot_text,
+    )
+    record(
+        "notify_admin does not route orders through get_admin_chat_id directly",
+        "get_admin_chat_id(" not in notify_admin_text,
+    )
+    record(
+        "track_action does not route client activity through ADMIN_CHAT_ID directly",
+        "get_admin_chat_id(" not in track_action_text and "ADMIN_CHAT_ID" not in track_action_text,
     )
     record(
         "new client notification uses get_new_clients_chat_id",
@@ -305,6 +343,7 @@ def main() -> int:
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
     check_contains(config_example_text, '"new_clients"', "bot/config.example.json")
     check_contains(readme_text, "Разделение уведомлений по чатам", "README.md")
+    check_contains(readme_text, "/notification_routes", "README.md")
 
     failed = [(name, detail) for name, ok, detail in CHECKS if not ok]
     for name, ok, detail in CHECKS:
