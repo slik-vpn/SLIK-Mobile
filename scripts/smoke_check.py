@@ -84,6 +84,8 @@ def check_bot_contract(bot_text: str) -> None:
         "repeat_order:",
         "abandoned_reminder_sent",
         "ABANDONED_CHECKOUT_REMINDER_MINUTES",
+        "expiry_reminder_sent",
+        "ESIM_EXPIRY_REMINDER_DAYS_BEFORE",
     ]
     for identifier in identifiers:
         check_contains(bot_text, identifier, "bot/bot.py callback/data identifiers")
@@ -108,6 +110,7 @@ def check_bot_contract(bot_text: str) -> None:
         "async def choose_payment(",
         "async def show_existing_checkout_payment(",
         "async def abandoned_checkout_reminder_job(",
+        "async def esim_expiry_reminder_job(",
         "async def notify_admin(",
         "def main(",
     ]
@@ -143,6 +146,36 @@ def check_bot_contract(bot_text: str) -> None:
         "abandoned reminder fresh update helper reloads orders",
         bool(re.search(
             r"def\s+mark_abandoned_reminder_sent_if_still_waiting\(order_id: int\).*?fresh_orders\s*=\s*load_orders\(\).*?save_orders\(fresh_orders\)",
+            bot_text,
+            re.DOTALL,
+        )),
+    )
+
+    expiry_job = re.search(
+        r"async def esim_expiry_reminder_job\(.*?\n(?=\n\ndef |\n\nasync def |\n\n# ───)",
+        bot_text,
+        re.DOTALL,
+    )
+    expiry_job_text = expiry_job.group(0) if expiry_job else ""
+    expiry_send_index = expiry_job_text.find("await context.bot.send_message")
+    expiry_post_send_text = expiry_job_text[expiry_send_index:] if expiry_send_index >= 0 else ""
+    record(
+        "expiry reminder job is scheduled",
+        "schedule_esim_expiry_reminders(app)" in bot_text
+        and 'name="esim_expiry_reminders"' in bot_text,
+    )
+    record(
+        "expiry reminder updates fresh order after send",
+        "mark_expiry_reminder_sent_if_still_issued(order_id)" in expiry_post_send_text,
+    )
+    record(
+        "expiry reminder does not save stale snapshot after send",
+        bool(expiry_post_send_text) and "save_orders(" not in expiry_post_send_text,
+    )
+    record(
+        "expiry reminder fresh update helper reloads orders",
+        bool(re.search(
+            r"def\s+mark_expiry_reminder_sent_if_still_issued\(order_id: int\).*?fresh_orders\s*=\s*load_orders\(\).*?save_orders\(fresh_orders\)",
             bot_text,
             re.DOTALL,
         )),

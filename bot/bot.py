@@ -74,6 +74,9 @@ def env_int(name: str, default: int) -> int:
 
 ABANDONED_CHECKOUT_REMINDER_MINUTES = env_int("ABANDONED_CHECKOUT_REMINDER_MINUTES", 30)
 ABANDONED_CHECKOUT_MAX_AGE_HOURS = 24
+ESIM_EXPIRY_REMINDER_DAYS_BEFORE = env_int("ESIM_EXPIRY_REMINDER_DAYS_BEFORE", 1)
+ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS = env_int("ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS", 60)
+ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS = 60 * 60
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
@@ -187,6 +190,13 @@ def now_str() -> str:
 def now_time() -> str:
     return datetime.datetime.now(tz=TZ).strftime("%H:%M")
 
+
+def parse_now_str(value: str) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.strptime(str(value), "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+    except (TypeError, ValueError):
+        return None
+
 def local_date() -> datetime.date:
     return datetime.datetime.now(tz=TZ).date()
 
@@ -195,6 +205,17 @@ def parse_price(s: str) -> float:
         return float(s.replace("$", "").strip())
     except Exception:
         return 0.0
+
+
+def parse_order_days(value) -> int | None:
+    match = re.search(r"\d+", str(value or ""))
+    if not match:
+        return None
+    try:
+        days = int(match.group(0))
+    except ValueError:
+        return None
+    return days if days > 0 else None
 
 # ─── config.json ──────────────────────────────────────────────────────────────
 
@@ -1059,8 +1080,12 @@ def update_order_status(order_id: int, status: str, updated_by: int | None = Non
         except (TypeError, ValueError):
             current_id = None
         if current_id == order_id:
-            o["status"]     = normalize_order_status(status)
+            normalized_status = normalize_order_status(status)
+            o["status"]     = normalized_status
             o["updated_at"] = now_str()
+            if normalized_status == "issued":
+                o.setdefault("issued_at", now_str())
+                o.setdefault("expiry_reminder_sent", False)
             if updated_by is not None:
                 o["status_updated_by"] = updated_by
             save_orders(orders)
@@ -2831,6 +2856,89 @@ async def abandoned_checkout_reminder_job(context: ContextTypes.DEFAULT_TYPE) ->
             )
 
 
+def expiry_reminder_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Повторить заказ", callback_data=f"repeat_order:{order_id}")],
+        [InlineKeyboardButton("🌍 Выбрать другую eSIM", callback_data="buy_esim")],
+        [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
+    ])
+
+
+def mark_expiry_reminder_sent_if_still_issued(order_id: int) -> bool:
+    fresh_orders = load_orders()
+    for fresh_order in fresh_orders:
+        try:
+            is_same_order = int(fresh_order.get("id")) == int(order_id)
+        except (TypeError, ValueError):
+            is_same_order = False
+        if not is_same_order:
+            continue
+        if normalize_order_status(fresh_order.get("status")) != "issued" or fresh_order.get("expiry_reminder_sent"):
+            return False
+        fresh_order["expiry_reminder_sent"] = True
+        fresh_order["expiry_reminder_sent_at"] = now_str()
+        save_orders(fresh_orders)
+        return True
+    return False
+
+
+async def esim_expiry_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.datetime.now(tz=TZ)
+    candidate_orders = load_orders()
+    for order in candidate_orders:
+        if normalize_order_status(order.get("status")) != "issued" or order.get("expiry_reminder_sent"):
+            continue
+        order_id = order.get("id")
+        if order_id is None:
+            continue
+        issued_at = parse_now_str(order.get("issued_at"))
+        days = parse_order_days(order.get("days"))
+        if not issued_at or days is None:
+            continue
+        age = now - issued_at
+        if age < datetime.timedelta(0) or age > datetime.timedelta(days=ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS):
+            continue
+        expiry_at = issued_at + datetime.timedelta(days=days)
+        reminder_at = expiry_at - datetime.timedelta(days=ESIM_EXPIRY_REMINDER_DAYS_BEFORE)
+        if now < reminder_at or now > expiry_at:
+            continue
+        user_id = order.get("user_id")
+        if not user_id:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "Ваша eSIM скоро закончится.\n\n"
+                    "Если интернет всё ещё нужен — можно быстро купить такой же пакет ещё раз."
+                ),
+                reply_markup=expiry_reminder_keyboard(int(order_id)),
+            )
+        except Exception as e:
+            logger.error("Не удалось отправить eSIM expiry reminder для заказа %s: %s", order.get("number"), e)
+            continue
+
+        if mark_expiry_reminder_sent_if_still_issued(order_id):
+            logger.info("eSIM expiry reminder sent for order %s", order.get("number"))
+        else:
+            logger.info(
+                "eSIM expiry reminder was sent but order %s changed before flag update; leaving order unchanged",
+                order.get("number"),
+            )
+
+
+def schedule_esim_expiry_reminders(app: Application) -> None:
+    if not app.job_queue:
+        logger.warning("JobQueue недоступен; eSIM expiry reminders не запущены")
+        return
+    app.job_queue.run_repeating(
+        esim_expiry_reminder_job,
+        interval=ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS,
+        first=ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS,
+        name="esim_expiry_reminders",
+    )
+
+
 def schedule_abandoned_checkout_reminders(app: Application) -> None:
     if not app.job_queue:
         logger.warning("JobQueue недоступен; abandoned checkout reminders не запущены")
@@ -4589,6 +4697,7 @@ async def post_init(app: Application) -> None:
         logger.warning("Telegram API timeout/network error during post_init; bot will continue: %s", exc)
     schedule_automatic_backups(app)
     schedule_abandoned_checkout_reminders(app)
+    schedule_esim_expiry_reminders(app)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
