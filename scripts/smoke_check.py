@@ -140,6 +140,18 @@ def check_bot_contract(bot_text: str) -> None:
     ]:
         check_contains(bot_text, needle, "bot/bot.py notification chats")
 
+
+    admin_prefix_match = re.search(r"admin_prefixes\s*=\s*\((.*?)\)", bot_text, re.DOTALL)
+    admin_prefix_text = admin_prefix_match.group(1) if admin_prefix_match else ""
+    for prefix in [
+        '"admin_"',
+        '"notification_chat:"',
+        '"notification_chat_edit:"',
+        '"notification_chat_test:"',
+        '"notification_chat_clear:"',
+    ]:
+        check_contains(admin_prefix_text, prefix, "bot/bot.py admin_prefixes notification gate")
+
     record(
         "track_action uses get_client_activity_chat_id",
         bool(re.search(r"async def track_action\(.*?get_client_activity_chat_id\(\)", bot_text, re.DOTALL)),

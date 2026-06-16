@@ -4509,7 +4509,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_restore_latest",
     }
     broadcast_callbacks = {"admin_news", "broadcast_send", "broadcast_cancel"}
-    admin_prefixes = ("admin_", "orders_list:", "order_card:", "order_status:", "clients_", "client_card:", "client_orders:", "client_order_card:", "client_balance:", "client_message:", "payment_method:", "payment_toggle:", "payment_instructions:", "payment_edit_")
+    admin_prefixes = (
+        "admin_",
+        "notification_chat:",
+        "notification_chat_edit:",
+        "notification_chat_test:",
+        "notification_chat_clear:",
+        "orders_list:",
+        "order_card:",
+        "order_status:",
+        "clients_",
+        "client_card:",
+        "client_orders:",
+        "client_order_card:",
+        "client_balance:",
+        "client_message:",
+        "payment_method:",
+        "payment_toggle:",
+        "payment_instructions:",
+        "payment_edit_",
+    )
     if data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
     elif (data in broadcast_callbacks or data.startswith(("broadcast_cat:", "broadcast_compose:"))) and not has_broadcast_access(query.from_user):
