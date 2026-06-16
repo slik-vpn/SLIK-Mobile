@@ -225,6 +225,12 @@ DEFAULT_CONFIG = {
     "managers": [],
     "relay":    {},
     "payment":  {"card": "", "cryptobot_token": ""},
+    "notification_chats": {
+        "orders": "",
+        "client_activity": "",
+        "payments": "",
+        "tech_alerts": "",
+    },
 }
 
 PAYMENT_METHOD_LABELS = {
@@ -352,6 +358,65 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     save_runtime_json(CONFIG_FILE, cfg)
+
+
+NOTIFICATION_CHAT_META = {
+    "orders": ("Заказы", "ORDERS_CHAT_ID", "чат заказов"),
+    "client_activity": ("Действия клиентов", "CLIENT_ACTIVITY_CHAT_ID", "чат действий клиентов"),
+    "payments": ("Оплаты", "PAYMENTS_CHAT_ID", "чат оплат"),
+    "tech_alerts": ("Техника", "TECH_ALERTS_CHAT_ID", "технический чат"),
+}
+
+
+def _parse_chat_id(value) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_notification_chat_source(kind: str) -> tuple[int | None, str]:
+    if kind not in NOTIFICATION_CHAT_META:
+        return get_admin_chat_id(), "fallback ADMIN_CHAT_ID"
+    cfg = load_config()
+    chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
+    config_id = _parse_chat_id(chats.get(kind))
+    if config_id is not None:
+        return config_id, "config"
+    env_name = NOTIFICATION_CHAT_META[kind][1]
+    env_id = _parse_chat_id(os.environ.get(env_name, ""))
+    if env_id is not None:
+        return env_id, "env"
+    return get_admin_chat_id(), "fallback ADMIN_CHAT_ID"
+
+
+def get_notification_chat_id(kind: str) -> int | None:
+    return get_notification_chat_source(kind)[0]
+
+
+def get_orders_chat_id() -> int | None:
+    return get_notification_chat_id("orders")
+
+
+def get_client_activity_chat_id() -> int | None:
+    return get_notification_chat_id("client_activity")
+
+
+def get_payments_chat_id() -> int | None:
+    return get_notification_chat_id("payments")
+
+
+def get_tech_alerts_chat_id() -> int | None:
+    return get_notification_chat_id("tech_alerts")
+
+
+def set_notification_chat_id(kind: str, chat_id: str) -> None:
+    cfg = load_config()
+    cfg.setdefault("notification_chats", {})[kind] = chat_id
+    save_config(cfg)
 
 
 # ─── payment_methods.json ─────────────────────────────────────────────────────
@@ -1489,8 +1554,8 @@ def user_tag_html(user) -> str:
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
-    """Отправляет уведомление в админ-чат о действии клиента."""
-    admin_id = get_admin_chat_id()
+    """Отправляет уведомление о действии клиента в выбранный чат."""
+    admin_id = get_client_activity_chat_id()
     if not admin_id:
         return
     text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
@@ -1812,6 +1877,7 @@ CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
 CLIENT_INPUT_SEARCH = "client_search"
 BROADCAST_INPUT_MESSAGE = "broadcast_message"
+NOTIFICATION_CHAT_INPUT = "notification_chat"
 BROADCAST_CATEGORIES = {
     "all": "👥 Все клиенты",
     "no_orders": "🆕 Без заказов",
@@ -2474,6 +2540,7 @@ def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
         [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
         [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
+        [InlineKeyboardButton("🔔 Чаты уведомлений", callback_data="admin_notification_chats")],
     ]
     if has_backup_access(user):
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
@@ -2481,6 +2548,55 @@ def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
+
+
+def notification_chat_line(kind: str) -> str:
+    title, env_name, _test_label = NOTIFICATION_CHAT_META[kind]
+    chat_id, source = get_notification_chat_source(kind)
+    cfg = load_config()
+    chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
+    configured = str(chats.get(kind) or "").strip()
+    env_value = str(os.environ.get(env_name, "") or "").strip()
+    if source == "config":
+        source_text = "config.json"
+    elif source == "env":
+        source_text = env_name
+    else:
+        source_text = "используется ADMIN_CHAT_ID"
+    value = f"<code>{chat_id}</code>" if chat_id is not None else "<b>не настроен</b>"
+    details = []
+    if configured:
+        details.append(f"config: <code>{html_escape(configured)}</code>")
+    if env_value:
+        details.append(f"env: <code>{html_escape(env_value)}</code>")
+    if not details:
+        details.append("config/env пустые")
+    return f"• <b>{html_escape(title)}</b>: {value} — {html_escape(source_text)} ({'; '.join(details)})"
+
+
+def notification_chats_admin_text() -> str:
+    lines = [notification_chat_line(kind) for kind in NOTIFICATION_CHAT_META]
+    return "⚙️ <b>Уведомления / Чаты</b>\n\n" + "\n".join(lines) + "\n\nЕсли отдельный чат не задан, используется ADMIN_CHAT_ID."
+
+
+def notification_chats_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(title, callback_data=f"notification_chat:{kind}")] for kind, (title, _env, _label) in NOTIFICATION_CHAT_META.items()]
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def notification_chat_detail_text(kind: str) -> str:
+    title = NOTIFICATION_CHAT_META[kind][0]
+    return f"⚙️ <b>{html_escape(title)}</b>\n\n" + notification_chat_line(kind)
+
+
+def notification_chat_detail_keyboard(kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить", callback_data=f"notification_chat_edit:{kind}")],
+        [InlineKeyboardButton("🧪 Тест", callback_data=f"notification_chat_test:{kind}")],
+        [InlineKeyboardButton("🧹 Очистить", callback_data=f"notification_chat_clear:{kind}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_notification_chats")],
+    ])
 
 def buy_esim_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -3532,12 +3648,12 @@ async def send_admin_order_message(
 
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
-    admin_id = get_admin_chat_id()
+    admin_id = get_orders_chat_id()
     order_number = order.get("number", "—")
     order_id = order.get("id")
     if not admin_id:
         logger.warning(
-            "Админ-уведомление по заказу %s не отправлено: ADMIN_CHAT_ID не задан",
+            "Админ-уведомление по заказу %s не отправлено: чат заказов и ADMIN_CHAT_ID не заданы",
             order_number,
         )
         return
@@ -3613,6 +3729,23 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         context.user_data.pop("client_target_id", None)
         await deny_admin_access(update)
+        return
+
+    if input_mode == NOTIFICATION_CHAT_INPUT:
+        kind = str(context.user_data.get("notification_chat_kind") or "")
+        if kind not in NOTIFICATION_CHAT_META:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("notification_chat_kind", None)
+            await msg.reply_text("Тип чата не найден.", reply_markup=notification_chats_keyboard())
+            return
+        chat_id = msg.text.strip()
+        if _parse_chat_id(chat_id) is None:
+            await msg.reply_text("Введите chat_id числом, например <code>-1001234567890</code>.", parse_mode="HTML")
+            return
+        set_notification_chat_id(kind, chat_id)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("notification_chat_kind", None)
+        await msg.reply_text("✅ Чат уведомлений сохранён.", parse_mode="HTML", reply_markup=notification_chat_detail_keyboard(kind))
         return
 
     if input_mode in {PAYMENT_ADMIN_INPUT_TITLE, PAYMENT_ADMIN_INPUT_CREDENTIALS}:
@@ -4310,6 +4443,11 @@ async def show_admin_payments(update: Update, context: ContextTypes.DEFAULT_TYPE
     await edit_or_send(query, context, payment_methods_admin_text(), payment_methods_admin_keyboard())
 
 
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat:
+        await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
@@ -4347,7 +4485,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Подключение группового чата:</b>\n"
         "1. Создать группу «SLIK Mobile Admin»\n"
         "2. Добавить бота в группу\n"
-        "3. Получить ID группы через @userinfobot\n"
+        "3. Получить ID группы командой /chatid\n"
         "4. Установить ADMIN_CHAT_ID = <i>-100XXXXXXXXX</i>",
         parse_mode="HTML",
     )
@@ -4510,6 +4648,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     elif data == "admin_payments":
         await show_admin_payments(update, context)
+    elif data == "admin_notification_chats":
+        await query.answer()
+        await edit_or_send(query, context, notification_chats_admin_text(), notification_chats_keyboard())
+    elif data.startswith("notification_chat:"):
+        kind = data.split(":", 1)[1]
+        if kind not in NOTIFICATION_CHAT_META:
+            await query.answer("Тип чата не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, notification_chat_detail_text(kind), notification_chat_detail_keyboard(kind))
+    elif data.startswith("notification_chat_edit:"):
+        kind = data.split(":", 1)[1]
+        if kind not in NOTIFICATION_CHAT_META:
+            await query.answer("Тип чата не найден.", show_alert=True)
+            return
+        context.user_data["client_input"] = NOTIFICATION_CHAT_INPUT
+        context.user_data["notification_chat_kind"] = kind
+        await query.answer()
+        await edit_or_send(query, context, "✏️ <b>Изменить чат уведомлений</b>\n\nОтправьте chat_id числом, например <code>-1001234567890</code>.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"notification_chat:{kind}")]]))
+    elif data.startswith("notification_chat_clear:"):
+        kind = data.split(":", 1)[1]
+        if kind not in NOTIFICATION_CHAT_META:
+            await query.answer("Тип чата не найден.", show_alert=True)
+            return
+        set_notification_chat_id(kind, "")
+        await query.answer("Настройка очищена.")
+        await edit_or_send(query, context, notification_chat_detail_text(kind), notification_chat_detail_keyboard(kind))
+    elif data.startswith("notification_chat_test:"):
+        kind = data.split(":", 1)[1]
+        if kind not in NOTIFICATION_CHAT_META:
+            await query.answer("Тип чата не найден.", show_alert=True)
+            return
+        chat_id = get_notification_chat_id(kind)
+        if chat_id is None:
+            await query.answer("Чат не настроен.", show_alert=True)
+            return
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ Тест уведомлений SLIK Mobile: {NOTIFICATION_CHAT_META[kind][2]} подключён.")
+            await query.answer("Тест отправлен.")
+        except Exception as exc:
+            logger.warning("Notification chat test failed for %s/%s: %s", kind, chat_id, exc)
+            await query.answer("Не удалось отправить сообщение. Проверьте, что бот добавлен в группу и chat_id указан верно.", show_alert=True)
     elif data.startswith("payment_method:"):
         method_key = data.split(":", 1)[1]
         if not get_payment_method(method_key):
@@ -4690,6 +4870,7 @@ async def post_init(app: Application) -> None:
             BotCommand("payment_details", "Реквизиты оплаты"),
             BotCommand("backup",          "Создать резервную копию"),
             BotCommand("backups",         "Последние резервные копии"),
+            BotCommand("chatid",          "Показать ID текущего чата"),
             BotCommand("help",            "Справка администратора"),
         ])
         logger.info("Команды зарегистрированы в Telegram")
@@ -4786,6 +4967,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setpayment",      cmd_setpayment))
     app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_handler(CommandHandler("backups",         cmd_backups))
+    app.add_handler(CommandHandler("chatid",          cmd_chatid))
     app.add_handler(CommandHandler("help",            cmd_help))
 
     # ── Навигационные callback'и ──────────────────────────────────────────────
