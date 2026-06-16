@@ -2860,7 +2860,7 @@ def expiry_reminder_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 Повторить заказ", callback_data=f"repeat_order:{order_id}")],
         [InlineKeyboardButton("🌍 Выбрать другую eSIM", callback_data="buy_esim")],
-        [InlineKeyboardButton("👨‍💻 Поддержка", callback_data="support")],
+        [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
     ])
 
 
