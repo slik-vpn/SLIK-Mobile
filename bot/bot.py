@@ -228,6 +228,7 @@ DEFAULT_CONFIG = {
     "notification_chats": {
         "orders": "",
         "client_activity": "",
+        "new_clients": "",
         "payments": "",
         "tech_alerts": "",
     },
@@ -353,6 +354,12 @@ def load_config() -> dict:
     data = load_runtime_json(CONFIG_FILE, runtime_default_value(CONFIG_FILE), dict)
     for k, v in DEFAULT_CONFIG.items():
         data.setdefault(k, json.loads(json.dumps(v)))
+    chats = data.get("notification_chats")
+    if not isinstance(chats, dict):
+        chats = {}
+        data["notification_chats"] = chats
+    for kind in DEFAULT_CONFIG["notification_chats"]:
+        chats.setdefault(kind, "")
     return data
 
 
@@ -363,6 +370,7 @@ def save_config(cfg: dict) -> None:
 NOTIFICATION_CHAT_META = {
     "orders": ("Заказы", "ORDERS_CHAT_ID", "чат заказов"),
     "client_activity": ("Действия клиентов", "CLIENT_ACTIVITY_CHAT_ID", "чат действий клиентов"),
+    "new_clients": ("Новые клиенты", "NEW_CLIENTS_CHAT_ID", "чат новых клиентов"),
     "payments": ("Оплаты", "PAYMENTS_CHAT_ID", "чат оплат"),
     "tech_alerts": ("Техника", "TECH_ALERTS_CHAT_ID", "технический чат"),
 }
@@ -403,6 +411,10 @@ def get_orders_chat_id() -> int | None:
 
 def get_client_activity_chat_id() -> int | None:
     return get_notification_chat_id("client_activity")
+
+
+def get_new_clients_chat_id() -> int | None:
+    return get_notification_chat_id("new_clients")
 
 
 def get_payments_chat_id() -> int | None:
@@ -524,6 +536,7 @@ def default_user_profile(user) -> dict:
         "referral_clicks": 0,
         "referrer": None,
         "referral_bonus_awarded": False,
+        "new_client_notified": False,
         "status": "Traveller",
     }
 
@@ -1006,6 +1019,7 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("referral_clicks", 0)
         profile.setdefault("referrer", None)
         profile.setdefault("referral_bonus_awarded", False)
+        profile.setdefault("new_client_notified", False)
         profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
         profile["username"] = user.username or ""
         profile["full_name"] = user.full_name or ""
@@ -1384,9 +1398,9 @@ async def send_backup_archive(bot, chat_id: int, backup_info: dict) -> None:
 async def automatic_backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         backup_info = create_backup_archive()
-        admin_id = get_admin_chat_id()
+        admin_id = get_tech_alerts_chat_id()
         if not admin_id:
-            logger.warning("ADMIN_CHAT_ID не задан; автоматический бэкап сохранён локально: %s", backup_info["path"])
+            logger.warning("Технический чат и ADMIN_CHAT_ID не заданы; автоматический бэкап сохранён локально: %s", backup_info["path"])
             return
         await send_backup_archive(context.bot, admin_id, backup_info)
     except Exception:
@@ -1571,6 +1585,55 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
         await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
     except Exception as e:
         logger.error("track_action error: %s", e)
+
+
+async def notify_new_client(
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+    referrer_id: int | None = None,
+) -> None:
+    """Отправляет однократное уведомление о новом клиенте в выделенный чат."""
+    if not user or has_admin_access(user):
+        return
+
+    users = load_users()
+    key = str(user.id)
+    profile = users.get(key)
+    if not isinstance(profile, dict):
+        return
+    if profile.get("new_client_notified"):
+        return
+
+    chat_id = get_new_clients_chat_id()
+    if not chat_id:
+        return
+
+    saved_referrer_id = profile.get("referrer")
+    effective_referrer_id = referrer_id or saved_referrer_id
+    source = "referral" if effective_referrer_id else "direct"
+    text = (
+        "🆕 <b>Новый клиент</b>\n\n"
+        f"Имя: <b>{html_escape(user.full_name or '—')}</b>\n"
+        f"Username: <b>{user_tag_html(user)}</b>\n"
+        f"User ID: <code>{user.id}</code>\n"
+        f"Время: {html_escape(now_str())}\n"
+        f"Источник: {html_escape(source)}"
+    )
+    if effective_referrer_id:
+        text += f"\nПришёл по приглашению: <code>{html_escape(str(effective_referrer_id))}</code>"
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error("new client notification error: %s", e)
+        return
+
+    users = load_users()
+    profile = users.get(key)
+    if isinstance(profile, dict):
+        profile["new_client_notified"] = True
+        users[key] = profile
+        save_users(users)
 
 
 def format_order_list(orders: list, title: str) -> list[str]:
@@ -2592,6 +2655,7 @@ def notification_chats_help_text() -> str:
         "1. Создайте отдельные Telegram-группы:\n"
         "   • SLIK Заказы\n"
         "   • SLIK Действия клиентов\n"
+        "   • SLIK Новые клиенты\n"
         "   • SLIK Оплаты\n"
         "   • SLIK Техника\n\n"
         "2. Добавьте бота SLIK Mobile в нужную группу.\n\n"
@@ -2605,6 +2669,7 @@ def notification_chats_help_text() -> str:
         "7. Выберите нужный тип:\n"
         "   • Заказы\n"
         "   • Действия клиентов\n"
+        "   • Новые клиенты\n"
         "   • Оплаты\n"
         "   • Техника\n\n"
         "8. Нажмите “✏️ Изменить” и вставьте chat_id.\n\n"
@@ -2756,9 +2821,14 @@ MAIN_MENU_TEXT = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    is_new_client = False
+    referrer_id = None
     if user:
+        users_before_start = load_users()
+        is_new_client = str(user.id) not in users_before_start
+        referrer_id = extract_referrer_id(context)
         ensure_user_profile(user)
-        register_start_referral(user, extract_referrer_id(context))
+        register_start_referral(user, referrer_id)
     if update.message:
         try:
             await update.message.reply_text("...", reply_markup=ReplyKeyboardRemove())
@@ -2776,8 +2846,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=main_menu_keyboard(user),
                 parse_mode="HTML",
             )
-        if not has_admin_access(user):
-            await track_action(context, user, "открыл главное меню")
+        if user and not has_admin_access(user):
+            if is_new_client:
+                await notify_new_client(context, user, referrer_id)
+            else:
+                await track_action(context, user, "открыл бот")
     elif update.callback_query:
         await edit_or_send(update.callback_query, context, MAIN_MENU_TEXT, main_menu_keyboard(user))
 
