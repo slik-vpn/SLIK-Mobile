@@ -65,6 +65,7 @@ FAZERCARDS_API_BASE_URL = "https://api.fzr.cards/api/v2"
 FAZERCARDS_TIMEOUT_SECONDS = 8.0
 FAZERCARDS_BALANCE_ENDPOINT = "/balance"
 FAZERCARDS_PRODUCTS_ENDPOINT = "/giftcards?limit=100"
+FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT = "/giftcards/cards"
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
     try:
@@ -1402,8 +1403,12 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("enabled", True)
     item.setdefault("fazercards_product_id", "")
     item.setdefault("fazercards_product_name", "")
+    item.setdefault("fazercards_category_id", "")
+    item.setdefault("fazercards_card_id", "")
     item.setdefault("fazercards_last_seen", "")
     item.setdefault("fazercards_available", None)
+    item.setdefault("fazercards_price_usd", None)
+    item.setdefault("fazercards_stock", None)
     return item
 
 
@@ -1521,6 +1526,16 @@ async def fetch_fazercards_products(client: httpx.AsyncClient, api_key: str) -> 
     return data
 
 
+async def fetch_fazercards_giftcards_cards(client: httpx.AsyncClient, api_key: str, category_id: str = "") -> dict:
+    params = {"category_id": str(category_id or "")}
+    response = await client.get(FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT, headers=fazercards_headers(api_key), params=params)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise ValueError(str(data.get("error") if isinstance(data, dict) else "invalid response"))
+    return data
+
+
 async def fetch_fazercards_products_readonly() -> dict:
     api_key = get_fazercards_api_key()
     if not api_key:
@@ -1531,6 +1546,19 @@ async def fetch_fazercards_products_readonly() -> dict:
     except Exception as exc:
         safe_error = fazercards_api_error(exc)
         logger.warning("FazerCards products fetch failed: %s", safe_error)
+        return {"ok": False, "error": safe_error, "items": []}
+
+
+async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> dict:
+    api_key = get_fazercards_api_key()
+    if not api_key:
+        return {"ok": False, "error": "API key не указан", "items": []}
+    try:
+        async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            return await fetch_fazercards_giftcards_cards(client, api_key, category_id)
+    except Exception as exc:
+        safe_error = fazercards_api_error(exc)
+        logger.warning("FazerCards gift cards fetch failed: %s", safe_error)
         return {"ok": False, "error": safe_error, "items": []}
 
 
@@ -5811,8 +5839,12 @@ def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
 
 def fazercards_product_value(item: dict, key: str) -> str:
     aliases = {
-        "id": ("supplier_product_id", "product_id", "id", "sku"),
-        "name": ("name", "title", "product_name"),
+        "id": ("supplier_product_id", "supplierProductId", "product_id", "productId", "card_id", "cardId", "id", "slug", "code", "sku"),
+        "category_id": ("category_id", "categoryId"),
+        "card_id": ("card_id", "cardId", "supplier_product_id", "supplierProductId", "product_id", "productId", "id"),
+        "name": ("name", "title", "product_name", "productName"),
+        "price_usd": ("price_usd", "priceUsd", "price", "usd_price", "usdPrice"),
+        "stock": ("stock", "quantity", "available", "available_count", "availableCount"),
     }
     for field in aliases[key]:
         value = item.get(field)
@@ -5862,10 +5894,14 @@ def apple_giftcard_candidates(product: dict, items: list[dict], limit: int = 8, 
         name = fazercards_product_value(item, "name")
         if not is_apple_itunes_fazercards_name(name):
             continue
-        if not fazercards_name_has_region(name, region):
+        if fazercards_name_has_region(name, region):
+            score_region = 3
+        elif any(fazercards_name_has_region(name, known_region) for known_region in APPLE_REGION_PATTERNS):
             continue
+        else:
+            score_region = 0
         has_amount = fazercards_name_has_amount(name, amount)
-        score = 8
+        score = 8 + score_region
         if has_amount:
             score += 4
         scored.append((score, 0 if has_amount else 1, name, item))
@@ -6500,7 +6536,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await edit_or_send(query, context, "⚠️ API key не указан.\nСначала владелец должен указать FazerCards API key.", apple_id_admin_product_keyboard(product))
             return
         await query.answer("Получаю товары FazerCards...")
-        payload = await fetch_fazercards_products_readonly()
+        payload = await fetch_fazercards_giftcards_cards_readonly(product.get("fazercards_category_id", ""))
         items = payload.get("items") if isinstance(payload, dict) else []
         if not payload.get("ok") or not isinstance(items, list):
             await edit_or_send(query, context, fazercards_select_text(product, False, str(payload.get("error") or "Не удалось получить список товаров")), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]))
@@ -6575,10 +6611,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Товар не найден. Откройте привязку заново.", show_alert=True)
             return
         product = set_apple_id_product(product_id, {
-            "fazercards_product_id": fazercards_product_value(item, "id"),
+            "fazercards_product_id": fazercards_product_value(item, "card_id"),
             "fazercards_product_name": fazercards_product_value(item, "name"),
+            "fazercards_category_id": fazercards_product_value(item, "category_id"),
+            "fazercards_card_id": fazercards_product_value(item, "card_id"),
             "fazercards_last_seen": fazercards_checked_at(),
             "fazercards_available": True,
+            "fazercards_price_usd": fazercards_product_value(item, "price_usd") or None,
+            "fazercards_stock": fazercards_product_value(item, "stock") or None,
         })
         await query.answer("Товар привязан.")
         await edit_or_send(query, context, "✅ Товар привязан.\n\n" + apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
@@ -6600,8 +6640,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         product = set_apple_id_product(product_id, {
             "fazercards_product_id": "",
             "fazercards_product_name": "",
+            "fazercards_category_id": "",
+            "fazercards_card_id": "",
             "fazercards_last_seen": "",
             "fazercards_available": None,
+            "fazercards_price_usd": None,
+            "fazercards_stock": None,
         })
         if not product:
             await query.answer("Товар не найден.", show_alert=True)
