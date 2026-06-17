@@ -595,9 +595,18 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "admin_apple_id_fazer_unlink:" in bot_text,
     )
     readonly_fetch_text = function_block(bot_text, "fetch_fazercards_products_readonly")
+    giftcards_cards_fetch_text = function_block(bot_text, "fetch_fazercards_giftcards_cards")
+    giftcards_cards_readonly_text = function_block(bot_text, "fetch_fazercards_giftcards_cards_readonly")
     mapping_handlers_text = "\n".join(
         function_block(bot_text, name)
-        for name in ("fetch_fazercards_products_readonly", "fazercards_select_keyboard", "apple_giftcard_candidates")
+        for name in (
+            "fetch_fazercards_products_readonly",
+            "fetch_fazercards_giftcards_cards",
+            "fetch_fazercards_giftcards_cards_readonly",
+            "fazercards_select_keyboard",
+            "fazercards_cards_keyboard",
+            "apple_giftcard_candidates",
+        )
     )
     record(
         "FazerCards mapping uses only GET/read-only product list",
@@ -616,6 +625,29 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
             "/manual-services/order",
             "/payments/create",
         )),
+    )
+    record(
+        "FazerCards giftcards/cards endpoint constant exists",
+        'FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT = "/giftcards/cards"' in bot_text,
+    )
+    record(
+        "FazerCards giftcards/cards helper exists",
+        "async def fetch_fazercards_giftcards_cards(" in bot_text
+        and "async def fetch_fazercards_giftcards_cards_readonly(" in bot_text,
+    )
+    record(
+        "FazerCards giftcards/cards helper uses GET with category_id",
+        "client.get(" in giftcards_cards_fetch_text
+        and "FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT" in giftcards_cards_fetch_text
+        and 'params={"category_id": category_id}' in giftcards_cards_fetch_text
+        and "X-API-Key" in function_block(bot_text, "fazercards_headers")
+        and "client.post" not in giftcards_cards_fetch_text,
+    )
+    record(
+        "FazerCards giftcards/cards readonly helper safely handles errors",
+        "fazercards_api_error(exc)" in giftcards_cards_readonly_text
+        and "logger.warning" in giftcards_cards_readonly_text
+        and "api_key" not in " ".join(re.findall(r"logger\.warning\([^\n]+", giftcards_cards_readonly_text)),
     )
     apple_candidates_text = function_block(bot_text, "apple_giftcard_candidates")
     apple_name_text = function_block(bot_text, "is_apple_itunes_fazercards_name")
@@ -699,6 +731,36 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "FazerCards child items helper checks nested denomination fields",
         "def extract_fazercards_child_items" in bot_text
         and all(field in bot_text for field in ("items", "products", "children", "variants", "denominations", "values", "options")),
+    )
+    record(
+        "FazerCards card mapping saves category_id and card_id",
+        '"fazercards_category_id": category_id' in handle_callback_text
+        and '"fazercards_card_id": card_id' in handle_callback_text
+        and '"fazercards_product_id": card_id' in handle_callback_text
+        and '"fazercards_mapping_type": "card"' in handle_callback_text,
+    )
+    record(
+        "FazerCards card mapping stores supplier price and stock",
+        '"fazercards_price_usd": fazercards_card_value(card, "price_usd")' in handle_callback_text
+        and '"fazercards_stock": fazercards_card_value(card, "stock")' in handle_callback_text,
+    )
+    record(
+        "FazerCards card mapping display includes category and card details",
+        "Category ID" in apple_product_text
+        and "Card ID" in apple_product_text
+        and "Цена поставщика" in apple_product_text
+        and "Stock" in apple_product_text,
+    )
+    record(
+        "FazerCards unlink clears category/card supplier fields",
+        all(field in handle_callback_text for field in (
+            '"fazercards_category_id": ""',
+            '"fazercards_category_name": ""',
+            '"fazercards_card_id": ""',
+            '"fazercards_card_name": ""',
+            '"fazercards_price_usd": ""',
+            '"fazercards_stock": ""',
+        )),
     )
     record(
         "Apple ID user purchase remains manual with FazerCards status only",
