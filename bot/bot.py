@@ -74,7 +74,9 @@ def env_float(name: str, default: float, min_value: float | None = None, max_val
     return value
 
 
-USD_RUB_FALLBACK_RATE = env_float("USD_RUB_FALLBACK_RATE", 90, 30, 200)
+USD_RUB_MIN_RATE = env_float("USD_RUB_MIN_RATE", 50, 1, 500)
+USD_RUB_MAX_RATE = env_float("USD_RUB_MAX_RATE", 200, USD_RUB_MIN_RATE, 500)
+USD_RUB_FALLBACK_RATE = env_float("USD_RUB_FALLBACK_RATE", 90, USD_RUB_MIN_RATE, USD_RUB_MAX_RATE)
 USD_RUB_MARKUP_PERCENT = env_float("USD_RUB_MARKUP_PERCENT", 1.5, 0, 30)
 CARD_RATE_LOCK_SECONDS = 5 * 60
 
@@ -655,24 +657,43 @@ def is_card_payment_lock_active(lock: dict | None) -> bool:
     return bool(locked_until and locked_until > rate_lock_now())
 
 
-def extract_rate_from_text(text: str) -> float | None:
-    candidates = []
-    for raw in re.findall(r"(?<!\d)(\d{2,3}(?:[.,]\d{1,6})?)(?!\d)", text):
-        try:
-            value = float(raw.replace(",", "."))
-        except ValueError:
-            continue
-        if 30 <= value <= 200:
-            candidates.append(value)
-    return candidates[0] if candidates else None
-
-
 def normalize_rate(value) -> float | None:
     try:
         rate = float(value)
     except (TypeError, ValueError):
         return None
-    return rate if 30 <= rate <= 200 else None
+    return rate if USD_RUB_MIN_RATE <= rate <= USD_RUB_MAX_RATE else None
+
+
+def extract_rate_from_text(text: str) -> float | None:
+    """Extract a plausible USD/RUB quote from Yandex HTML/search snippets.
+
+    Yandex pages contain many unrelated values (dates, chart ranges, percents,
+    "30 days" labels). Prefer values that are located near currency markers and
+    always pass the shared USD/RUB bounds. If no confident value is found, return
+    None so the next structured provider can be tried.
+    """
+    clean_text = re.sub(r"<[^>]+>", " ", text)
+    clean_text = re.sub(r"\s+", " ", clean_text)
+    currency_context = re.compile(
+        r"(?i)(?:usd|доллар|доллара|доллар сша|\$)[^\d]{0,80}"
+        r"(\d{2,3}(?:[.,]\d{1,6})?)\s*(?:₽|руб|rub|rur)?|"
+        r"(\d{2,3}(?:[.,]\d{1,6})?)\s*(?:₽|руб|rub|rur)[^а-яa-z0-9]{0,80}"
+        r"(?:за|=|/)?\s*(?:1\s*)?(?:usd|доллар|доллара|доллар сша|\$)"
+    )
+    ignored_context = re.compile(r"(?i)(?:дн|день|дней|месяц|год|график|%|процент|январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)")
+    for match in currency_context.finditer(clean_text):
+        raw = next((group for group in match.groups() if group), None)
+        if not raw:
+            continue
+        context = clean_text[max(0, match.start() - 30):match.end() + 30]
+        if ignored_context.search(context):
+            continue
+        rate = normalize_rate(raw.replace(",", "."))
+        if rate is not None:
+            return rate
+        logger.warning("Источник Яндекс вернул невалидное значение: %s, пропущено", raw)
+    return None
 
 
 def normalize_percent(value) -> float | None:
@@ -690,12 +711,18 @@ async def fetch_yandex_usd_rub_rate(client: httpx.AsyncClient) -> float | None:
     ]
     headers = {"User-Agent": "Mozilla/5.0 SLIK-Mobile/1.0"}
     for url in urls:
-        response = await client.get(url, headers=headers)
+        try:
+            response = await client.get(url, headers=headers)
+        except Exception as e:
+            logger.warning("Не удалось получить страницу Яндекса USD/RUB: %s", e)
+            continue
         if response.status_code >= 400:
+            logger.warning("Яндекс USD/RUB вернул HTTP %s", response.status_code)
             continue
         rate = extract_rate_from_text(response.text)
-        if rate:
+        if rate is not None:
             return rate
+        logger.warning("Источник Яндекс не дал уверенного валидного курса USD/RUB, пропущено")
     return None
 
 
@@ -735,42 +762,44 @@ async def get_usd_rub_rate() -> tuple[float, str]:
     if manual_rate:
         return round(manual_rate, 4), "manual"
     providers = [
-        ("Яндекс", fetch_yandex_usd_rub_rate),
         ("ЦБ РФ", fetch_cbr_usd_rub_rate),
         ("open.er-api.com", fetch_open_er_usd_rub_rate),
         ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
+        ("Яндекс", fetch_yandex_usd_rub_rate),
     ]
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         for source, provider in providers:
             try:
                 rate = await provider(client)
-                if rate:
+                if rate is not None:
                     return round(rate, 4), source
+                logger.warning("Источник %s вернул невалидное значение, пропущено", source)
             except Exception as e:
                 logger.warning("Не удалось получить USD/RUB из %s: %s", source, e)
     logger.warning(
         "Не удалось получить USD/RUB из внешних источников; используется fallback %.2f",
         USD_RUB_FALLBACK_RATE,
     )
-    return USD_RUB_FALLBACK_RATE, "USD_RUB_FALLBACK_RATE"
+    return USD_RUB_FALLBACK_RATE, "fallback"
 
 
 async def check_market_usd_rub_rate() -> tuple[float, str]:
     providers = [
-        ("Яндекс", fetch_yandex_usd_rub_rate),
         ("ЦБ РФ", fetch_cbr_usd_rub_rate),
         ("open.er-api.com", fetch_open_er_usd_rub_rate),
         ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
+        ("Яндекс", fetch_yandex_usd_rub_rate),
     ]
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
         for source, provider in providers:
             try:
                 rate = await provider(client)
-                if rate:
+                if rate is not None:
                     return round(rate, 4), source
+                logger.warning("Источник %s вернул невалидное значение, пропущено", source)
             except Exception as e:
                 logger.warning("Не удалось проверить USD/RUB из %s: %s", source, e)
-    return USD_RUB_FALLBACK_RATE, "USD_RUB_FALLBACK_RATE"
+    return USD_RUB_FALLBACK_RATE, "fallback"
 
 
 async def refresh_usd_rub_rate_check() -> tuple[float, str]:
@@ -5021,7 +5050,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await edit_or_send(
             query, context,
-            "✏️ <b>Ручной курс USD/RUB</b>\n\nВведите курс числом от 30 до 200, например <code>92.5</code>.",
+            f"✏️ <b>Ручной курс USD/RUB</b>\n\nВведите курс числом от {USD_RUB_MIN_RATE:g} до {USD_RUB_MAX_RATE:g}, например <code>72.14</code>.",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_usd_rub")]]),
         )
     elif data == "usd_rub_reset_manual":

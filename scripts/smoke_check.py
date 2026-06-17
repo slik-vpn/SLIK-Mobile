@@ -268,6 +268,36 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "USD_RUB_MARKUP_PERCENT" in bot_text and "USD_RUB_MARKUP_PERCENT" in env_example_text,
     )
     record(
+        "USD/RUB min/max env exists",
+        all(token in bot_text and token in env_example_text for token in ("USD_RUB_MIN_RATE", "USD_RUB_MAX_RATE")),
+    )
+    record(
+        "normalize_rate rejects invalid 30 RUB rate",
+        "USD_RUB_MIN_RATE <= rate <= USD_RUB_MAX_RATE" in function_block(bot_text, "normalize_rate")
+        and "30 <= rate <= 200" not in function_block(bot_text, "normalize_rate"),
+    )
+    get_rate_text = function_block(bot_text, "get_usd_rub_rate")
+    check_market_text = function_block(bot_text, "check_market_usd_rub_rate")
+    record(
+        "Yandex parser is not the only mandatory USD/RUB source",
+        all(source in get_rate_text for source in ("ЦБ РФ", "open.er-api.com", "exchangerate.host", "Яндекс"))
+        and get_rate_text.find("ЦБ РФ") < get_rate_text.find("Яндекс"),
+    )
+    record(
+        "market rate check continues after provider returns None",
+        "if rate is not None:" in check_market_text and 'logger.warning("Источник %s вернул невалидное значение' in check_market_text,
+    )
+    record(
+        "USD/RUB fallback only after all providers fail",
+        check_market_text.rfind('return USD_RUB_FALLBACK_RATE, "fallback"') > check_market_text.rfind("for source, provider in providers"),
+    )
+    record(
+        "manual USD/RUB rate keeps payment priority",
+        "manual_rate = get_manual_usd_rub_rate()" in get_rate_text
+        and 'return round(manual_rate, 4), "manual"' in get_rate_text
+        and get_rate_text.find("manual_rate = get_manual_usd_rub_rate()") < get_rate_text.find("providers ="),
+    )
+    record(
         "USD/RUB markup env parsing is safe",
         "def env_float(" in bot_text and 'USD_RUB_MARKUP_PERCENT = env_float("USD_RUB_MARKUP_PERCENT", 1.5' in bot_text,
     )
