@@ -617,6 +617,89 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
             "/payments/create",
         )),
     )
+    apple_candidates_text = function_block(bot_text, "apple_giftcard_candidates")
+    apple_name_text = function_block(bot_text, "is_apple_itunes_fazercards_name")
+    record(
+        "App Store & iTunes (US) is recognized as Apple/iTunes candidate for US",
+        "app\\s*store" in bot_text
+        and "itunes" in bot_text.lower()
+        and "\\(\\s*us\\s*\\)" in bot_text
+        and "fazercards_name_has_region(name, region)" in apple_candidates_text,
+    )
+    record(
+        "App Store & iTunes (TR) is recognized as Apple/iTunes candidate for TR",
+        "app\\s*store" in bot_text
+        and "itunes" in bot_text.lower()
+        and "\\(\\s*tr\\s*\\)" in bot_text
+        and "türkiye" in bot_text.lower()
+        and "fazercards_name_has_region(name, region)" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes candidates are not rejected when amount is missing",
+        "if not fazercards_name_has_amount" not in apple_candidates_text
+        and "has_amount = fazercards_name_has_amount(name, amount)" in apple_candidates_text
+        and "if has_amount:" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes candidates no longer require gift/card terms",
+        '("gift" not in text and "card" not in text)' not in apple_candidates_text
+        and '("gift" not in text or "card" not in text)' not in apple_candidates_text
+        and "if not is_apple_itunes_fazercards_name(name):" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes mapping has no client.post",
+        "client.post" not in mapping_handlers_text,
+    )
+    record(
+        "FazerCards Apple/iTunes mapping has no purchase/order/create endpoints",
+        all(token not in mapping_handlers_text.lower() for token in ("/purchase", "/order", "/create")),
+    )
+    fazercards_value_text = function_block(bot_text, "fazercards_product_value")
+    handle_callback_text = function_block(bot_text, "handle_callback")
+    apple_region_text = function_block(bot_text, "apple_id_admin_region_text")
+    apple_product_text = function_block(bot_text, "apple_id_admin_product_text")
+    record(
+        "FazerCards ID extraction supports category and alternate identifiers",
+        all(field in fazercards_value_text for field in ("category_id", "categoryId", "slug", "code", "productId")),
+    )
+    record(
+        "FazerCards name extraction supports category labels",
+        all(field in fazercards_value_text for field in ("productName", "category_name", "categoryName", "label")),
+    )
+    record(
+        "FazerCards mapping cannot be saved with empty ID",
+        "if not item_id:" in handle_callback_text
+        and "FazerCards товар не содержит ID. Нельзя сохранить привязку для будущей выдачи." in handle_callback_text,
+    )
+    record(
+        "FazerCards item without ID shows available fields diagnostics",
+        "def fazercards_item_without_id_text" in bot_text
+        and "Доступные поля" in bot_text
+        and "Нельзя сохранить полноценную привязку без ID" in bot_text,
+    )
+    record(
+        "FazerCards category mapping type is saved",
+        '"fazercards_mapping_type": fazercards_mapping_type_for_item(product, item)' in handle_callback_text
+        and 'return "product" if fazercards_name_has_amount' in bot_text
+        and 'else "category"' in bot_text,
+    )
+    record(
+        "FazerCards category mapping displays separately from product mapping",
+        "FazerCards категория" in apple_region_text
+        and "FazerCards товар ✅" in apple_region_text
+        and "✅ Привязан как категория" in apple_product_text
+        and "✅ Привязан как товар" in apple_product_text,
+    )
+    record(
+        "FazerCards category mapping warns that nominal is not selected",
+        "Номинал не выбран. Для автовыдачи позже потребуется выбрать конкретный номинал/продукт." in apple_product_text
+        and "Это категория без номинала. Автовыдача пока отключена." in handle_callback_text,
+    )
+    record(
+        "FazerCards child items helper checks nested denomination fields",
+        "def extract_fazercards_child_items" in bot_text
+        and all(field in bot_text for field in ("items", "products", "children", "variants", "denominations", "values", "options")),
+    )
     record(
         "Apple ID user purchase remains manual with FazerCards status only",
         "create_apple_id_checkout_order" in bot_text

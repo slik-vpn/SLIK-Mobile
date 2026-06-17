@@ -5750,9 +5750,13 @@ def apple_id_admin_region_text(region: str) -> str:
     if not products:
         lines.append("— товаров нет")
     for product in products:
-        status = "✅" if product.get("enabled", True) else "⛔️"
-        mapping = "FazerCards ✅" if product.get("fazercards_product_id") else "не привязан"
-        lines.append(f"{status} {html_escape(apple_nominal_text(product))} — {html_escape(format_usd(product.get('price_usd')))} — {mapping}")
+        if product.get("fazercards_product_id"):
+            mapping = "FazerCards категория" if product.get("fazercards_mapping_type") == "category" else "FazerCards товар ✅"
+            mapping_icon = "⚠️" if product.get("fazercards_mapping_type") == "category" else "✅"
+        else:
+            mapping = "не привязан"
+            mapping_icon = "⚠️"
+        lines.append(f"{mapping_icon} {html_escape(apple_nominal_text(product))} — {html_escape(format_usd(product.get('price_usd')))} — {mapping}")
     return "\n".join(lines)
 
 
@@ -5766,13 +5770,26 @@ def apple_id_admin_region_keyboard(region: str) -> InlineKeyboardMarkup:
 def apple_id_admin_product_text(product: dict) -> str:
     region = product.get("region", "")
     if product.get("fazercards_product_id"):
-        mapping_text = (
-            "FazerCards:\n"
-            "✅ Привязан\n"
-            f"ID: <code>{html_escape(str(product.get('fazercards_product_id') or ''))}</code>\n"
-            f"Название: {html_escape(str(product.get('fazercards_product_name') or '—'))}\n"
-            f"Последняя проверка: {html_escape(str(product.get('fazercards_last_seen') or '—'))}"
-        )
+        mapping_type = str(product.get("fazercards_mapping_type") or "product")
+        if mapping_type == "category":
+            mapping_text = (
+                "FazerCards:\n"
+                "✅ Привязан как категория\n"
+                f"ID: <code>{html_escape(str(product.get('fazercards_product_id') or ''))}</code>\n"
+                f"Название: {html_escape(str(product.get('fazercards_product_name') or '—'))}\n"
+                "Тип: категория\n"
+                "⚠️ Номинал не выбран. Для автовыдачи позже потребуется выбрать конкретный номинал/продукт.\n"
+                f"Последняя проверка: {html_escape(str(product.get('fazercards_last_seen') or '—'))}"
+            )
+        else:
+            mapping_text = (
+                "FazerCards:\n"
+                "✅ Привязан как товар\n"
+                f"ID: <code>{html_escape(str(product.get('fazercards_product_id') or ''))}</code>\n"
+                f"Название: {html_escape(str(product.get('fazercards_product_name') or '—'))}\n"
+                "Тип: товар\n"
+                f"Последняя проверка: {html_escape(str(product.get('fazercards_last_seen') or '—'))}"
+            )
     else:
         mapping_text = "FazerCards:\n⚠️ Не привязан"
     return (
@@ -5811,8 +5828,12 @@ def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
 
 def fazercards_product_value(item: dict, key: str) -> str:
     aliases = {
-        "id": ("supplier_product_id", "product_id", "id", "sku"),
-        "name": ("name", "title", "product_name"),
+        "id": (
+            "id", "uuid", "slug", "code", "sku",
+            "product_id", "productId", "supplier_product_id", "supplierProductId",
+            "category_id", "categoryId", "service_id", "serviceId", "item_id", "itemId",
+        ),
+        "name": ("name", "title", "product_name", "productName", "category_name", "categoryName", "label"),
     }
     for field in aliases[key]:
         value = item.get(field)
@@ -5821,25 +5842,100 @@ def fazercards_product_value(item: dict, key: str) -> str:
     return ""
 
 
+FAZERCARDS_CHILD_ITEM_FIELDS = ("items", "products", "children", "variants", "denominations", "values", "options")
+
+
+def extract_fazercards_child_items(item: dict) -> list[dict]:
+    children = []
+    if not isinstance(item, dict):
+        return children
+    for field in FAZERCARDS_CHILD_ITEM_FIELDS:
+        value = item.get(field)
+        if isinstance(value, list):
+            children.extend(child for child in value if isinstance(child, dict))
+        elif isinstance(value, dict):
+            nested_items = value.get("items") if isinstance(value.get("items"), list) else value.get("products")
+            if isinstance(nested_items, list):
+                children.extend(child for child in nested_items if isinstance(child, dict))
+    return children
+
+
+def fazercards_item_field_names(item: dict) -> list[str]:
+    if not isinstance(item, dict):
+        return []
+    return sorted(str(key) for key in item.keys())
+
+
+def fazercards_item_without_id_text(item: dict) -> str:
+    fields = fazercards_item_field_names(item)
+    fields_text = "\n".join(f"• {html_escape(field)}" for field in fields) if fields else "—"
+    name = fazercards_product_value(item, "name") or "—"
+    return (
+        "⚠️ FazerCards вернул товар без ID.\n\n"
+        "Доступные поля:\n"
+        f"{fields_text}\n\n"
+        "Название:\n"
+        f"{html_escape(name)}\n\n"
+        "Нельзя сохранить полноценную привязку без ID."
+    )
+
+
+def fazercards_mapping_type_for_item(product: dict, item: dict) -> str:
+    raw_amount = float(product.get("amount", 0) or 0)
+    amount = str(int(raw_amount)) if raw_amount.is_integer() else str(product.get("amount", ""))
+    return "product" if fazercards_name_has_amount(fazercards_product_value(item, "name"), amount) else "category"
+
+
+APPLE_ITUNES_PATTERNS = (
+    r"\bapple\b",
+    r"\bitunes\b",
+    r"\bapp\s*store\b",
+    r"\bappstore\b",
+    r"\bapp\s*store\s*(?:&|and)\s*itunes\b",
+)
+
+APPLE_REGION_PATTERNS = {
+    "US": (r"\(\s*us\s*\)", r"\bus\b", r"\busa\b", r"\bunited\s+states\b", r"\busd\b"),
+    "TR": (r"\(\s*tr\s*\)", r"\btr\b", r"\bturkey\b", r"\btürkiye\b", r"\btry\b", r"\btl\b", r"₺"),
+}
+
+
+def is_apple_itunes_fazercards_name(name: str) -> bool:
+    text = str(name or "").lower()
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in APPLE_ITUNES_PATTERNS)
+
+
+def fazercards_name_has_region(name: str, region: str) -> bool:
+    text = str(name or "").lower()
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in APPLE_REGION_PATTERNS.get(region, ()))
+
+
+def fazercards_name_has_amount(name: str, amount: str) -> bool:
+    if not amount:
+        return False
+    return bool(re.search(rf"(?<!\d){re.escape(amount)}(?!\d)", str(name or "")))
+
+
 def apple_giftcard_candidates(product: dict, items: list[dict], limit: int = 8, offset: int = 0) -> tuple[list[dict], bool]:
-    amount = str(int(product.get("amount", 0))) if float(product.get("amount", 0) or 0).is_integer() else str(product.get("amount", ""))
-    region_terms = ("us", "usa", "united states", "usd") if product.get("region") == "US" else ("turkey", "tr", "try", "tl", "₺")
+    raw_amount = float(product.get("amount", 0) or 0)
+    amount = str(int(raw_amount)) if raw_amount.is_integer() else str(product.get("amount", ""))
+    region = str(product.get("region") or "")
     scored = []
     for item in items:
         if not isinstance(item, dict):
             continue
         name = fazercards_product_value(item, "name")
-        text = name.lower()
-        if "apple" not in text or ("gift" not in text and "card" not in text):
+        if not is_apple_itunes_fazercards_name(name):
             continue
-        score = 1
-        if any(term in text for term in region_terms):
-            score += 3
-        if re.search(rf"(?<!\d){re.escape(amount)}(?!\d)", text):
+        if not fazercards_name_has_region(name, region):
+            continue
+        has_amount = fazercards_name_has_amount(name, amount)
+        score = 8
+        if has_amount:
             score += 4
-        scored.append((score, name, item))
-    scored.sort(key=lambda row: (-row[0], row[1].lower()))
-    return [item for _score, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][0] >= 8)
+        scored.append((score, 0 if has_amount else 1, name, item))
+    scored.sort(key=lambda row: (-row[0], row[1], row[2].lower()))
+    return [item for _score, _missing_amount, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][1] == 0)
 
 
 def fazercards_select_text(product: dict, exact_match: bool, error: str = "") -> str:
@@ -6513,15 +6609,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not product or not item:
             await query.answer("Товар не найден. Откройте привязку заново.", show_alert=True)
             return
-        context.user_data[f"fazercards_selected:{product_id}"] = item
+        child_items = extract_fazercards_child_items(item)
+        if child_items:
+            context.user_data[f"fazercards_candidates:{product_id}"] = child_items
+            await query.answer("Выберите номинал внутри категории")
+            await edit_or_send(
+                query,
+                context,
+                f"Выберите вложенный товар/номинал FazerCards для:\n<b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>",
+                fazercards_select_keyboard(product_id, child_items[:8], 0, len(child_items) > 8),
+            )
+            return
         item_id = fazercards_product_value(item, "id")
         item_name = fazercards_product_value(item, "name")
+        if not item_id:
+            await query.answer("FazerCards товар без ID", show_alert=True)
+            await edit_or_send(
+                query,
+                context,
+                fazercards_item_without_id_text(item),
+                InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]),
+            )
+            return
+        context.user_data[f"fazercards_selected:{product_id}"] = item
+        mapping_type = fazercards_mapping_type_for_item(product, item)
+        type_title = "товар" if mapping_type == "product" else "категория"
+        nominal_warning = ""
+        if mapping_type == "category":
+            nominal_warning = (
+                "\n\n⚠️ Это категория без номинала. Автовыдача пока отключена. "
+                "Для будущей автовыдачи нужно будет уточнить endpoint получения номиналов внутри категории."
+            )
         text = (
             "Привязать товар?\n\n"
             f"Наш товар:\n<b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>\n\n"
             "FazerCards:\n"
             f"ID: <code>{html_escape(item_id)}</code>\n"
-            f"Название: {html_escape(item_name)}"
+            f"Название: {html_escape(item_name)}\n"
+            f"Тип: {type_title}"
+            f"{nominal_warning}"
         )
         await query.answer()
         await edit_or_send(query, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Привязать", callback_data=f"admin_apple_id_fazer_confirm:{product_id}")], [InlineKeyboardButton("❌ Отмена", callback_data=f"admin_apple_id_product:{product_id}")]]))
@@ -6535,9 +6661,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not product or not item:
             await query.answer("Товар не найден. Откройте привязку заново.", show_alert=True)
             return
+        item_id = fazercards_product_value(item, "id")
+        if not item_id:
+            await query.answer("FazerCards товар не содержит ID.", show_alert=True)
+            await edit_or_send(
+                query,
+                context,
+                "FazerCards товар не содержит ID. Нельзя сохранить привязку для будущей выдачи.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]),
+            )
+            return
         product = set_apple_id_product(product_id, {
-            "fazercards_product_id": fazercards_product_value(item, "id"),
+            "fazercards_product_id": item_id,
             "fazercards_product_name": fazercards_product_value(item, "name"),
+            "fazercards_mapping_type": fazercards_mapping_type_for_item(product, item),
             "fazercards_last_seen": fazercards_checked_at(),
             "fazercards_available": True,
         })
@@ -6563,6 +6700,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "fazercards_product_name": "",
             "fazercards_last_seen": "",
             "fazercards_available": None,
+            "fazercards_mapping_type": "",
         })
         if not product:
             await query.answer("Товар не найден.", show_alert=True)
