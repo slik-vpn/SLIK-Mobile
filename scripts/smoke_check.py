@@ -392,6 +392,25 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "if not has_owner_access(query.from_user)" in function_block(bot_text, "show_admin_admins"),
     )
     record(
+        "legacy username admin entries are represented in administrators UI",
+        "legacy_username|admins|" in bot_text
+        and "legacy_username|managers|" in bot_text
+        and "legacy username" in bot_text
+        and "remove_admin_access(user_id)" in bot_text,
+    )
+    record(
+        "legacy username role changes show Telegram ID limitation",
+        "Для изменения роли legacy username-пользователя" in bot_text
+        and 'user_id.startswith("legacy_username|")' in bot_text,
+    )
+    record(
+        "admin management cancel clears pending input",
+        "admin_admins_cancel" in bot_text
+        and "def clear_admin_management_state(" in bot_text
+        and "context.user_data.pop(\"client_input\", None)" in function_block(bot_text, "clear_admin_management_state")
+        and "admin_management_" in function_block(bot_text, "clear_admin_management_state"),
+    )
+    record(
         "role constants keep USER/MANAGER/ADMIN/OWNER names",
         all(token in bot_text for token in (
             'ROLE_USER = "USER"',

@@ -4912,11 +4912,26 @@ def admin_role_from_profile(profile: dict) -> str:
 
 
 def admin_display_name(user_id: str, profile: dict) -> str:
+    if profile.get("legacy_username"):
+        return f"@{profile['legacy_username']}"
     username = str(profile.get("username") or "").strip().lstrip("@")
     full_name = str(profile.get("full_name") or "").strip()
     if username:
         return f"@{username}"
     return full_name or "Без имени"
+
+
+def admin_identifier_text(user_id: str, profile: dict) -> str:
+    if profile.get("legacy_username"):
+        return "legacy username"
+    return f"<code>{html_escape(user_id)}</code>"
+
+
+def admin_target_label(user_id: str) -> str:
+    if user_id.startswith("legacy_username|"):
+        _prefix, _config_key, username = user_id.split("|", 2)
+        return f"@{html_escape(username)}"
+    return f"<code>{html_escape(user_id)}</code>"
 
 
 def list_admin_users() -> list[tuple[str, dict, str]]:
@@ -4930,11 +4945,17 @@ def list_admin_users() -> list[tuple[str, dict, str]]:
         if role:
             admins[str(user_id)] = (profile, role)
     for entry in cfg.get("admins", []):
-        if str(entry).isdigit():
-            admins.setdefault(str(entry), (users.get(str(entry), {}) if isinstance(users.get(str(entry)), dict) else {"telegram_id": int(entry)}, ROLE_ADMIN))
+        entry_text = str(entry).strip().lstrip("@")
+        if entry_text.isdigit():
+            admins.setdefault(entry_text, (users.get(entry_text, {}) if isinstance(users.get(entry_text), dict) else {"telegram_id": int(entry_text)}, ROLE_ADMIN))
+        elif entry_text:
+            admins.setdefault(f"legacy_username|admins|{entry_text}", ({"legacy_username": entry_text}, ROLE_ADMIN))
     for entry in cfg.get("managers", []):
-        if str(entry).isdigit() and str(entry) not in admins:
-            admins[str(entry)] = (users.get(str(entry), {}) if isinstance(users.get(str(entry)), dict) else {"telegram_id": int(entry)}, ROLE_MANAGER)
+        entry_text = str(entry).strip().lstrip("@")
+        if entry_text.isdigit() and entry_text not in admins:
+            admins[entry_text] = (users.get(entry_text, {}) if isinstance(users.get(entry_text), dict) else {"telegram_id": int(entry_text)}, ROLE_MANAGER)
+        elif entry_text:
+            admins.setdefault(f"legacy_username|managers|{entry_text}", ({"legacy_username": entry_text}, ROLE_MANAGER))
     return sorted((user_id, profile, role) for user_id, (profile, role) in admins.items())
 
 
@@ -4980,6 +5001,27 @@ def set_stored_user_role(user_id: str, role: str) -> None:
     save_config(cfg)
 
 
+def remove_admin_access(user_id: str) -> None:
+    if user_id.startswith("legacy_username|"):
+        _prefix, config_key, username = user_id.split("|", 2)
+        cfg = load_config()
+        cfg[config_key] = [
+            entry for entry in cfg.get(config_key, [])
+            if str(entry).strip().lstrip("@").lower() != username.lower()
+        ]
+        save_config(cfg)
+        return
+    set_stored_user_role(user_id, ROLE_USER)
+
+
+def clear_admin_management_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("client_input") == ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID:
+        context.user_data.pop("client_input", None)
+    for key in list(context.user_data.keys()):
+        if str(key).startswith("admin_management_"):
+            context.user_data.pop(key, None)
+
+
 def admin_management_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_admins_add")],
@@ -5005,7 +5047,7 @@ def admin_management_text() -> str:
     admins = list_admin_users()
     if admins:
         for index, (user_id, profile, role) in enumerate(admins, 1):
-            lines.append(f"{index}. {html_escape(admin_display_name(user_id, profile))} — {role} — <code>{html_escape(user_id)}</code>")
+            lines.append(f"{index}. {html_escape(admin_display_name(user_id, profile))} — {role} — {admin_identifier_text(user_id, profile)}")
     else:
         lines.append("• Дополнительные пользователи не найдены.")
     lines.extend(["", "Выберите действие:"])
@@ -5025,14 +5067,14 @@ def admin_role_keyboard(action: str, user_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(role, callback_data=f"admin_admins_role:{action}:{user_id}:{role}")]
         for role in ADMIN_MANAGEMENT_ROLES
-    ] + [[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins")]])
+    ] + [[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")]])
 
 
 def admin_confirm_keyboard(action: str, user_id: str, role: str = "") -> InlineKeyboardMarkup:
     suffix = f":{role}" if role else ""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Подтвердить", callback_data=f"admin_admins_confirm:{action}:{user_id}{suffix}")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="admin_admins")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")],
     ])
 
 
@@ -5395,6 +5437,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             broadcast_menu_keyboard(),
         )
     elif data == "admin_admins":
+        clear_admin_management_state(context)
         await show_admin_admins(update, context)
     elif data == "admin_admins_add":
         context.user_data["client_input"] = ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID
@@ -5403,8 +5446,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             query,
             context,
             "➕ <b>Добавить администратора</b>\n\nВведите Telegram ID пользователя, которого нужно добавить.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins")]]),
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")]]),
         )
+    elif data == "admin_admins_cancel":
+        clear_admin_management_state(context)
+        await query.answer("Отменено.")
+        await edit_or_send(query, context, admin_management_text(), admin_management_keyboard())
     elif data == "admin_admins_change_role":
         await query.answer()
         await edit_or_send(query, context, "Выберите пользователя:", admin_user_list_keyboard("change"))
@@ -5422,10 +5469,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await edit_or_send(
                 query,
                 context,
-                f"Удалить права администратора у пользователя <code>{html_escape(user_id)}</code>?",
+                f"Удалить права администратора у пользователя {admin_target_label(user_id)}?",
                 admin_confirm_keyboard("remove", user_id),
             )
         else:
+            if user_id.startswith("legacy_username|"):
+                await query.answer("Нужен Telegram ID.", show_alert=True)
+                await edit_or_send(
+                    query,
+                    context,
+                    "Для изменения роли legacy username-пользователя попросите его открыть бота и нажать /start, затем добавьте его по Telegram ID.",
+                    admin_management_keyboard(),
+                )
+                return
             await query.answer()
             await edit_or_send(query, context, "Выберите роль:", admin_role_keyboard("change", user_id))
     elif data.startswith("admin_admins_role:"):
@@ -5458,6 +5514,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.answer("Нельзя снять роль с последнего OWNER.", show_alert=True)
                 return
             set_stored_user_role(user_id, role)
+            clear_admin_management_state(context)
             await query.answer("Роль сохранена.")
             await edit_or_send(
                 query,
@@ -5469,12 +5526,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if current_role == ROLE_OWNER and count_owner_roles(exclude_user_id=user_id) < 1:
                 await query.answer("Нельзя удалить последнего OWNER.", show_alert=True)
                 return
-            set_stored_user_role(user_id, ROLE_USER)
+            remove_admin_access(user_id)
+            clear_admin_management_state(context)
             await query.answer("Права удалены.")
             await edit_or_send(
                 query,
                 context,
-                f"✅ Права администратора у пользователя <code>{html_escape(user_id)}</code> удалены.",
+                f"✅ Права администратора у пользователя {admin_target_label(user_id)} удалены.",
                 admin_management_keyboard(),
             )
     elif data == "admin_payments":
