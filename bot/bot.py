@@ -322,6 +322,8 @@ PAYMENT_ADMIN_INPUT_TITLE = "payment_title"
 PAYMENT_ADMIN_INPUT_CREDENTIALS = "payment_credentials"
 USD_RUB_INPUT_MANUAL_RATE = "usd_rub_manual_rate"
 USD_RUB_INPUT_MARKUP = "usd_rub_markup"
+ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
+ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
 
 
 def runtime_default_value(path: Path):
@@ -1423,11 +1425,20 @@ def get_user_role(user) -> str:
         return ROLE_ADMIN
     if _user_in_config_list(user, "managers"):
         return ROLE_MANAGER
+    users = load_users()
+    profile = users.get(str(getattr(user, "id", "")))
+    role = str(profile.get("role", "")).upper() if isinstance(profile, dict) else ""
+    if role in {ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER, ROLE_USER}:
+        return role
     return ROLE_USER
 
 
 def has_admin_access(user) -> bool:
     return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER}
+
+
+def has_owner_access(user) -> bool:
+    return get_user_role(user) == ROLE_OWNER
 
 
 def has_backup_access(user) -> bool:
@@ -2913,6 +2924,8 @@ def admin_service_sections_keyboard(user=None) -> InlineKeyboardMarkup:
     if has_backup_access(user):
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
+    if has_owner_access(user):
+        rows.append([InlineKeyboardButton("👤 Администраторы", callback_data="admin_admins")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
@@ -4174,6 +4187,20 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         await deny_admin_access(update)
         return
 
+    if input_mode == ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID:
+        if not has_owner_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        telegram_id = msg.text.strip()
+        if not telegram_id.isdigit():
+            await msg.reply_text("Введите числовой Telegram ID.", parse_mode="HTML")
+            return
+        context.user_data.pop("client_input", None)
+        context.user_data["admin_management_target_id"] = telegram_id
+        await msg.reply_text("Выберите роль:", reply_markup=admin_role_keyboard("add", telegram_id))
+        return
+
     if input_mode == NOTIFICATION_CHAT_INPUT:
         kind = str(context.user_data.get("notification_chat_kind") or "")
         if kind not in NOTIFICATION_CHAT_META:
@@ -4874,7 +4901,181 @@ def admin_service_sections_text(user) -> str:
     ]
     if has_backup_access(user):
         lines.extend(["• 🩺 Проверка системы", "• 💾 Бэкапы"])
+    if has_owner_access(user):
+        lines.append("• 👤 Администраторы")
     return "\n".join(lines)
+
+
+def admin_role_from_profile(profile: dict) -> str:
+    role = str(profile.get("role", "")).upper()
+    return role if role in {ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER} else ""
+
+
+def admin_display_name(user_id: str, profile: dict) -> str:
+    if profile.get("legacy_username"):
+        return f"@{profile['legacy_username']}"
+    username = str(profile.get("username") or "").strip().lstrip("@")
+    full_name = str(profile.get("full_name") or "").strip()
+    if username:
+        return f"@{username}"
+    return full_name or "Без имени"
+
+
+def admin_identifier_text(user_id: str, profile: dict) -> str:
+    if profile.get("legacy_username"):
+        return "legacy username"
+    return f"<code>{html_escape(user_id)}</code>"
+
+
+def admin_target_label(user_id: str) -> str:
+    if user_id.startswith("legacy_username|"):
+        _prefix, _config_key, username = user_id.split("|", 2)
+        return f"@{html_escape(username)}"
+    return f"<code>{html_escape(user_id)}</code>"
+
+
+def list_admin_users() -> list[tuple[str, dict, str]]:
+    users = load_users()
+    cfg = load_config()
+    admins: dict[str, tuple[dict, str]] = {}
+    for user_id, profile in users.items():
+        if not isinstance(profile, dict):
+            continue
+        role = admin_role_from_profile(profile)
+        if role:
+            admins[str(user_id)] = (profile, role)
+    for entry in cfg.get("admins", []):
+        entry_text = str(entry).strip().lstrip("@")
+        if entry_text.isdigit():
+            admins.setdefault(entry_text, (users.get(entry_text, {}) if isinstance(users.get(entry_text), dict) else {"telegram_id": int(entry_text)}, ROLE_ADMIN))
+        elif entry_text:
+            admins.setdefault(f"legacy_username|admins|{entry_text}", ({"legacy_username": entry_text}, ROLE_ADMIN))
+    for entry in cfg.get("managers", []):
+        entry_text = str(entry).strip().lstrip("@")
+        if entry_text.isdigit() and entry_text not in admins:
+            admins[entry_text] = (users.get(entry_text, {}) if isinstance(users.get(entry_text), dict) else {"telegram_id": int(entry_text)}, ROLE_MANAGER)
+        elif entry_text:
+            admins.setdefault(f"legacy_username|managers|{entry_text}", ({"legacy_username": entry_text}, ROLE_MANAGER))
+    return sorted((user_id, profile, role) for user_id, (profile, role) in admins.items())
+
+
+def count_owner_roles(exclude_user_id: str | None = None) -> int:
+    count = 1  # OWNER_USERNAME is the immutable primary owner.
+    for user_id, _profile, role in list_admin_users():
+        if role == ROLE_OWNER and str(user_id) != str(exclude_user_id or ""):
+            count += 1
+    return count
+
+
+def set_stored_user_role(user_id: str, role: str) -> None:
+    users = load_users()
+    profile = users.get(str(user_id))
+    if not isinstance(profile, dict):
+        profile = {
+            "telegram_id": int(user_id),
+            "username": "",
+            "full_name": "",
+            "created_at": now_str(),
+            "orders_count": 0,
+            "total_spent": 0,
+            "bonus_balance": 0,
+            "slik_balance": 0,
+            "referrals": [],
+            "referral_clicks": 0,
+            "referrer": None,
+            "referral_bonus_awarded": False,
+            "new_client_notified": False,
+            "status": "Traveller",
+        }
+    profile["telegram_id"] = int(user_id)
+    profile["role"] = role
+    users[str(user_id)] = profile
+    save_users(users)
+    cfg = load_config()
+    for key in ("admins", "managers"):
+        cfg[key] = [entry for entry in cfg.get(key, []) if str(entry) != str(user_id)]
+    if role == ROLE_ADMIN:
+        cfg.setdefault("admins", []).append(str(user_id))
+    elif role == ROLE_MANAGER:
+        cfg.setdefault("managers", []).append(str(user_id))
+    save_config(cfg)
+
+
+def remove_admin_access(user_id: str) -> None:
+    if user_id.startswith("legacy_username|"):
+        _prefix, config_key, username = user_id.split("|", 2)
+        cfg = load_config()
+        cfg[config_key] = [
+            entry for entry in cfg.get(config_key, [])
+            if str(entry).strip().lstrip("@").lower() != username.lower()
+        ]
+        save_config(cfg)
+        return
+    set_stored_user_role(user_id, ROLE_USER)
+
+
+def clear_admin_management_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get("client_input") == ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID:
+        context.user_data.pop("client_input", None)
+    for key in list(context.user_data.keys()):
+        if str(key).startswith("admin_management_"):
+            context.user_data.pop(key, None)
+
+
+def admin_management_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Добавить администратора", callback_data="admin_admins_add")],
+        [InlineKeyboardButton("🔁 Изменить роль", callback_data="admin_admins_change_role")],
+        [InlineKeyboardButton("➖ Удалить администратора", callback_data="admin_admins_remove")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_service_sections")],
+    ])
+
+
+def admin_management_text() -> str:
+    lines = [
+        "👤 <b>Администраторы</b>",
+        "",
+        "Здесь можно управлять доступами к админ-панели.",
+        "",
+        "Роли:",
+        "• OWNER — полный доступ и управление администраторами",
+        "• ADMIN — доступ к админ-панели без управления владельцами",
+        "• MANAGER — ограниченный рабочий доступ",
+        "",
+        "Текущие пользователи с правами:",
+    ]
+    admins = list_admin_users()
+    if admins:
+        for index, (user_id, profile, role) in enumerate(admins, 1):
+            lines.append(f"{index}. {html_escape(admin_display_name(user_id, profile))} — {role} — {admin_identifier_text(user_id, profile)}")
+    else:
+        lines.append("• Дополнительные пользователи не найдены.")
+    lines.extend(["", "Выберите действие:"])
+    return "\n".join(lines)
+
+
+def admin_user_list_keyboard(action: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"{admin_display_name(user_id, profile)} — {role}", callback_data=f"admin_admins_select:{action}:{user_id}")]
+        for user_id, profile, role in list_admin_users()
+    ]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_admins")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_role_keyboard(action: str, user_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(role, callback_data=f"admin_admins_role:{action}:{user_id}:{role}")]
+        for role in ADMIN_MANAGEMENT_ROLES
+    ] + [[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")]])
+
+
+def admin_confirm_keyboard(action: str, user_id: str, role: str = "") -> InlineKeyboardMarkup:
+    suffix = f":{role}" if role else ""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"admin_admins_confirm:{action}:{user_id}{suffix}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")],
+    ])
 
 
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4982,6 +5183,15 @@ async def show_admin_backups(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await edit_or_send(query, context, build_backups_dashboard(), backups_keyboard())
 
 
+async def show_admin_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_owner_access(query.from_user):
+        await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+        return
+    await query.answer()
+    await edit_or_send(query, context, admin_management_text(), admin_management_keyboard())
+
+
 async def show_admin_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not has_admin_access(query.from_user):
@@ -5065,6 +5275,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "backup_restore_latest",
     }
     broadcast_callbacks = {"admin_news", "broadcast_send", "broadcast_cancel"}
+    owner_callbacks = ("admin_admins",)
     admin_prefixes = (
         "admin_",
         "usd_rub_",
@@ -5087,7 +5298,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "payment_instructions:",
         "payment_edit_",
     )
-    if data in backup_callbacks and not has_backup_access(query.from_user):
+    if data.startswith(owner_callbacks) and not has_owner_access(query.from_user):
+        await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+    elif data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
     elif (data in broadcast_callbacks or data.startswith(("broadcast_cat:", "broadcast_compose:"))) and not has_broadcast_access(query.from_user):
         await deny_admin_access(update)
@@ -5223,6 +5436,105 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Ошибок: <b>{failed}</b>",
             broadcast_menu_keyboard(),
         )
+    elif data == "admin_admins":
+        clear_admin_management_state(context)
+        await show_admin_admins(update, context)
+    elif data == "admin_admins_add":
+        context.user_data["client_input"] = ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID
+        await query.answer()
+        await edit_or_send(
+            query,
+            context,
+            "➕ <b>Добавить администратора</b>\n\nВведите Telegram ID пользователя, которого нужно добавить.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="admin_admins_cancel")]]),
+        )
+    elif data == "admin_admins_cancel":
+        clear_admin_management_state(context)
+        await query.answer("Отменено.")
+        await edit_or_send(query, context, admin_management_text(), admin_management_keyboard())
+    elif data == "admin_admins_change_role":
+        await query.answer()
+        await edit_or_send(query, context, "Выберите пользователя:", admin_user_list_keyboard("change"))
+    elif data == "admin_admins_remove":
+        await query.answer()
+        await edit_or_send(query, context, "Выберите пользователя:", admin_user_list_keyboard("remove"))
+    elif data.startswith("admin_admins_select:"):
+        _prefix, action, user_id = data.split(":", 2)
+        if action == "remove":
+            role = next((role for selected_id, _profile, role in list_admin_users() if selected_id == user_id), "")
+            if role == ROLE_OWNER:
+                await query.answer("Проверьте удаление OWNER внимательно.", show_alert=True)
+            else:
+                await query.answer()
+            await edit_or_send(
+                query,
+                context,
+                f"Удалить права администратора у пользователя {admin_target_label(user_id)}?",
+                admin_confirm_keyboard("remove", user_id),
+            )
+        else:
+            if user_id.startswith("legacy_username|"):
+                await query.answer("Нужен Telegram ID.", show_alert=True)
+                await edit_or_send(
+                    query,
+                    context,
+                    "Для изменения роли legacy username-пользователя попросите его открыть бота и нажать /start, затем добавьте его по Telegram ID.",
+                    admin_management_keyboard(),
+                )
+                return
+            await query.answer()
+            await edit_or_send(query, context, "Выберите роль:", admin_role_keyboard("change", user_id))
+    elif data.startswith("admin_admins_role:"):
+        _prefix, action, user_id, role = data.split(":", 3)
+        if role not in ADMIN_MANAGEMENT_ROLES:
+            await query.answer("Роль не найдена.", show_alert=True)
+            return
+        if role == ROLE_OWNER:
+            await query.answer("OWNER получает полный доступ, включая управление администраторами.", show_alert=True)
+        else:
+            await query.answer()
+        verb = "Добавить пользователя" if action == "add" else "Изменить роль пользователя"
+        tail = f"с ролью {role}" if action == "add" else f"на {role}"
+        await edit_or_send(
+            query,
+            context,
+            f"{verb} <code>{html_escape(user_id)}</code> {tail}?",
+            admin_confirm_keyboard(action, user_id, role),
+        )
+    elif data.startswith("admin_admins_confirm:"):
+        parts = data.split(":")
+        action, user_id = parts[1], parts[2]
+        role = parts[3] if len(parts) > 3 else ""
+        current_role = next((admin_role for selected_id, _profile, admin_role in list_admin_users() if selected_id == user_id), "")
+        if action in {"change", "add"}:
+            if role not in ADMIN_MANAGEMENT_ROLES:
+                await query.answer("Роль не найдена.", show_alert=True)
+                return
+            if current_role == ROLE_OWNER and role != ROLE_OWNER and count_owner_roles(exclude_user_id=user_id) < 1:
+                await query.answer("Нельзя снять роль с последнего OWNER.", show_alert=True)
+                return
+            set_stored_user_role(user_id, role)
+            clear_admin_management_state(context)
+            await query.answer("Роль сохранена.")
+            await edit_or_send(
+                query,
+                context,
+                f"✅ Пользователь <code>{html_escape(user_id)}</code> назначен {role}.",
+                admin_management_keyboard(),
+            )
+        elif action == "remove":
+            if current_role == ROLE_OWNER and count_owner_roles(exclude_user_id=user_id) < 1:
+                await query.answer("Нельзя удалить последнего OWNER.", show_alert=True)
+                return
+            remove_admin_access(user_id)
+            clear_admin_management_state(context)
+            await query.answer("Права удалены.")
+            await edit_or_send(
+                query,
+                context,
+                f"✅ Права администратора у пользователя {admin_target_label(user_id)} удалены.",
+                admin_management_keyboard(),
+            )
     elif data == "admin_payments":
         await show_admin_payments(update, context)
     elif data == "admin_usd_rub":

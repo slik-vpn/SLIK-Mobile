@@ -365,6 +365,75 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "💳 Оплата и курс" in admin_panel_keyboard_text
         and "🛠 Сервис" in admin_panel_keyboard_text,
     )
+    service_keyboard_text = function_block(bot_text, "admin_service_sections_keyboard")
+    service_text_block = function_block(bot_text, "admin_service_sections_text")
+    admin_management_text = function_block(bot_text, "admin_management_text")
+    record(
+        "service section contains owner-only administrators button",
+        "👤 Администраторы" in service_keyboard_text
+        and "admin_admins" in service_keyboard_text
+        and "has_owner_access(user)" in service_keyboard_text,
+    )
+    record(
+        "administrators screen callback and handlers exist",
+        all(token in bot_text for token in (
+            "admin_admins_add",
+            "admin_admins_change_role",
+            "admin_admins_remove",
+            "show_admin_admins",
+            "ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID",
+        )),
+    )
+    record(
+        "administrators management is restricted to OWNER",
+        "def has_owner_access(user)" in bot_text
+        and 'get_user_role(user) == ROLE_OWNER' in bot_text
+        and 'data.startswith(owner_callbacks) and not has_owner_access(query.from_user)' in bot_text
+        and "if not has_owner_access(query.from_user)" in function_block(bot_text, "show_admin_admins"),
+    )
+    record(
+        "legacy username admin entries are represented in administrators UI",
+        "legacy_username|admins|" in bot_text
+        and "legacy_username|managers|" in bot_text
+        and "legacy username" in bot_text
+        and "remove_admin_access(user_id)" in bot_text,
+    )
+    record(
+        "legacy username role changes show Telegram ID limitation",
+        "Для изменения роли legacy username-пользователя" in bot_text
+        and 'user_id.startswith("legacy_username|")' in bot_text,
+    )
+    record(
+        "admin management cancel clears pending input",
+        "admin_admins_cancel" in bot_text
+        and "def clear_admin_management_state(" in bot_text
+        and "context.user_data.pop(\"client_input\", None)" in function_block(bot_text, "clear_admin_management_state")
+        and "admin_management_" in function_block(bot_text, "clear_admin_management_state"),
+    )
+    record(
+        "role constants keep USER/MANAGER/ADMIN/OWNER names",
+        all(token in bot_text for token in (
+            'ROLE_USER = "USER"',
+            'ROLE_MANAGER = "MANAGER"',
+            'ROLE_ADMIN = "ADMIN"',
+            'ROLE_OWNER = "OWNER"',
+        )),
+    )
+    record(
+        "administrators screen lists MANAGER/ADMIN/OWNER roles",
+        all(role in admin_management_text for role in ("OWNER —", "ADMIN —", "MANAGER —"))
+        and "list_admin_users()" in admin_management_text,
+    )
+    record(
+        "last OWNER is protected from demotion and removal",
+        "count_owner_roles(exclude_user_id=user_id) < 1" in bot_text
+        and "Нельзя снять роль с последнего OWNER" in bot_text
+        and "Нельзя удалить последнего OWNER" in bot_text,
+    )
+    record(
+        "service text mentions administrators only for owners",
+        "👤 Администраторы" in service_text_block and "has_owner_access(user)" in service_text_block,
+    )
     record(
         "legacy admin section callbacks are still routed",
         all(
