@@ -70,6 +70,10 @@ def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> Non
 def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
         "buy_esim",
+        "buy_apple_id",
+        "apple_id_region:",
+        "apple_id_product:",
+        "buy_apple_id_product:",
         "profile",
         "profile_orders",
         "profile_invite",
@@ -113,6 +117,10 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "def admin_service_sections_keyboard",
         "async def start(",
         "async def show_buy_esim(",
+        "async def show_apple_id_start(",
+        "async def show_apple_id_region(",
+        "async def show_apple_id_product(",
+        "async def start_apple_id_purchase(",
         "async def show_profile(",
         "async def show_my_orders(",
         "async def show_user_order(",
@@ -151,6 +159,43 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     for handler in handlers:
         check_contains(bot_text, handler, "bot/bot.py menu/handler functions")
 
+    record(
+        "main menu contains Apple ID topup button after eSIM",
+        bool(re.search(r"Купить eSIM.*?🍎 Пополнить Apple ID.*?Личный кабинет.*?Поддержка", function_block(bot_text, "main_menu_keyboard"), re.DOTALL)),
+    )
+    record(
+        "Apple ID catalog has USA and Turkey regions",
+        "APPLE_ID_PRODUCTS" in bot_text and '"US"' in bot_text and '"TR"' in bot_text
+        and "Apple Gift Card USA" in bot_text and "Apple Gift Card Turkey" in bot_text,
+    )
+    record(
+        "Apple ID catalog has USA and Turkey nominal values",
+        all(token in bot_text for token in ("apple_us_5", "apple_us_10", "apple_us_100", "apple_tr_100", "apple_tr_1000")),
+    )
+    record(
+        "Apple ID order is created separately from eSIM",
+        '"product_type": "apple_id"' in bot_text and '"product_type": "esim"' in bot_text
+        and "create_apple_id_checkout_order" in bot_text and "create_checkout_order" in bot_text,
+    )
+    record(
+        "eSIM purchase logic remains present",
+        "PLAN_MAP" in bot_text and "start_purchase_for_plan" in bot_text and 'CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_")' in bot_text,
+    )
+    record(
+        "Apple ID payments reuse existing payment flow",
+        "start_apple_id_purchase" in bot_text and "enabled_payment_methods()" in function_block(bot_text, "start_apple_id_purchase")
+        and "create_card_payment_lock(plan)" in function_block(bot_text, "start_apple_id_purchase")
+        and "payment_keyboard(product_id)" in function_block(bot_text, "start_apple_id_purchase"),
+    )
+    record(
+        "card payment lock still uses USD/RUB flow",
+        "await get_usd_rub_rate()" in function_block(bot_text, "create_card_payment_lock")
+        and "CARD_RATE_LOCK_SECONDS" in function_block(bot_text, "create_card_payment_lock"),
+    )
+    record(
+        "cashback remains disabled by default",
+        'CASHBACK_ENABLED", "0"' in bot_text or 'CASHBACK_ENABLED", "false"' in bot_text,
+    )
 
     for needle in [
         '"notification_chats"',

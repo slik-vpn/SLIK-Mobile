@@ -143,6 +143,26 @@ RUSSIA_PLANS = [
 ]
 PLAN_MAP = {p[3]: {"gb": p[0], "days": p[1], "price": p[2]} for p in RUSSIA_PLANS}
 
+APPLE_ID_PRODUCTS = {
+    "US": [
+        {"id": "apple_us_5", "region": "US", "title": "Apple Gift Card USA $5", "amount": 5, "currency": "USD", "price_usd": 5},
+        {"id": "apple_us_10", "region": "US", "title": "Apple Gift Card USA $10", "amount": 10, "currency": "USD", "price_usd": 10},
+        {"id": "apple_us_15", "region": "US", "title": "Apple Gift Card USA $15", "amount": 15, "currency": "USD", "price_usd": 15},
+        {"id": "apple_us_25", "region": "US", "title": "Apple Gift Card USA $25", "amount": 25, "currency": "USD", "price_usd": 25},
+        {"id": "apple_us_50", "region": "US", "title": "Apple Gift Card USA $50", "amount": 50, "currency": "USD", "price_usd": 50},
+        {"id": "apple_us_100", "region": "US", "title": "Apple Gift Card USA $100", "amount": 100, "currency": "USD", "price_usd": 100},
+    ],
+    "TR": [
+        {"id": "apple_tr_100", "region": "TR", "title": "Apple Gift Card Turkey 100₺", "amount": 100, "currency": "TRY", "price_usd": 4},
+        {"id": "apple_tr_250", "region": "TR", "title": "Apple Gift Card Turkey 250₺", "amount": 250, "currency": "TRY", "price_usd": 9},
+        {"id": "apple_tr_500", "region": "TR", "title": "Apple Gift Card Turkey 500₺", "amount": 500, "currency": "TRY", "price_usd": 18},
+        {"id": "apple_tr_1000", "region": "TR", "title": "Apple Gift Card Turkey 1000₺", "amount": 1000, "currency": "TRY", "price_usd": 36},
+    ],
+}
+
+APPLE_ID_REGION_TITLES = {"US": "USA", "TR": "Turkey"}
+APPLE_ID_REGION_FLAGS = {"US": "🇺🇸", "TR": "🇹🇷"}
+
 FRIEND_REFERRAL_REWARD_USD = 1.0
 STATUS_LEVELS = [
     (1000.0, "Ambassador", "👑", 10.0, 7),
@@ -1323,11 +1343,51 @@ def find_order(order_id: int) -> dict | None:
 
 def create_checkout_order(user, plan_key: str, plan: dict) -> dict:
     return append_order({
+        "product_type": "esim",
         "gb": plan["gb"],
         "days": plan["days"],
         "price": plan["price"],
         "country": "Россия",
         "plan_key": plan_key,
+        "payment_method": "",
+        "payment_provider": "",
+        "name": "",
+        "tg_handle": user_tag(user),
+        "user_id": user.id,
+        "status": "waiting_payment",
+        "checkout_created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"),
+        "abandoned_reminder_sent": False,
+    })
+
+
+def apple_id_product_by_id(product_id: str) -> dict | None:
+    for products in APPLE_ID_PRODUCTS.values():
+        for product in products:
+            if product["id"] == product_id:
+                return product
+    return None
+
+
+def apple_id_product_plan(product: dict) -> dict:
+    return {
+        "gb": product["title"],
+        "days": "ручная выдача",
+        "price": format_usd(product["price_usd"]),
+        "product_type": "apple_id",
+        "product_id": product["id"],
+        "product_title": product["title"],
+        "region": product["region"],
+        "amount": product["amount"],
+        "currency": product["currency"],
+        "price_usd": product["price_usd"],
+    }
+
+
+def create_apple_id_checkout_order(user, product: dict) -> dict:
+    plan = apple_id_product_plan(product)
+    return append_order({
+        **plan,
+        "country": APPLE_ID_REGION_TITLES.get(product["region"], product["region"]),
         "payment_method": "",
         "payment_provider": "",
         "name": "",
@@ -1915,6 +1975,12 @@ def order_number_plain(order: dict) -> str:
 
 
 def format_order_button_text(order: dict) -> str:
+    if order.get("product_type") == "apple_id":
+        amount = order.get("amount", "—")
+        currency = order.get("currency", "")
+        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
+        return f"{order_number_plain(order)} — 🍎 Apple ID / {region} / {nominal}"
     return (
         f"{order_number_plain(order)} — {order.get('country', 'Россия')} "
         f"{order.get('gb', '—')} — {order.get('price', '—')}"
@@ -2020,6 +2086,29 @@ def build_order_card_text(order: dict) -> str:
             f"Итоговый курс: <b>{final_rate:.4f} ₽</b>\n"
         )
     username = order.get("tg_handle") or "—"
+    if order.get("product_type") == "apple_id":
+        amount = order.get("amount", "—")
+        currency = order.get("currency", "")
+        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
+        return (
+            f"🍎 <b>Заказ Apple ID {html_escape(order_number_plain(order))}</b>\n\n"
+            f"👤 Клиент: <b>{html_escape(order.get('name', '—'))}</b>\n"
+            f"🆔 Telegram ID: <code>{html_escape(order.get('user_id', '—'))}</code>\n"
+            f"Username: <b>{html_escape(username)}</b>\n\n"
+            f"Тип товара: <b>Apple ID</b>\n"
+            f"Регион: <b>{html_escape(region)}</b>\n"
+            f"Номинал: <b>{html_escape(nominal)}</b>\n"
+            f"Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>\n"
+            f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n\n"
+            "<b>Способ оплаты:</b>\n"
+            f"{html_escape(payment_method)}\n\n"
+            f"{card_lines}"
+            "<b>Статус:</b>\n"
+            f"{html_escape(order_status_with_icon(order.get('status')))}\n\n"
+            "<b>Дата:</b>\n"
+            f"{html_escape(format_order_date(order))}"
+        )
     return (
         f"📦 <b>Заказ {html_escape(order_number_plain(order))}</b>\n\n"
         f"👤 Клиент: <b>{html_escape(order.get('name', '—'))}</b>\n"
@@ -2878,6 +2967,7 @@ def get_tma_url() -> str | None:
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
+        [InlineKeyboardButton("🍎 Пополнить Apple ID",       callback_data="buy_apple_id")],
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
         [InlineKeyboardButton("👨‍💻 Поддержка",              url=SUPPORT_URL)],
     ]
@@ -3050,6 +3140,30 @@ def buy_esim_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def apple_id_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇺🇸 Apple ID USA", callback_data="apple_id_region:US")],
+        [InlineKeyboardButton("🇹🇷 Apple ID Turkey", callback_data="apple_id_region:TR")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+
+
+def apple_id_products_keyboard(region: str) -> InlineKeyboardMarkup:
+    rows = []
+    for product in APPLE_ID_PRODUCTS.get(region, []):
+        amount = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
+        rows.append([InlineKeyboardButton(amount, callback_data=f"apple_id_product:{product['id']}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="buy_apple_id")])
+    return InlineKeyboardMarkup(rows)
+
+
+def apple_id_product_keyboard(product: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Купить", callback_data=f"buy_apple_id_product:{product['id']}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f"apple_id_region:{product['region']}")],
+    ])
+
+
 def russia_plans_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(f"📶 {p[0]}  •  {p[2]}", callback_data=p[3])]
@@ -3135,6 +3249,9 @@ def user_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
 
 
 def user_order_card_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    order = find_order(order_id)
+    if order and order.get("product_type") == "apple_id":
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="profile_orders")]])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔁 Повторить заказ", callback_data=f"repeat_order:{order_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="profile_orders")],
@@ -3199,6 +3316,58 @@ async def show_buy_esim(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await edit_or_send(query, context, "🌍 <b>Выберите страну:</b>", buy_esim_keyboard())
     if not has_admin_access(user):
         await track_action(context, user, "нажал «Купить eSIM»")
+
+
+async def show_apple_id_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    text = (
+        "🍎 <b>Пополнение Apple ID</b>\n\n"
+        "Выберите регион вашего Apple ID:\n\n"
+        "🇺🇸 USA — подарочные карты Apple Gift Card в долларах\n"
+        "🇹🇷 Turkey — подарочные карты Apple Gift Card в лирах\n\n"
+        "Важно:\n"
+        "Код подходит только для выбранного региона Apple ID. Перед покупкой убедитесь, что регион аккаунта совпадает."
+    )
+    await edit_or_send(query, context, text, apple_id_start_keyboard())
+    if not has_admin_access(query.from_user):
+        await track_action(context, query.from_user, "нажал «Пополнить Apple ID»")
+
+
+async def show_apple_id_region(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    region = query.data.split(":", 1)[1]
+    if region not in APPLE_ID_PRODUCTS:
+        await query.answer("Регион не найден.", show_alert=True)
+        return
+    flag = APPLE_ID_REGION_FLAGS.get(region, "")
+    title = APPLE_ID_REGION_TITLES.get(region, region)
+    text = f"{flag} <b>Apple ID {html_escape(title)}</b>\n\nВыберите номинал:"
+    await edit_or_send(query, context, text, apple_id_products_keyboard(region))
+
+
+async def show_apple_id_product(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    product_id = query.data.split(":", 1)[1]
+    product = apple_id_product_by_id(product_id)
+    if not product:
+        await query.answer("Товар не найден.", show_alert=True)
+        return
+    region = product["region"]
+    region_title = APPLE_ID_REGION_TITLES.get(region, region)
+    flag = APPLE_ID_REGION_FLAGS.get(region, "")
+    nominal = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
+    text = (
+        f"🍎 <b>{html_escape(product['title'])}</b>\n\n"
+        f"Регион: {flag} {html_escape(region_title)}\n"
+        f"Номинал: <b>{html_escape(nominal)}</b>\n"
+        f"Стоимость: <b>{html_escape(format_usd(product['price_usd']))}</b>\n\n"
+        f"Важно:\nКод можно активировать только на Apple ID региона {html_escape(region_title)}.\n\n"
+        "После оплаты менеджер проверит заказ и отправит код."
+    )
+    await edit_or_send(query, context, text, apple_id_product_keyboard(product))
 
 
 async def show_region_russia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3574,6 +3743,17 @@ def format_user_orders(orders: list) -> str:
     for index, order in enumerate(latest_orders):
         if index:
             lines.append("────────────")
+        if order.get("product_type") == "apple_id":
+            lines.extend([
+                f"🧾 Заказ: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>",
+                f"🍎 Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>",
+                f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>",
+                f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>",
+                f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>",
+                "",
+                "Откройте заказ кнопкой ниже, чтобы посмотреть детали.",
+            ])
+            continue
         lines.extend([
             f"🧾 Заказ: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>",
             f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>",
@@ -3605,6 +3785,22 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def build_user_order_card_text(order: dict) -> str:
+    if order.get("product_type") == "apple_id":
+        amount = order.get("amount", "—")
+        currency = order.get("currency", "")
+        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
+        return (
+            "🍎 <b>Заказ Apple ID</b>\n\n"
+            f"🧾 Номер: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>\n"
+            f"Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>\n"
+            f"Регион: <b>{html_escape(region)}</b>\n"
+            f"Номинал: <b>{html_escape(nominal)}</b>\n"
+            f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>\n"
+            f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>\n\n"
+            "После подтверждения оплаты менеджер отправит код вручную."
+        )
     return (
         "📦 <b>Заказ</b>\n\n"
         f"🧾 Номер: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>\n"
@@ -3733,6 +3929,43 @@ async def start_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return await start_purchase_for_plan(update, context, plan_key, plan)
 
 
+async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    product_id = query.data.split(":", 1)[1]
+    product = apple_id_product_by_id(product_id)
+    if not product:
+        await query.answer("Товар не найден.", show_alert=True)
+        return ConversationHandler.END
+    plan = apple_id_product_plan(product)
+    context.user_data["plan_key"] = product_id
+    context.user_data["plan"] = plan
+    order = create_apple_id_checkout_order(query.from_user, product)
+    context.user_data["checkout_order_id"] = order["id"]
+
+    methods = enabled_payment_methods()
+    if list(methods.keys()) == ["card"] or not methods:
+        cfg = load_config()
+        card = cfg["payment"].get("card", "")
+        context.user_data["payment_method"] = payment_provider_label("card")
+        context.user_data["payment_provider"] = "card"
+        lock = await create_card_payment_lock(plan)
+        context.user_data["card_payment_lock"] = lock
+        update_checkout_order(order["id"], payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
+        await query.message.reply_text(build_card_payment_text(plan, card, lock), parse_mode="HTML", reply_markup=card_payment_keyboard())
+    else:
+        await query.message.reply_text(
+            "💳 <b>Выберите способ оплаты</b>\n\n"
+            f"🍎 Товар: <b>{html_escape(product['title'])}</b>\n"
+            f"💵 Цена: <b>{html_escape(plan['price'])}</b>",
+            parse_mode="HTML",
+            reply_markup=payment_keyboard(product_id),
+        )
+    if not has_admin_access(query.from_user):
+        await track_action(context, query.from_user, "нажал «Купить Apple ID»", f"Товар: {product['title']}\nЦена: {plan['price']}")
+    return WAITING_PAYMENT
+
+
 async def repeat_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     order_id = int(query.data.split(":", 1)[1])
@@ -3761,8 +3994,8 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     plan = context.user_data.get("plan", {})
     if not plan and (data in {"pay_card", "pay_cryptobot", "pay_freekassa", "pay_yookassa", "payment_done"} or data.startswith("check_payment_")):
         await query.message.reply_text(
-            "Платёжная сессия устарела. Выберите eSIM заново.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌍 Выбрать eSIM", callback_data="buy_esim")]]),
+            "Платёжная сессия устарела. Выберите товар заново.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")]]),
         )
         return ConversationHandler.END
 
@@ -3795,7 +4028,11 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["payment_method"] = payment_provider_label("cryptobot")
         context.user_data["payment_provider"] = "cryptobot"
         amount = parse_price(plan.get("price", "0"))
-        description = f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip()
+        description = (
+            f"SLIK Apple ID {plan.get('product_title', '')}".strip()
+            if plan.get("product_type") == "apple_id"
+            else f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip()
+        )
         invoice = await crypto_create_invoice(token, amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}")
         if not invoice:
             await query.message.reply_text(
@@ -3911,6 +4148,23 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif data.startswith("back_to_plan_"):
         plan_key = data.replace("back_to_plan_", "")
+        product = apple_id_product_by_id(plan_key)
+        if product:
+            context.user_data.pop("checkout_order_id", None)
+            region = product["region"]
+            region_title = APPLE_ID_REGION_TITLES.get(region, region)
+            flag = APPLE_ID_REGION_FLAGS.get(region, "")
+            nominal = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
+            text = (
+                f"🍎 <b>{html_escape(product['title'])}</b>\n\n"
+                f"Регион: {flag} {html_escape(region_title)}\n"
+                f"Номинал: <b>{html_escape(nominal)}</b>\n"
+                f"Стоимость: <b>{html_escape(format_usd(product['price_usd']))}</b>\n\n"
+                f"Важно:\nКод можно активировать только на Apple ID региона {html_escape(region_title)}.\n\n"
+                "После оплаты менеджер проверит заказ и отправит код."
+            )
+            await edit_or_send(query, context, text, apple_id_product_keyboard(product))
+            return ConversationHandler.END
         plan_data = PLAN_MAP.get(plan_key)
         if plan_data:
             text = (
@@ -3990,6 +4244,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     payment = context.user_data.get("payment_method", payment_provider_label(payment_provider))
 
     order_payload = {
+        "product_type":    plan.get("product_type", "esim"),
         "gb":             plan["gb"],
         "days":           plan["days"],
         "price":          plan["price"],
@@ -4001,6 +4256,16 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "tg_handle":      tg_handle,
         "user_id":        user.id,
     }
+    if plan.get("product_type") == "apple_id":
+        order_payload.update({
+            "product_id": plan.get("product_id"),
+            "product_title": plan.get("product_title"),
+            "region": plan.get("region"),
+            "amount": plan.get("amount"),
+            "currency": plan.get("currency"),
+            "price_usd": plan.get("price_usd"),
+            "country": APPLE_ID_REGION_TITLES.get(plan.get("region"), plan.get("region", "—")),
+        })
     payment_details = order_payment_details_from_context(context)
     if payment_details:
         order_payload["payment_details"] = payment_details
@@ -4011,8 +4276,19 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         order = append_order(order_payload)
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
-    await update.message.reply_text(
-        (
+    if plan.get("product_type") == "apple_id":
+        nominal = f"${plan.get('amount')}" if plan.get("currency") == "USD" else f"{plan.get('amount')}₺"
+        client_text = (
+            "✅ <b>Заявка создана</b>\n\n"
+            f"🧾 Номер заказа: <b>{order['number']}</b>\n\n"
+            f"Товар: <b>{html_escape(plan.get('product_title', plan['gb']))}</b>\n"
+            f"Регион: <b>{html_escape(APPLE_ID_REGION_TITLES.get(plan.get('region'), plan.get('region', '—')))}</b>\n"
+            f"Номинал: <b>{html_escape(nominal)}</b>\n"
+            f"Сумма: <b>{html_escape(plan['price'])}</b>\n\n"
+            "После проверки оплаты менеджер отправит код в этот чат."
+        )
+    else:
+        client_text = (
             "✅ <b>Заявка принята</b>\n\n"
             f"🧾 Номер заказа: <b>{order['number']}</b>\n\n"
             f"📶 Тариф: <b>{plan['gb']} / {plan['days']}</b>\n"
@@ -4020,7 +4296,9 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "Спасибо за заявку.\n\n"
             "Менеджер свяжется с вами в течение нескольких минут и отправит вашу eSIM.\n\n"
             "⚡ Среднее время обработки — до 5 минут."
-        ),
+        )
+    await update.message.reply_text(
+        client_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("👨‍💻 Написать менеджеру", url=SUPPORT_URL)],
@@ -4033,8 +4311,11 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await notify_status_upgrade(context, user.id, current_status)
     await notify_admin(context, order)
     if not has_admin_access(user):
-        await track_action(context, user, "создал заявку",
-                           f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}\nОплата: {payment}")
+        if plan.get("product_type") == "apple_id":
+            details = f"Товар: {plan.get('product_title')}\nЦена: {plan['price']}\nОплата: {payment}"
+        else:
+            details = f"Тариф: {plan['gb']} / {plan['days']}\nЦена: {plan['price']}\nОплата: {payment}"
+        await track_action(context, user, "создал заявку", details)
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -4132,18 +4413,40 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
             f"Итоговый курс: <b>{html_escape(final_rate_text)} ₽</b>\n"
             f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
         )
-    text = (
-        "🔥 <b>Новый заказ</b>\n\n"
-        f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
-        f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
-        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
-        f"{payment_line}"
-        f"{payment_details_line}\n"
-        f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
-        f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
-        f"🕒 {html_escape(order.get('created_at', '—'))}\n"
-        f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
-    )
+    if order.get("product_type") == "apple_id":
+        amount = order.get("amount", "—")
+        currency = order.get("currency", "")
+        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
+        text = (
+            "🍎 <b>Новый заказ Apple ID</b>\n\n"
+            f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
+            f"Клиент: <b>{html_escape(order.get('tg_handle', '—'))}</b> / ID <code>{html_escape(order.get('user_id', '—'))}</code>\n"
+            f"Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
+            f"Регион: <b>{html_escape(region)}</b>\n"
+            f"Номинал: <b>{html_escape(nominal)}</b>\n"
+            f"Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>\n"
+            f"Сумма: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"{payment_line}"
+            f"{payment_details_line}"
+            f"Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>\n\n"
+            "После подтверждения оплаты отправьте клиенту код вручную.\n\n"
+            f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+            f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+        )
+    else:
+        text = (
+            "🔥 <b>Новый заказ</b>\n\n"
+            f"Номер заказа: <b>{html_escape(order_number)}</b>\n\n"
+            f"📶 Тариф: <b>{html_escape(order.get('gb', '—'))} / {html_escape(order.get('days', '—'))}</b>\n"
+            f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"{payment_line}"
+            f"{payment_details_line}\n"
+            f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
+            f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
+            f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+            f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+        )
     await send_admin_order_message(context, admin_id, text, order_id)
 
 
@@ -5752,6 +6055,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_admin_backups(update, context)
     elif data == "buy_esim":
         await show_buy_esim(update, context)
+    elif data == "buy_apple_id":
+        await show_apple_id_start(update, context)
+    elif data.startswith("apple_id_region:"):
+        await show_apple_id_region(update, context)
+    elif data.startswith("apple_id_product:"):
+        await show_apple_id_product(update, context)
     elif data == "region_russia":
         await show_region_russia(update, context)
     elif data == "region_worldwide":
@@ -5849,6 +6158,7 @@ def main() -> None:
     purchase_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_"),
+            CallbackQueryHandler(start_apple_id_purchase, pattern=r"^buy_apple_id_product:"),
             CallbackQueryHandler(repeat_order, pattern=r"^repeat_order:\d+$"),
             CallbackQueryHandler(show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"),
         ],
