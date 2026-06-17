@@ -259,6 +259,22 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "notify_cashback_awarded only called after positive cashback",
         bool(re.search(r"if\s+cashback_amount\s*>\s*0\s*:\s*\n\s*await\s+notify_cashback_awarded", bot_text)),
     )
+    record(
+        "USD/RUB fallback env exists",
+        "USD_RUB_FALLBACK_RATE" in bot_text and "USD_RUB_FALLBACK_RATE" in env_example_text,
+    )
+    record(
+        "USD/RUB markup env exists",
+        "USD_RUB_MARKUP_PERCENT" in bot_text and "USD_RUB_MARKUP_PERCENT" in env_example_text,
+    )
+    record(
+        "admin USD/RUB screen exists",
+        "💱 Курс USD/RUB" in bot_text and "usd_rub_admin_keyboard" in bot_text,
+    )
+    record(
+        "USD/RUB settings persist rate check and final rate",
+        all(token in bot_text for token in ("rate_checked_at", "markup_percent", "final_usd_rub_rate")),
+    )
 
     record(
         "is_revenue_order excludes waiting_payment",
