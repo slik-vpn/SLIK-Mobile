@@ -595,15 +595,52 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "admin_apple_id_fazer_unlink:" in bot_text,
     )
     readonly_fetch_text = function_block(bot_text, "fetch_fazercards_products_readonly")
+    readonly_cards_text = function_block(bot_text, "fetch_fazercards_giftcards_cards_readonly")
+    cards_fetch_text = function_block(bot_text, "fetch_fazercards_giftcards_cards")
+    handle_callback_text = function_block(bot_text, "handle_callback")
     mapping_handlers_text = "\n".join(
         function_block(bot_text, name)
-        for name in ("fetch_fazercards_products_readonly", "fazercards_select_keyboard", "apple_giftcard_candidates")
+        for name in (
+            "fetch_fazercards_products_readonly",
+            "fetch_fazercards_giftcards_cards_readonly",
+            "fetch_fazercards_giftcards_cards",
+            "fazercards_select_keyboard",
+            "fazercards_cards_keyboard",
+            "apple_giftcard_candidates",
+            "handle_callback",
+        )
+    )
+    record(
+        "FazerCards category mapping starts with GET /giftcards",
+        "payload = await fetch_fazercards_products_readonly()" in handle_callback_text
+        and "admin_apple_id_fazer_link:" in handle_callback_text
+        and "await fetch_fazercards_giftcards_cards_readonly(category_id)" in handle_callback_text,
+    )
+    record(
+        "FazerCards mapping has read-only cards fetch with category_id",
+        "async def fetch_fazercards_giftcards_cards_readonly" in bot_text
+        and "client.get(FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT" in cards_fetch_text
+        and 'params = {"category_id": str(category_id or "")}' in cards_fetch_text
+        and "await fetch_fazercards_giftcards_cards(client, api_key, category_id)" in readonly_cards_text,
     )
     record(
         "FazerCards mapping uses only GET/read-only product list",
         "await fetch_fazercards_products(client, api_key)" in readonly_fetch_text
         and "client.get(FAZERCARDS_PRODUCTS_ENDPOINT" in function_block(bot_text, "fetch_fazercards_products")
         and "client.post" not in mapping_handlers_text,
+    )
+    record(
+        "FazerCards card selection callback and temporary storage exist",
+        "admin_apple_id_fazer_card_pick:" in bot_text
+        and "fazercards_category:{product_id}" in bot_text
+        and "fazercards_cards:{product_id}" in bot_text,
+    )
+    record(
+        "FazerCards mapping saves category_id and card_id",
+        '"fazercards_category_id": fazercards_category_id_value(category)' in handle_callback_text
+        and '"fazercards_card_id": card_id' in handle_callback_text
+        and '"fazercards_product_id": card_id' in handle_callback_text
+        and 'if not card_id:' in handle_callback_text,
     )
     record(
         "FazerCards mapping avoids purchase/order/create endpoints",
@@ -655,9 +692,11 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         all(token not in mapping_handlers_text.lower() for token in ("/purchase", "/order", "/create")),
     )
     record(
-        "FazerCards missing nominal warning is shown for category-like products",
-        "В названии FazerCards товара не найден номинал" in bot_text
-        and "Автовыдача пока отключена" in bot_text,
+        "FazerCards card confirmation shows category/card diagnostics",
+        "Category ID:" in bot_text
+        and "Card ID:" in bot_text
+        and "Цена поставщика:" in bot_text
+        and "Stock:" in bot_text,
     )
     record(
         "Apple ID user purchase remains manual with FazerCards status only",

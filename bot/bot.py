@@ -5837,6 +5837,15 @@ def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
     return None
 
 
+
+
+def fazercards_category_id_value(item: dict) -> str:
+    for field in ("category_id", "categoryId", "id", "slug", "code"):
+        value = item.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
 def fazercards_product_value(item: dict, key: str) -> str:
     aliases = {
         "id": ("supplier_product_id", "supplierProductId", "product_id", "productId", "card_id", "cardId", "id", "slug", "code", "sku"),
@@ -5919,11 +5928,20 @@ def fazercards_select_text(product: dict, exact_match: bool, error: str = "") ->
 def fazercards_select_keyboard(product_id: str, candidates: list[dict], offset: int, has_more: bool) -> InlineKeyboardMarkup:
     rows = []
     for idx, item in enumerate(candidates, start=offset):
-        name = fazercards_product_value(item, "name") or fazercards_product_value(item, "id")
+        name = fazercards_product_value(item, "name") or fazercards_category_id_value(item)
         rows.append([InlineKeyboardButton(name[:60], callback_data=f"admin_apple_id_fazer_pick:{product_id}:{idx}")])
     if has_more:
         rows.append([InlineKeyboardButton("🔄 Показать ещё", callback_data=f"admin_apple_id_fazer_more:{product_id}:{offset + len(candidates)}")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def fazercards_cards_keyboard(product_id: str, cards: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, item in enumerate(cards[:30]):
+        name = fazercards_product_value(item, "name") or fazercards_product_value(item, "card_id")
+        rows.append([InlineKeyboardButton(name[:60], callback_data=f"admin_apple_id_fazer_card_pick:{product_id}:{idx}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_fazer_link:{product_id}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -6536,7 +6554,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await edit_or_send(query, context, "⚠️ API key не указан.\nСначала владелец должен указать FazerCards API key.", apple_id_admin_product_keyboard(product))
             return
         await query.answer("Получаю товары FazerCards...")
-        payload = await fetch_fazercards_giftcards_cards_readonly(product.get("fazercards_category_id", ""))
+        payload = await fetch_fazercards_products_readonly()
         items = payload.get("items") if isinstance(payload, dict) else []
         if not payload.get("ok") or not isinstance(items, list):
             await edit_or_send(query, context, fazercards_select_text(product, False, str(payload.get("error") or "Не удалось получить список товаров")), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]))
@@ -6574,29 +6592,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         product = apple_id_product_by_id(product_id)
         candidates = context.user_data.get(f"fazercards_candidates:{product_id}") or []
         try:
-            item = candidates[int(idx_raw)]
+            category = candidates[int(idx_raw)]
         except (ValueError, IndexError, TypeError):
-            item = None
-        if not product or not item:
-            await query.answer("Товар не найден. Откройте привязку заново.", show_alert=True)
+            category = None
+        if not product or not category:
+            await query.answer("Категория не найдена. Откройте привязку заново.", show_alert=True)
             return
-        context.user_data[f"fazercards_selected:{product_id}"] = item
-        item_id = fazercards_product_value(item, "id")
-        item_name = fazercards_product_value(item, "name")
-        amount = str(int(float(product.get("amount", 0) or 0))) if float(product.get("amount", 0) or 0).is_integer() else str(product.get("amount", ""))
-        nominal_warning = ""
-        if not fazercards_name_has_amount(item_name, amount):
-            nominal_warning = (
-                "\n\n⚠️ В названии FazerCards товара не найден номинал. "
-                "Возможно, это категория. Автовыдача пока отключена, поэтому это безопасно для ручной привязки."
-            )
+        category_id = fazercards_category_id_value(category)
+        category_name = fazercards_product_value(category, "name") or category_id
+        if not category_id:
+            await query.answer("У категории нет category_id.", show_alert=True)
+            await edit_or_send(query, context, "⚠️ Не удалось определить category_id для выбранной категории FazerCards. Выберите другую категорию.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_fazer_link:{product_id}")]]))
+            return
+        await query.answer("Получаю карты FazerCards...")
+        payload = await fetch_fazercards_giftcards_cards_readonly(category_id)
+        items = payload.get("items") if isinstance(payload, dict) else []
+        if not payload.get("ok") or not isinstance(items, list):
+            await edit_or_send(query, context, fazercards_select_text(product, False, str(payload.get("error") or "Не удалось получить cards")), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_fazer_link:{product_id}")]]))
+            return
+        cards, exact_match = apple_giftcard_candidates(product, items, limit=1000)
+        if not cards:
+            cards = [item for item in items if isinstance(item, dict)]
+            exact_match = False
+        context.user_data[f"fazercards_category:{product_id}"] = category
+        context.user_data[f"fazercards_cards:{product_id}"] = cards
+        if not cards:
+            await edit_or_send(query, context, f"Cards не найдены для категории {html_escape(category_name)}.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_fazer_link:{product_id}")]]))
+            return
+        await edit_or_send(query, context, fazercards_select_text(product, exact_match), fazercards_cards_keyboard(product_id, cards))
+    elif data.startswith("admin_apple_id_fazer_card_pick:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        _prefix, product_id, idx_raw = data.split(":", 2)
+        product = apple_id_product_by_id(product_id)
+        category = context.user_data.get(f"fazercards_category:{product_id}") or {}
+        cards = context.user_data.get(f"fazercards_cards:{product_id}") or []
+        try:
+            card = cards[int(idx_raw)]
+        except (ValueError, IndexError, TypeError):
+            card = None
+        if not product or not category or not card:
+            await query.answer("Карта не найдена. Откройте привязку заново.", show_alert=True)
+            return
+        category_id = fazercards_category_id_value(category)
+        category_name = fazercards_product_value(category, "name") or category_id
+        card_id = fazercards_product_value(card, "card_id")
+        if not card_id:
+            await query.answer("У карты нет card_id.", show_alert=True)
+            await edit_or_send(query, context, "⚠️ Не удалось определить card_id для выбранной карты FazerCards. Выберите другую карту.", fazercards_cards_keyboard(product_id, cards))
+            return
+        context.user_data[f"fazercards_selected:{product_id}"] = card
+        card_name = fazercards_product_value(card, "name")
+        price_usd = fazercards_product_value(card, "price_usd") or "—"
+        stock = fazercards_product_value(card, "stock") or "—"
         text = (
-            "Привязать товар?\n\n"
+            "Привязать карту?\n\n"
             f"Наш товар:\n<b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>\n\n"
             "FazerCards:\n"
-            f"ID: <code>{html_escape(item_id)}</code>\n"
-            f"Название: {html_escape(item_name)}"
-            f"{nominal_warning}"
+            f"Категория: {html_escape(category_name)}\n"
+            f"Category ID: <code>{html_escape(category_id)}</code>\n"
+            f"Карта: {html_escape(card_name)}\n"
+            f"Card ID: <code>{html_escape(card_id)}</code>\n"
+            f"Цена поставщика: {html_escape(price_usd)}\n"
+            f"Stock: {html_escape(stock)}"
         )
         await query.answer()
         await edit_or_send(query, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Привязать", callback_data=f"admin_apple_id_fazer_confirm:{product_id}")], [InlineKeyboardButton("❌ Отмена", callback_data=f"admin_apple_id_product:{product_id}")]]))
@@ -6606,15 +6665,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         product_id = data.split(":", 1)[1]
         item = context.user_data.get(f"fazercards_selected:{product_id}") or {}
+        category = context.user_data.get(f"fazercards_category:{product_id}") or {}
         product = apple_id_product_by_id(product_id)
+        card_id = fazercards_product_value(item, "card_id")
         if not product or not item:
             await query.answer("Товар не найден. Откройте привязку заново.", show_alert=True)
             return
+        if not card_id:
+            await query.answer("У карты нет card_id. Привязка не сохранена.", show_alert=True)
+            return
         product = set_apple_id_product(product_id, {
-            "fazercards_product_id": fazercards_product_value(item, "card_id"),
+            "fazercards_product_id": card_id,
             "fazercards_product_name": fazercards_product_value(item, "name"),
-            "fazercards_category_id": fazercards_product_value(item, "category_id"),
-            "fazercards_card_id": fazercards_product_value(item, "card_id"),
+            "fazercards_category_id": fazercards_category_id_value(category),
+            "fazercards_card_id": card_id,
             "fazercards_last_seen": fazercards_checked_at(),
             "fazercards_available": True,
             "fazercards_price_usd": fazercards_product_value(item, "price_usd") or None,
