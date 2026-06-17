@@ -597,13 +597,16 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     readonly_fetch_text = function_block(bot_text, "fetch_fazercards_products_readonly")
     readonly_cards_text = function_block(bot_text, "fetch_fazercards_giftcards_cards_readonly")
     cards_fetch_text = function_block(bot_text, "fetch_fazercards_giftcards_cards")
+    cards_payload_text = function_block(bot_text, "fazercards_cards_from_payload")
     handle_callback_text = function_block(bot_text, "handle_callback")
+    cards_flow_text = handle_callback_text.split("payload = await fetch_fazercards_giftcards_cards_readonly(category_id)", 1)[1].split("context.user_data[f\"fazercards_category:{product_id}\"]", 1)[0]
     mapping_handlers_text = "\n".join(
         function_block(bot_text, name)
         for name in (
             "fetch_fazercards_products_readonly",
             "fetch_fazercards_giftcards_cards_readonly",
             "fetch_fazercards_giftcards_cards",
+            "fazercards_cards_from_payload",
             "fazercards_select_keyboard",
             "fazercards_cards_keyboard",
             "apple_giftcard_candidates",
@@ -622,6 +625,18 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "client.get(FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT" in cards_fetch_text
         and 'params = {"category_id": str(category_id or "")}' in cards_fetch_text
         and "await fetch_fazercards_giftcards_cards(client, api_key, category_id)" in readonly_cards_text,
+    )
+    record(
+        "FazerCards cards payload helper supports offers and nested data",
+        "def fazercards_cards_from_payload" in bot_text
+        and '("offers", "items", "cards", "data", "products")' in cards_payload_text
+        and '("offers", "items", "cards", "products")' in cards_payload_text
+        and 'payload.get("data")' in cards_payload_text,
+    )
+    record(
+        "FazerCards cards flow does not read only payload items",
+        "fetched_cards = fazercards_cards_from_payload(payload)" in cards_flow_text
+        and 'payload.get("items")' not in cards_flow_text,
     )
     record(
         "FazerCards mapping uses only GET/read-only product list",

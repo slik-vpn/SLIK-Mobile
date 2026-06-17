@@ -1562,6 +1562,22 @@ async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> di
         return {"ok": False, "error": safe_error, "items": []}
 
 
+def fazercards_cards_from_payload(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    for field in ("offers", "items", "cards", "data", "products"):
+        value = payload.get(field)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for field in ("offers", "items", "cards", "products"):
+            value = data.get(field)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 def summarize_fazercards_products(products_payload: dict) -> tuple[int, list[str]]:
     items = products_payload.get("items") if isinstance(products_payload, dict) else []
     if not isinstance(items, list):
@@ -6606,13 +6622,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer("Получаю карты FazerCards...")
         payload = await fetch_fazercards_giftcards_cards_readonly(category_id)
-        items = payload.get("items") if isinstance(payload, dict) else []
-        if not payload.get("ok") or not isinstance(items, list):
+        fetched_cards = fazercards_cards_from_payload(payload)
+        if not payload.get("ok") or not fetched_cards:
             await edit_or_send(query, context, fazercards_select_text(product, False, str(payload.get("error") or "Не удалось получить cards")), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_fazer_link:{product_id}")]]))
             return
-        cards, exact_match = apple_giftcard_candidates(product, items, limit=1000)
+        cards, exact_match = apple_giftcard_candidates(product, fetched_cards, limit=1000)
         if not cards:
-            cards = [item for item in items if isinstance(item, dict)]
+            cards = fetched_cards
             exact_match = False
         context.user_data[f"fazercards_category:{product_id}"] = category
         context.user_data[f"fazercards_cards:{product_id}"] = cards
