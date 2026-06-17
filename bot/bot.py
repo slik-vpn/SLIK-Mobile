@@ -785,6 +785,7 @@ async def create_card_payment_lock(plan: dict) -> dict:
         "usd_price": usd_price,
         "usd_rub_rate": round(rate, 2),
         "rate_source": source,
+        "rate_checked_at": now_str(),
         "markup_percent": markup_percent,
         "final_usd_rub_rate": round(rate * (1 + markup_percent / 100), 4),
         "rub_amount": rub_amount,
@@ -823,6 +824,7 @@ def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> di
         "usd_price": lock.get("usd_price"),
         "usd_rub_rate": lock.get("usd_rub_rate"),
         "rate_source": lock.get("rate_source"),
+        "rate_checked_at": lock.get("rate_checked_at"),
         "markup_percent": lock.get("markup_percent"),
         "final_usd_rub_rate": lock.get("final_usd_rub_rate"),
         "rub_amount": lock.get("rub_amount"),
@@ -1900,9 +1902,11 @@ def build_order_card_text(order: dict) -> str:
         rate = float(payment_details.get("usd_rub_rate") or 0)
         markup = float(payment_details.get("markup_percent") or 0)
         final_rate = float(payment_details.get("final_usd_rub_rate") or 0)
+        rate_checked_at = payment_details.get("rate_checked_at") or "—"
         card_lines = (
             f"💳 К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
             f"Курс: <b>{rate:.2f} ₽</b>\n"
+            f"Проверка курса: <b>{html_escape(rate_checked_at)}</b>\n"
             f"Комиссия: <b>{markup:g}%</b>\n"
             f"Итоговый курс: <b>{final_rate:.4f} ₽</b>\n"
         )
@@ -3951,9 +3955,11 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         rate_text = f"{float(payment_details.get('usd_rub_rate') or 0):.2f}"
         markup_text = f"{float(payment_details.get('markup_percent') or 0):g}"
         final_rate_text = f"{float(payment_details.get('final_usd_rub_rate') or 0):.4f}"
+        rate_checked_at = payment_details.get("rate_checked_at") or "—"
         payment_details_line = (
             f"Источник курса: <b>{html_escape(payment_details.get('rate_source', '—'))}</b>\n"
             f"Курс: <b>{html_escape(rate_text)} ₽</b>\n"
+            f"Время проверки курса: <b>{html_escape(rate_checked_at)}</b>\n"
             f"Комиссия: <b>{html_escape(markup_text)}%</b>\n"
             f"Итоговый курс: <b>{html_escape(final_rate_text)} ₽</b>\n"
             f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"

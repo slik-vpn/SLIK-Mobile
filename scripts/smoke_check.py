@@ -275,6 +275,16 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "USD/RUB settings persist rate check and final rate",
         all(token in bot_text for token in ("rate_checked_at", "markup_percent", "final_usd_rub_rate")),
     )
+    create_card_payment_lock_text = function_block(bot_text, "create_card_payment_lock")
+    order_payment_details_text = function_block(bot_text, "order_payment_details_from_context")
+    record(
+        "card payment lock stores rate_checked_at",
+        '"rate_checked_at": now_str()' in create_card_payment_lock_text,
+    )
+    record(
+        "order payment_details keeps rate_checked_at",
+        '"rate_checked_at": lock.get("rate_checked_at")' in order_payment_details_text,
+    )
 
     record(
         "is_revenue_order excludes waiting_payment",
