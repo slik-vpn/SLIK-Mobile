@@ -75,9 +75,15 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "profile_invite",
         "profile_bonuses",
         "admin_panel",
+        "admin_business_sections",
+        "admin_payment_sections",
+        "admin_service_sections",
         "admin_orders",
+        "admin_analytics",
         "admin_clients",
+        "admin_news",
         "admin_payments",
+        "admin_usd_rub",
         "admin_notification_chats",
         "notification_chats_help",
         "notification_chat:",
@@ -102,6 +108,9 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     handlers = [
         "def main_menu_keyboard",
         "def admin_panel_keyboard",
+        "def admin_business_sections_keyboard",
+        "def admin_payment_sections_keyboard",
+        "def admin_service_sections_keyboard",
         "async def start(",
         "async def show_buy_esim(",
         "async def show_profile(",
@@ -112,6 +121,9 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "async def show_profile_bonuses(",
         "async def show_support_screen(",
         "async def show_admin_panel(",
+        "async def show_admin_business_sections(",
+        "async def show_admin_payment_sections(",
+        "async def show_admin_service_sections(",
         "async def show_admin_orders(",
         "async def show_admin_clients(",
         "async def show_admin_payments(",
@@ -345,6 +357,30 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "admin USD/RUB screen exists",
         "💱 Курс USD/RUB" in bot_text and "usd_rub_admin_keyboard" in bot_text,
+    )
+    admin_panel_keyboard_text = function_block(bot_text, "admin_panel_keyboard")
+    record(
+        "admin main menu is grouped into business/payment/service sections",
+        "📊 Бизнес-разделы" in admin_panel_keyboard_text
+        and "💳 Оплата и курс" in admin_panel_keyboard_text
+        and "🛠 Сервис" in admin_panel_keyboard_text,
+    )
+    record(
+        "legacy admin section callbacks are still routed",
+        all(
+            token in bot_text
+            for token in (
+                '"admin_orders"',
+                '"admin_analytics"',
+                '"admin_clients"',
+                '"admin_news"',
+                '"admin_payments"',
+                '"admin_usd_rub"',
+                '"admin_notification_chats"',
+                '"admin_healthcheck"',
+                '"admin_backups"',
+            )
+        ),
     )
     record(
         "USD/RUB settings persist rate check and final rate",

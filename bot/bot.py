@@ -2880,18 +2880,40 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
 
 def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("📋 Заказы",       callback_data="admin_orders")],
-        [InlineKeyboardButton("📊 Аналитика",    callback_data="admin_analytics")],
-        [InlineKeyboardButton("👥 Клиенты",      callback_data="admin_clients")],
-        [InlineKeyboardButton("📰 Новости",      callback_data="admin_news")],
+        [InlineKeyboardButton("📊 Бизнес-разделы", callback_data="admin_business_sections")],
+        [InlineKeyboardButton("💳 Оплата и курс", callback_data="admin_payment_sections")],
+        [InlineKeyboardButton("🛠 Сервис", callback_data="admin_service_sections")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_business_sections_keyboard(user=None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📋 Заказы", callback_data="admin_orders")],
+        [InlineKeyboardButton("📊 Аналитика", callback_data="admin_analytics")],
+        [InlineKeyboardButton("👥 Клиенты", callback_data="admin_clients")],
+    ]
+    if has_broadcast_access(user):
+        rows.append([InlineKeyboardButton("📰 Новости", callback_data="admin_news")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_payment_sections_keyboard(user=None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
         [InlineKeyboardButton("💱 Курс USD/RUB", callback_data="admin_usd_rub")],
-        [InlineKeyboardButton("🔔 Чаты уведомлений", callback_data="admin_notification_chats")],
-    ]
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
+    ])
+
+
+def admin_service_sections_keyboard(user=None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🔔 Чаты уведомлений", callback_data="admin_notification_chats")]]
     if has_backup_access(user):
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
-    rows.append([InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -4814,14 +4836,45 @@ def admin_panel_text(user) -> str:
         "🛠 <b>Админ-панель SLIK Mobile</b>\n\n"
         f"Роль: <b>{role}</b>\n\n"
         "Доступные разделы:\n"
-        "• 📋 Заказы и статистика\n"
-        "• 📊 Аналитика — метрики продаж и клиентов\n"
-        "• 👥 Клиенты — CRM клиентов\n"
-        "• 📰 Новости — CRM рассылки\n"
-        "• 💳 Платёжные способы\n"
-        "• 💱 Курс USD/RUB и наценка\n"
-        + ("\n• 💾 Бэкапы runtime-данных" if has_backup_access(user) else "")
+        "• 📊 Бизнес-разделы — заказы, аналитика, клиенты, новости\n"
+        "• 💳 Оплата и курс — платёжные способы и USD/RUB\n"
+        "• 🛠 Сервис — уведомления, проверка системы, бэкапы"
     )
+
+
+def admin_business_sections_text(user) -> str:
+    lines = [
+        "📊 <b>Бизнес-разделы</b>",
+        "",
+        "Выберите раздел:",
+        "• 📋 Заказы",
+        "• 📊 Аналитика",
+        "• 👥 Клиенты",
+    ]
+    if has_broadcast_access(user):
+        lines.append("• 📰 Новости")
+    return "\n".join(lines)
+
+
+def admin_payment_sections_text(user) -> str:
+    return (
+        "💳 <b>Оплата и курс</b>\n\n"
+        "Выберите раздел:\n"
+        "• 💳 Платёжные способы\n"
+        "• 💱 Курс USD/RUB"
+    )
+
+
+def admin_service_sections_text(user) -> str:
+    lines = [
+        "🛠 <b>Сервис</b>",
+        "",
+        "Выберите раздел:",
+        "• 🔔 Чаты уведомлений",
+    ]
+    if has_backup_access(user):
+        lines.extend(["• 🩺 Проверка системы", "• 💾 Бэкапы"])
+    return "\n".join(lines)
 
 
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4831,6 +4884,48 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await query.answer()
     await edit_or_send(query, context, admin_panel_text(query.from_user), admin_panel_keyboard(query.from_user))
+
+
+async def show_admin_business_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(
+        query,
+        context,
+        admin_business_sections_text(query.from_user),
+        admin_business_sections_keyboard(query.from_user),
+    )
+
+
+async def show_admin_payment_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(
+        query,
+        context,
+        admin_payment_sections_text(query.from_user),
+        admin_payment_sections_keyboard(query.from_user),
+    )
+
+
+async def show_admin_service_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+    await query.answer()
+    await edit_or_send(
+        query,
+        context,
+        admin_service_sections_text(query.from_user),
+        admin_service_sections_keyboard(query.from_user),
+    )
 
 
 async def show_admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5325,6 +5420,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await edit_or_send(query, context, "✅ Старые архивы удалены.", backups_keyboard())
     elif data in {"admin_panel", "admin_analytics_back"}:
         await show_admin_panel(update, context)
+    elif data == "admin_business_sections":
+        await show_admin_business_sections(update, context)
+    elif data == "admin_payment_sections":
+        await show_admin_payment_sections(update, context)
+    elif data == "admin_service_sections":
+        await show_admin_service_sections(update, context)
     elif data == "admin_orders":
         await show_admin_orders(update, context)
     elif data == "admin_analytics":
