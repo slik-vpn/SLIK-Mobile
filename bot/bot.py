@@ -62,8 +62,20 @@ BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
 PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
-USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
-USD_RUB_MARKUP_PERCENT = float(os.environ.get("USD_RUB_MARKUP_PERCENT", "1.5"))
+def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+USD_RUB_FALLBACK_RATE = env_float("USD_RUB_FALLBACK_RATE", 90, 30, 200)
+USD_RUB_MARKUP_PERCENT = env_float("USD_RUB_MARKUP_PERCENT", 1.5, 0, 30)
 CARD_RATE_LOCK_SECONDS = 5 * 60
 
 def env_int(name: str, default: int) -> int:
@@ -5013,9 +5025,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_usd_rub")]]),
         )
     elif data == "usd_rub_reset_manual":
+        await query.answer("Ручной курс сброшен.")
         save_usd_rub_settings(manual_rate=None)
         await refresh_usd_rub_rate_check()
-        await query.answer("Ручной курс сброшен.")
         await edit_or_send(query, context, usd_rub_admin_text(), usd_rub_admin_keyboard())
     elif data == "usd_rub_set_markup":
         context.user_data["client_input"] = USD_RUB_INPUT_MARKUP
@@ -5026,9 +5038,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_usd_rub")]]),
         )
     elif data == "usd_rub_reset_markup":
+        await query.answer("Наценка сброшена.")
         save_usd_rub_settings(markup_percent=USD_RUB_MARKUP_PERCENT)
         await refresh_usd_rub_rate_check()
-        await query.answer("Наценка сброшена.")
         await edit_or_send(query, context, usd_rub_admin_text(), usd_rub_admin_keyboard())
     elif data == "admin_notification_chats":
         await query.answer()

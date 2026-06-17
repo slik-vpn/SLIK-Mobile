@@ -268,6 +268,14 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "USD_RUB_MARKUP_PERCENT" in bot_text and "USD_RUB_MARKUP_PERCENT" in env_example_text,
     )
     record(
+        "USD/RUB markup env parsing is safe",
+        "def env_float(" in bot_text and 'USD_RUB_MARKUP_PERCENT = env_float("USD_RUB_MARKUP_PERCENT", 1.5' in bot_text,
+    )
+    record(
+        "USD/RUB markup env is not parsed with bare float at import",
+        'USD_RUB_MARKUP_PERCENT = float(os.environ.get("USD_RUB_MARKUP_PERCENT"' not in bot_text,
+    )
+    record(
         "admin USD/RUB screen exists",
         "💱 Курс USD/RUB" in bot_text and "usd_rub_admin_keyboard" in bot_text,
     )
@@ -284,6 +292,29 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "order payment_details keeps rate_checked_at",
         '"rate_checked_at": lock.get("rate_checked_at")' in order_payment_details_text,
+    )
+    handle_callback_text = function_block(bot_text, "handle_callback")
+    record(
+        "reset manual rate answers callback before external refresh",
+        bool(re.search(
+            r'elif\s+data\s*==\s*"usd_rub_reset_manual":\s*'
+            r'await\s+query\.answer\(.*?\).*?'
+            r'save_usd_rub_settings\(manual_rate=None\).*?'
+            r'await\s+refresh_usd_rub_rate_check\(\)',
+            handle_callback_text,
+            re.DOTALL,
+        )),
+    )
+    record(
+        "reset markup answers callback before external refresh",
+        bool(re.search(
+            r'elif\s+data\s*==\s*"usd_rub_reset_markup":\s*'
+            r'await\s+query\.answer\(.*?\).*?'
+            r'save_usd_rub_settings\(markup_percent=USD_RUB_MARKUP_PERCENT\).*?'
+            r'await\s+refresh_usd_rub_rate_check\(\)',
+            handle_callback_text,
+            re.DOTALL,
+        )),
     )
 
     record(
