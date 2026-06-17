@@ -679,6 +679,22 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "if not is_apple_itunes_fazercards_name(name):" in apple_candidates_text,
     )
     record(
+        "Apple Gift Card $10 without region is not rejected",
+        'if not fazercards_name_has_region(name, region):' not in apple_candidates_text
+        and "has_region = fazercards_name_has_region(name, region)" in apple_candidates_text
+        and "has_amount = fazercards_name_has_amount(name, amount)" in apple_candidates_text,
+    )
+    record(
+        "iTunes $10 without region is not rejected",
+        'if not fazercards_name_has_region(name, region):' not in apple_candidates_text
+        and r"\bitunes\b" in bot_text
+        and "score += 3" in apple_candidates_text,
+    )
+    record(
+        "FazerCards regionless candidates show manual region warning",
+        "проверьте регион FazerCards товара" in function_block(bot_text, "fazercards_select_text"),
+    )
+    record(
         "FazerCards Apple/iTunes mapping has no client.post",
         "client.post" not in mapping_handlers_text,
     )
@@ -690,9 +706,24 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     handle_callback_text = function_block(bot_text, "handle_callback")
     apple_region_text = function_block(bot_text, "apple_id_admin_region_text")
     apple_product_text = function_block(bot_text, "apple_id_admin_product_text")
+    id_alias_text = re.search(r'"id": \((.*?)\),', fazercards_value_text, re.DOTALL).group(1) if re.search(r'"id": \((.*?)\),', fazercards_value_text, re.DOTALL) else ""
+    id_alias_order = [
+        id_alias_text.find(token)
+        for token in ("supplier_product_id", "supplierProductId", "product_id", "productId", '"id"', "slug", "code")
+    ]
     record(
         "FazerCards ID extraction supports category and alternate identifiers",
         all(field in fazercards_value_text for field in ("category_id", "categoryId", "slug", "code", "productId")),
+    )
+    record(
+        "FazerCards supplier/product IDs have priority over generic id/slug/code",
+        all(pos >= 0 for pos in id_alias_order)
+        and id_alias_order[0] < id_alias_order[4]
+        and id_alias_order[1] < id_alias_order[4]
+        and id_alias_order[2] < id_alias_order[4]
+        and id_alias_order[3] < id_alias_order[4]
+        and id_alias_order[2] < id_alias_order[5]
+        and id_alias_order[3] < id_alias_order[6],
     )
     record(
         "FazerCards name extraction supports category labels",
@@ -721,6 +752,13 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "FazerCards товар ✅" in apple_region_text
         and "✅ Привязан как категория" in apple_product_text
         and "✅ Привязан как товар" in apple_product_text,
+    )
+    record(
+        "Apple ID region list keeps enabled status separate from FazerCards mapping status",
+        'status = "✅" if product.get("enabled", True) else "⛔️"' in apple_region_text
+        and "mapping_icon" not in apple_region_text
+        and "FazerCards карта ✅" in apple_region_text
+        and 'lines.append(f"{status}' in apple_region_text,
     )
     record(
         "FazerCards category mapping warns that nominal is not selected",

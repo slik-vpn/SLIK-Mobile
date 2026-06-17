@@ -5786,17 +5786,15 @@ def apple_id_admin_region_text(region: str) -> str:
     if not products:
         lines.append("— товаров нет")
     for product in products:
+        status = "✅" if product.get("enabled", True) else "⛔️"
         if product.get("fazercards_product_id"):
             if product.get("fazercards_mapping_type") == "card":
                 mapping = "FazerCards карта ✅"
-                mapping_icon = "✅"
             else:
                 mapping = "FazerCards категория" if product.get("fazercards_mapping_type") == "category" else "FazerCards товар ✅"
-                mapping_icon = "⚠️" if product.get("fazercards_mapping_type") == "category" else "✅"
         else:
             mapping = "не привязан"
-            mapping_icon = "⚠️"
-        lines.append(f"{mapping_icon} {html_escape(apple_nominal_text(product))} — {html_escape(format_usd(product.get('price_usd')))} — {mapping}")
+        lines.append(f"{status} {html_escape(apple_nominal_text(product))} — {html_escape(format_usd(product.get('price_usd')))} — {mapping}")
     return "\n".join(lines)
 
 
@@ -5881,9 +5879,9 @@ def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
 def fazercards_product_value(item: dict, key: str) -> str:
     aliases = {
         "id": (
-            "id", "uuid", "slug", "code", "sku",
-            "product_id", "productId", "supplier_product_id", "supplierProductId",
-            "category_id", "categoryId", "service_id", "serviceId", "item_id", "itemId",
+            "supplier_product_id", "supplierProductId", "product_id", "productId",
+            "card_id", "cardId", "category_id", "categoryId",
+            "id", "uuid", "sku", "slug", "code", "service_id", "serviceId", "item_id", "itemId",
         ),
         "name": ("name", "title", "product_name", "productName", "category_name", "categoryName", "label"),
     }
@@ -6065,21 +6063,22 @@ def apple_giftcard_candidates(product: dict, items: list[dict], limit: int = 8, 
         name = fazercards_product_value(item, "name")
         if not is_apple_itunes_fazercards_name(name):
             continue
-        if not fazercards_name_has_region(name, region):
-            continue
+        has_region = fazercards_name_has_region(name, region)
         has_amount = fazercards_name_has_amount(name, amount)
-        score = 8
-        if has_amount:
+        score = 1
+        if has_region:
             score += 4
-        scored.append((score, 0 if has_amount else 1, name, item))
-    scored.sort(key=lambda row: (-row[0], row[1], row[2].lower()))
-    return [item for _score, _missing_amount, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][1] == 0)
+        if has_amount:
+            score += 3
+        scored.append((score, 0 if has_region else 1, 0 if has_amount else 1, name, item))
+    scored.sort(key=lambda row: (-row[0], row[1], row[2], row[3].lower()))
+    return [item for _score, _missing_region, _missing_amount, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][1] == 0 and scored[0][2] == 0)
 
 
 def fazercards_select_text(product: dict, exact_match: bool, error: str = "") -> str:
     if error:
         return f"⚠️ {html_escape(error)}\n\nApple Gift Card товары не найдены в FazerCards.\nПроверьте API key или доступность товаров в кабинете FazerCards."
-    warning = "" if exact_match else "⚠️ Точное совпадение не найдено. Выберите товар вручную.\n\n"
+    warning = "" if exact_match else "⚠️ Точное совпадение не найдено. Выберите товар вручную и проверьте регион FazerCards товара.\n\n"
     return f"{warning}Выберите FazerCards товар для:\n<b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>"
 
 
