@@ -536,8 +536,47 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         )),
     )
     record(
-        "FazerCards has no external API integration yet",
-        "fazercards.com" not in bot_text.lower() and "fazer" not in bot_text.lower().replace("fazercards", ""),
+        "FazerCards connection check callback and helper exist",
+        "🔍 Проверить подключение" in bot_text
+        and "admin_fazercards_check" in bot_text
+        and "async def check_fazercards_connection()" in bot_text
+        and "async def fetch_fazercards_balance" in bot_text
+        and "async def fetch_fazercards_products" in bot_text,
+    )
+    record(
+        "FazerCards connection check uses timeout and safe error handling",
+        "FAZERCARDS_TIMEOUT_SECONDS" in bot_text
+        and "timeout=FAZERCARDS_TIMEOUT_SECONDS" in bot_text
+        and "except Exception as exc" in function_block(bot_text, "check_fazercards_connection")
+        and 'logger.warning("FazerCards API check failed: %s", safe_error)' in bot_text,
+    )
+    record(
+        "FazerCards API key stays masked in diagnostics UI",
+        "masked_api_key" in bot_text
+        and "mask_secret(api_key)" in function_block(bot_text, "check_fazercards_connection")
+        and "API key: <code>{html_escape(str(result.get('masked_api_key')" in bot_text
+        and "api_key}" not in function_block(bot_text, "fazercards_connection_result_text"),
+    )
+    record(
+        "FazerCards diagnostics keeps auto issue disabled",
+        'current["auto_issue_enabled"] = False' in bot_text
+        and "Автовыдача: выключена" in bot_text,
+    )
+    record(
+        "FazerCards connection check does not call purchase/order/create endpoints",
+        "client.post" not in function_block(bot_text, "check_fazercards_connection")
+        and "/giftcards/order" not in bot_text
+        and "/topups/order" not in bot_text
+        and "/gamekeys/order" not in bot_text
+        and "/steam-gifts/order" not in bot_text
+        and "/steam-topup/order" not in bot_text
+        and "/manual-services/order" not in bot_text
+        and "/payments/create" not in bot_text,
+    )
+    record(
+        "FazerCards diagnostics has no automatic code issuance",
+        'auto_issue_enabled"] = True' not in bot_text
+        and 'auto_issue_enabled": True' not in bot_text,
     )
     record(
         "legacy admin section callbacks are still routed",

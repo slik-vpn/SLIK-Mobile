@@ -61,6 +61,10 @@ USERS_FILE     = Path(__file__).parent / "users.json"
 BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
 PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
+FAZERCARDS_API_BASE_URL = "https://api.fzr.cards/api/v2"
+FAZERCARDS_TIMEOUT_SECONDS = 8.0
+FAZERCARDS_BALANCE_ENDPOINT = "/balance"
+FAZERCARDS_PRODUCTS_ENDPOINT = "/giftcards?limit=100"
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
     try:
@@ -282,7 +286,17 @@ DEFAULT_CONFIG = {
         "tech_alerts": "",
     },
     "apple_id_products": {},
-    "fazercards": {"api_key": "", "enabled": False, "auto_issue_enabled": False},
+    "fazercards": {
+        "api_key": "",
+        "enabled": False,
+        "auto_issue_enabled": False,
+        "last_check_at": "",
+        "last_check_status": "",
+        "last_check_error": "",
+        "last_balance": "",
+        "last_products_count": None,
+        "apple_products_found": [],
+    },
 }
 
 PAYMENT_METHOD_LABELS = {
@@ -434,6 +448,14 @@ def load_config() -> dict:
     fazercards.setdefault("api_key", "")
     fazercards.setdefault("enabled", False)
     fazercards.setdefault("auto_issue_enabled", False)
+    fazercards.setdefault("last_check_at", "")
+    fazercards.setdefault("last_check_status", "")
+    fazercards.setdefault("last_check_error", "")
+    fazercards.setdefault("last_balance", "")
+    fazercards.setdefault("last_products_count", None)
+    fazercards.setdefault("apple_products_found", [])
+    # Safety invariant: diagnostics must never enable FazerCards auto issue.
+    fazercards["auto_issue_enabled"] = False
     return data
 
 
@@ -1418,19 +1440,125 @@ def apple_id_product_by_id(product_id: str) -> dict | None:
 
 def get_fazercards_settings() -> dict:
     settings = load_config().get("fazercards") or {}
-    return {"api_key": str(settings.get("api_key") or ""), "enabled": bool(settings.get("enabled", False)), "auto_issue_enabled": bool(settings.get("auto_issue_enabled", False))}
+    return {
+        "api_key": str(settings.get("api_key") or ""),
+        "enabled": bool(settings.get("enabled", False)),
+        "auto_issue_enabled": False,
+        "last_check_at": str(settings.get("last_check_at") or ""),
+        "last_check_status": str(settings.get("last_check_status") or ""),
+        "last_check_error": str(settings.get("last_check_error") or ""),
+        "last_balance": str(settings.get("last_balance") or ""),
+        "last_products_count": settings.get("last_products_count"),
+        "apple_products_found": settings.get("apple_products_found") if isinstance(settings.get("apple_products_found"), list) else [],
+    }
+
+
+def get_fazercards_api_key() -> str:
+    return str(get_fazercards_settings().get("api_key") or "").strip()
+
+
+def fazercards_headers(api_key: str | None = None) -> dict:
+    return {"X-API-Key": str(api_key if api_key is not None else get_fazercards_api_key()).strip()}
+
+
+def save_fazercards_settings(settings: dict) -> None:
+    cfg = load_config()
+    current = cfg.get("fazercards") if isinstance(cfg.get("fazercards"), dict) else {}
+    current.update(settings)
+    current["enabled"] = False
+    current["auto_issue_enabled"] = False
+    cfg["fazercards"] = current
+    save_config(cfg)
 
 
 def save_fazercards_api_key(api_key: str) -> None:
-    cfg = load_config()
-    cfg["fazercards"] = {"api_key": str(api_key or "").strip(), "enabled": False, "auto_issue_enabled": False}
-    save_config(cfg)
+    save_fazercards_settings({"api_key": str(api_key or "").strip(), "last_check_status": "", "last_check_error": ""})
 
 
 def clear_fazercards_api_key() -> None:
-    cfg = load_config()
-    cfg["fazercards"] = {"api_key": "", "enabled": False, "auto_issue_enabled": False}
-    save_config(cfg)
+    save_fazercards_settings({"api_key": "", "last_check_status": "", "last_check_error": "", "last_balance": "", "last_products_count": None, "apple_products_found": []})
+
+
+def fazercards_checked_at() -> str:
+    return datetime.datetime.now(tz=TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def fazercards_api_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        detail = ""
+        try:
+            payload = exc.response.json()
+            detail = str(payload.get("error") or payload.get("message") or "") if isinstance(payload, dict) else ""
+        except Exception:
+            detail = exc.response.text[:120]
+        return f"HTTP {exc.response.status_code}" + (f" / {detail}" if detail else "")
+    if isinstance(exc, ValueError):
+        return f"parse error: {exc}"
+    return str(exc) or exc.__class__.__name__
+
+
+async def fetch_fazercards_balance(client: httpx.AsyncClient, api_key: str) -> dict:
+    response = await client.get(FAZERCARDS_BALANCE_ENDPOINT, headers=fazercards_headers(api_key))
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise ValueError(str(data.get("error") if isinstance(data, dict) else "invalid response"))
+    return data
+
+
+async def fetch_fazercards_products(client: httpx.AsyncClient, api_key: str) -> dict:
+    response = await client.get(FAZERCARDS_PRODUCTS_ENDPOINT, headers=fazercards_headers(api_key))
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict) or not data.get("ok"):
+        raise ValueError(str(data.get("error") if isinstance(data, dict) else "invalid response"))
+    return data
+
+
+def summarize_fazercards_products(products_payload: dict) -> tuple[int, list[str]]:
+    items = products_payload.get("items") if isinstance(products_payload, dict) else []
+    if not isinstance(items, list):
+        items = []
+    found = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("title") or "")
+        normalized = name.lower()
+        if "apple" in normalized and "gift" in normalized and "card" in normalized:
+            found.append(name)
+    return len(items), found[:10]
+
+
+async def check_fazercards_connection() -> dict:
+    api_key = get_fazercards_api_key()
+    checked_at = fazercards_checked_at()
+    if not api_key:
+        result = {"ok": False, "error": "API key не указан", "checked_at": checked_at, "masked_api_key": mask_secret(api_key)}
+        save_fazercards_settings({"last_check_at": checked_at, "last_check_status": "error", "last_check_error": result["error"]})
+        return result
+    try:
+        async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            balance_payload, products_payload = await asyncio.gather(fetch_fazercards_balance(client, api_key), fetch_fazercards_products(client, api_key))
+        products_count, apple_products = summarize_fazercards_products(products_payload)
+        balance = str(balance_payload.get("balance") or "")
+        currency = str(balance_payload.get("currency") or "USD")
+        save_fazercards_settings({
+            "last_check_at": checked_at,
+            "last_check_status": "success",
+            "last_check_error": "",
+            "last_balance": f"{balance} {currency}".strip(),
+            "last_products_count": products_count,
+            "apple_products_found": apple_products,
+        })
+        return {"ok": True, "checked_at": checked_at, "balance": balance, "currency": currency, "products_count": products_count, "apple_products": apple_products, "masked_api_key": mask_secret(api_key)}
+    except Exception as exc:
+        safe_error = fazercards_api_error(exc)
+        logger.warning("FazerCards API check failed: %s", safe_error)
+        save_fazercards_settings({"last_check_at": checked_at, "last_check_status": "error", "last_check_error": safe_error})
+        return {"ok": False, "error": safe_error, "checked_at": checked_at, "masked_api_key": mask_secret(api_key)}
 
 
 def mask_secret(value) -> str:
@@ -5656,20 +5784,76 @@ def delete_apple_id_product(product_id: str) -> dict | None:
     return None
 
 
+def fazercards_last_check_text(settings: dict) -> str:
+    status = str(settings.get("last_check_status") or "")
+    if status == "success":
+        status_label = "успешно"
+    elif status == "error":
+        status_label = "ошибка"
+    else:
+        status_label = "не проверялось"
+    balance = settings.get("last_balance") or "—"
+    products_count = settings.get("last_products_count")
+    products_label = str(products_count) if products_count is not None else "—"
+    apple_found = settings.get("apple_products_found") or []
+    apple_label = "найдено" if apple_found else ("не найдено" if status else "—")
+    checked_at = settings.get("last_check_at") or "—"
+    error = settings.get("last_check_error") or ""
+    lines = [
+        "Последняя проверка:",
+        f"Статус: {status_label}",
+        f"Баланс: {html_escape(balance)}",
+        f"Товаров найдено: {html_escape(products_label)}",
+        f"Apple Gift Card: {apple_label}",
+        f"Проверено: {html_escape(checked_at)}",
+    ]
+    if error and status == "error":
+        lines.append(f"Ошибка: {html_escape(error)}")
+    return "\n".join(lines)
+
+
 def fazercards_api_text() -> str:
     settings = get_fazercards_settings()
     connected = bool(settings.get("api_key"))
     return (
         "🔑 <b>FazerCards API</b>\n\n"
-        f"Статус: {'подключён' if connected else 'не подключён'}\n\n"
+        f"Статус API key: {'подключён' if connected else 'не подключён'}\n"
         f"API key: <code>{html_escape(mask_secret(settings.get('api_key')))}</code>\n\n"
-        "Здесь можно сохранить API ключ FazerCards для будущей автовыдачи Apple Gift Card.\n\n"
+        "Автовыдача: выключена\n\n"
+        f"{fazercards_last_check_text(settings)}\n\n"
         "На этом этапе автовыдача отключена."
+    )
+
+
+def fazercards_connection_result_text(result: dict) -> str:
+    if result.get("ok"):
+        apple_products = result.get("apple_products") or []
+        apple_block = ""
+        if apple_products:
+            apple_block = "\nApple / Gift Card товары:\n" + "\n".join(f"• {html_escape(str(name))} — доступно" for name in apple_products[:5]) + "\n"
+        else:
+            apple_block = "\n⚠️ Подключение успешно, но Apple Gift Card USA/Turkey не найдены в списке продуктов.\n"
+        return (
+            "🔑 <b>FazerCards API</b>\n\n"
+            "✅ Подключение успешно\n\n"
+            f"Баланс: {html_escape(str(result.get('balance') or '—'))} {html_escape(str(result.get('currency') or 'USD'))}\n"
+            f"Товаров найдено: {html_escape(str(result.get('products_count') or 0))}\n"
+            f"{apple_block}\n"
+            f"Проверено: {html_escape(str(result.get('checked_at') or ''))}"
+        )
+    return (
+        "🔑 <b>FazerCards API</b>\n\n"
+        "❌ Не удалось проверить подключение.\n\n"
+        "Причина:\n"
+        f"{html_escape(str(result.get('error') or 'unknown error'))}\n\n"
+        f"API key: <code>{html_escape(str(result.get('masked_api_key') or 'не подключён'))}</code>\n\n"
+        f"Проверено: {html_escape(str(result.get('checked_at') or ''))}"
     )
 
 
 def fazercards_api_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 Проверить подключение", callback_data="admin_fazercards_check")],
         [InlineKeyboardButton("✏️ Указать API key", callback_data="admin_fazercards_set")],
         [InlineKeyboardButton("🧹 Удалить API key", callback_data="admin_fazercards_clear")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_service_sections")],
@@ -6197,6 +6381,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["client_input"] = FAZERCARDS_INPUT_API_KEY
         await query.answer()
         await edit_or_send(query, context, "Введите FazerCards API key.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_fazercards_api")]]))
+    elif data == "admin_fazercards_check":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        if not get_fazercards_api_key():
+            await query.answer("API key не указан.", show_alert=True)
+            await edit_or_send(query, context, "⚠️ API key не указан.\nСначала укажите FazerCards API key.", fazercards_api_keyboard())
+            return
+        await query.answer("Проверяю подключение...")
+        result = await check_fazercards_connection()
+        await edit_or_send(query, context, fazercards_connection_result_text(result), fazercards_api_keyboard())
     elif data == "admin_fazercards_clear":
         if not has_owner_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
