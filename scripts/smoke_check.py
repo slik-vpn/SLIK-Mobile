@@ -276,26 +276,63 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "USD_RUB_MIN_RATE <= rate <= USD_RUB_MAX_RATE" in function_block(bot_text, "normalize_rate")
         and "30 <= rate <= 200" not in function_block(bot_text, "normalize_rate"),
     )
+    providers_text = function_block(bot_text, "usd_rub_source_providers")
+    collect_text = function_block(bot_text, "collect_usd_rub_source_rates")
+    calculate_text = function_block(bot_text, "calculate_usd_rub_market_rate")
     get_rate_text = function_block(bot_text, "get_usd_rub_rate")
     check_market_text = function_block(bot_text, "check_market_usd_rub_rate")
+    extract_text = function_block(bot_text, "extract_rate_from_text")
     record(
-        "Yandex parser is not the only mandatory USD/RUB source",
-        all(source in get_rate_text for source in ("ЦБ РФ", "open.er-api.com", "exchangerate.host", "Яндекс"))
-        and get_rate_text.find("ЦБ РФ") < get_rate_text.find("Яндекс"),
+        "normalize_rate accepts realistic 78.25 RUB rate",
+        "USD_RUB_MIN_RATE <= rate <= USD_RUB_MAX_RATE" in function_block(bot_text, "normalize_rate")
+        and "USD_RUB_MIN_RATE" in bot_text and "USD_RUB_MAX_RATE" in bot_text,
     )
     record(
-        "market rate check continues after provider returns None",
-        "if rate is not None:" in check_market_text and 'logger.warning("Источник %s вернул невалидное значение' in check_market_text,
+        "Yandex parser is not the only mandatory USD/RUB source",
+        all(source in providers_text for source in ("ЦБ РФ", "open.er-api.com", "exchangerate.host", "Яндекс"))
+        and providers_text.find("ЦБ РФ") < providers_text.find("Яндекс"),
+    )
+    record(
+        "market rate collection continues after provider returns None",
+        "for source, provider in usd_rub_source_providers()" in collect_text
+        and "results.append(item)" in collect_text
+        and "returned invalid value" in collect_text,
+    )
+    record(
+        "multiple valid USD/RUB sources are averaged",
+        "len(filtered) >= 2" in calculate_text and "sum(float(item" in calculate_text and "среднее по" in calculate_text,
+    )
+    record(
+        "invalid 30 source does not participate in average",
+        "rate = normalize_rate(raw_rate)" in collect_text and "if rate is not None:" in collect_text,
+    )
+    record(
+        "USD/RUB outlier is rejected when three or more sources are valid",
+        "len(valid) >= 3" in calculate_text
+        and "USD_RUB_MAX_SOURCE_DEVIATION_PERCENT" in calculate_text
+        and "отклонение" in calculate_text,
+    )
+    record(
+        "single valid USD/RUB source is used with warning method",
+        "len(filtered) == 1" in calculate_text and "один источник" in calculate_text,
     )
     record(
         "USD/RUB fallback only after all providers fail",
-        check_market_text.rfind('return USD_RUB_FALLBACK_RATE, "fallback"') > check_market_text.rfind("for source, provider in providers"),
+        calculate_text.rfind('return USD_RUB_FALLBACK_RATE, "fallback"') > calculate_text.rfind("len(filtered) == 1"),
+    )
+    record(
+        "Yandex parser does not reject today context by bare дн substring",
+        "сегодня" not in extract_text and "дн|" not in extract_text and "\\bдн" in extract_text,
+    )
+    record(
+        "Yandex parser rejects days labels rather than treating 30 days as rate",
+        "\\bдней" in extract_text and "\\bдн" in extract_text and "ignored_context.search(context)" in extract_text,
     )
     record(
         "manual USD/RUB rate keeps payment priority",
         "manual_rate = get_manual_usd_rub_rate()" in get_rate_text
         and 'return round(manual_rate, 4), "manual"' in get_rate_text
-        and get_rate_text.find("manual_rate = get_manual_usd_rub_rate()") < get_rate_text.find("providers ="),
+        and get_rate_text.find("manual_rate = get_manual_usd_rub_rate()") < get_rate_text.find("collect_usd_rub_source_rates"),
     )
     record(
         "USD/RUB markup env parsing is safe",

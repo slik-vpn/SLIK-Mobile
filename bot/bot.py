@@ -78,6 +78,7 @@ USD_RUB_MIN_RATE = env_float("USD_RUB_MIN_RATE", 50, 1, 500)
 USD_RUB_MAX_RATE = env_float("USD_RUB_MAX_RATE", 200, USD_RUB_MIN_RATE, 500)
 USD_RUB_FALLBACK_RATE = env_float("USD_RUB_FALLBACK_RATE", 90, USD_RUB_MIN_RATE, USD_RUB_MAX_RATE)
 USD_RUB_MARKUP_PERCENT = env_float("USD_RUB_MARKUP_PERCENT", 1.5, 0, 30)
+USD_RUB_MAX_SOURCE_DEVIATION_PERCENT = 5
 CARD_RATE_LOCK_SECONDS = 5 * 60
 
 def env_int(name: str, default: int) -> int:
@@ -250,6 +251,8 @@ DEFAULT_CONFIG = {
         "rate_source": "",
         "market_usd_rub_rate": None,
         "final_usd_rub_rate": None,
+        "rate_method": "",
+        "rate_diagnostics": [],
     },
     "notification_chats": {
         "orders": "",
@@ -681,7 +684,13 @@ def extract_rate_from_text(text: str) -> float | None:
         r"(\d{2,3}(?:[.,]\d{1,6})?)\s*(?:₽|руб|rub|rur)[^а-яa-z0-9]{0,80}"
         r"(?:за|=|/)?\s*(?:1\s*)?(?:usd|доллар|доллара|доллар сша|\$)"
     )
-    ignored_context = re.compile(r"(?i)(?:дн|день|дней|месяц|год|график|%|процент|январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)")
+    ignored_context = re.compile(
+        r"(?i)(?:\bдн\.?\b|\bдень\b|\bдней\b|\bдня\b|"
+        r"\bмесяц\w*\b|\bгод\w*\b|\bграфик\w*\b|%|\bпроцент\w*\b|"
+        r"\bянвар\w*\b|\bфеврал\w*\b|\bмарт\w*\b|\bапрел\w*\b|\bма[йя]\b|"
+        r"\bиюн\w*\b|\bиюл\w*\b|\bавгуст\w*\b|\bсентябр\w*\b|"
+        r"\bоктябр\w*\b|\bноябр\w*\b|\bдекабр\w*\b)"
+    )
     for match in currency_context.finditer(clean_text):
         raw = next((group for group in match.groups() if group), None)
         if not raw:
@@ -757,59 +766,107 @@ async def fetch_exchangerate_host_usd_rub_rate(client: httpx.AsyncClient) -> flo
     return normalize_rate(data.get("rates", {}).get("RUB"))
 
 
+def usd_rub_source_providers() -> list[tuple[str, object]]:
+    return [
+        ("ЦБ РФ", fetch_cbr_usd_rub_rate),
+        ("open.er-api.com", fetch_open_er_usd_rub_rate),
+        ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
+        ("Яндекс", fetch_yandex_usd_rub_rate),
+    ]
+
+
+async def collect_usd_rub_source_rates(client: httpx.AsyncClient) -> list[dict]:
+    results = []
+    for source, provider in usd_rub_source_providers():
+        item = {"source": source, "rate": None, "status": "rejected", "reason": "нет валидного курса"}
+        try:
+            raw_rate = await provider(client)
+            rate = normalize_rate(raw_rate)
+            if rate is not None:
+                item.update({"rate": round(rate, 4), "status": "accepted", "reason": ""})
+                logger.info("USD/RUB source %s accepted rate %.4f", source, rate)
+            else:
+                item["raw_rate"] = raw_rate
+                if raw_rate is None:
+                    item["reason"] = "источник не вернул курс"
+                else:
+                    item["reason"] = (
+                        f"значение {raw_rate:.4f} ₽ вне допустимого диапазона "
+                        f"{USD_RUB_MIN_RATE:g}–{USD_RUB_MAX_RATE:g} ₽"
+                    )
+                logger.warning("USD/RUB source %s returned invalid value %s, skipped", source, raw_rate)
+        except Exception as e:
+            item.update({"status": "error", "reason": str(e)})
+            logger.warning("USD/RUB source %s failed: %s", source, e)
+        results.append(item)
+    return results
+
+
+def calculate_usd_rub_market_rate(source_results: list[dict]) -> tuple[float, str, list[dict]]:
+    valid = [item for item in source_results if item.get("status") == "accepted" and normalize_rate(item.get("rate")) is not None]
+    filtered = valid
+    if len(valid) >= 3:
+        sorted_rates = sorted(float(item["rate"]) for item in valid)
+        middle = len(sorted_rates) // 2
+        median = sorted_rates[middle] if len(sorted_rates) % 2 else (sorted_rates[middle - 1] + sorted_rates[middle]) / 2
+        filtered = []
+        for item in valid:
+            rate = float(item["rate"])
+            deviation = abs(rate - median) / median * 100 if median else 0
+            if deviation > USD_RUB_MAX_SOURCE_DEVIATION_PERCENT:
+                item.update({
+                    "status": "rejected",
+                    "reason": f"выброс: отклонение {deviation:.2f}% от медианы {median:.4f} ₽",
+                })
+                logger.warning("USD/RUB source %s rejected as outlier: %.4f", item.get("source"), rate)
+            else:
+                filtered.append(item)
+    if len(filtered) >= 2:
+        rate = round(sum(float(item["rate"]) for item in filtered) / len(filtered), 4)
+        method = f"среднее по {len(filtered)} источникам"
+        logger.info("USD/RUB average rate calculated from %s sources: %.4f", len(filtered), rate)
+        return rate, method, source_results
+    if len(filtered) == 1:
+        rate = round(float(filtered[0]["rate"]), 4)
+        method = f"один источник: {filtered[0].get('source')}"
+        logger.warning("USD/RUB rate calculated from only one source: %s %.4f", filtered[0].get("source"), rate)
+        return rate, method, source_results
+    logger.warning("USD/RUB fallback used because all sources failed")
+    return USD_RUB_FALLBACK_RATE, "fallback", source_results
+
+
 async def get_usd_rub_rate() -> tuple[float, str]:
     manual_rate = get_manual_usd_rub_rate()
     if manual_rate:
         return round(manual_rate, 4), "manual"
-    providers = [
-        ("ЦБ РФ", fetch_cbr_usd_rub_rate),
-        ("open.er-api.com", fetch_open_er_usd_rub_rate),
-        ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
-        ("Яндекс", fetch_yandex_usd_rub_rate),
-    ]
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        for source, provider in providers:
-            try:
-                rate = await provider(client)
-                if rate is not None:
-                    return round(rate, 4), source
-                logger.warning("Источник %s вернул невалидное значение, пропущено", source)
-            except Exception as e:
-                logger.warning("Не удалось получить USD/RUB из %s: %s", source, e)
-    logger.warning(
-        "Не удалось получить USD/RUB из внешних источников; используется fallback %.2f",
-        USD_RUB_FALLBACK_RATE,
-    )
-    return USD_RUB_FALLBACK_RATE, "fallback"
+        source_results = await collect_usd_rub_source_rates(client)
+    rate, method, _ = calculate_usd_rub_market_rate(source_results)
+    return rate, method
 
 
 async def check_market_usd_rub_rate() -> tuple[float, str]:
-    providers = [
-        ("ЦБ РФ", fetch_cbr_usd_rub_rate),
-        ("open.er-api.com", fetch_open_er_usd_rub_rate),
-        ("exchangerate.host", fetch_exchangerate_host_usd_rub_rate),
-        ("Яндекс", fetch_yandex_usd_rub_rate),
-    ]
     async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        for source, provider in providers:
-            try:
-                rate = await provider(client)
-                if rate is not None:
-                    return round(rate, 4), source
-                logger.warning("Источник %s вернул невалидное значение, пропущено", source)
-            except Exception as e:
-                logger.warning("Не удалось проверить USD/RUB из %s: %s", source, e)
-    return USD_RUB_FALLBACK_RATE, "fallback"
+        source_results = await collect_usd_rub_source_rates(client)
+    rate, method, _ = calculate_usd_rub_market_rate(source_results)
+    return rate, method
 
+
+async def check_market_usd_rub_rate_with_diagnostics() -> tuple[float, str, list[dict]]:
+    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+        source_results = await collect_usd_rub_source_rates(client)
+    return calculate_usd_rub_market_rate(source_results)
 
 async def refresh_usd_rub_rate_check() -> tuple[float, str]:
-    rate, source = await check_market_usd_rub_rate()
+    rate, source, diagnostics = await check_market_usd_rub_rate_with_diagnostics()
     markup = get_configured_usd_rub_markup_percent()
     manual_rate = get_manual_usd_rub_rate()
     base_rate = manual_rate or rate
     save_usd_rub_settings(
         rate_checked_at=now_str(),
         rate_source=source,
+        rate_method=source,
+        rate_diagnostics=diagnostics,
         market_usd_rub_rate=round(rate, 4),
         final_usd_rub_rate=round(base_rate * (1 + markup / 100), 4),
     )
@@ -2642,6 +2699,30 @@ def payment_methods_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def usd_rub_diagnostics_text(settings: dict) -> str:
+    diagnostics = settings.get("rate_diagnostics")
+    if not isinstance(diagnostics, list) or not diagnostics:
+        return ""
+    lines = ["", "Источники:"]
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        source = html_escape(str(item.get("source") or "—"))
+        rate = normalize_rate(item.get("rate"))
+        if item.get("status") == "accepted" and rate is not None:
+            lines.append(f"✅ {source}: {rate:.4f} ₽")
+        else:
+            reason = html_escape(str(item.get("reason") or "отклонён"))
+            raw_value = item.get("raw_rate")
+            try:
+                raw_rate = float(raw_value)
+            except (TypeError, ValueError):
+                raw_rate = None
+            raw_text = f", значение {raw_rate:.4f} ₽" if raw_rate is not None else ""
+            lines.append(f"❌ {source}: {reason}{raw_text}")
+    return "\n".join(lines) + "\n"
+
+
 def usd_rub_admin_text() -> str:
     settings = get_usd_rub_settings()
     markup = get_configured_usd_rub_markup_percent()
@@ -2650,6 +2731,15 @@ def usd_rub_admin_text() -> str:
     market_rate = normalize_rate(settings.get("market_usd_rub_rate"))
     final_rate = normalize_rate(settings.get("final_usd_rub_rate"))
     source = settings.get("rate_source") or "—"
+    diagnostics_text = usd_rub_diagnostics_text(settings)
+    method_warning = ""
+    if str(source).startswith("один источник"):
+        method_warning = "⚠️ Внимание: курс рассчитан только по одному источнику.\n"
+    elif source == "fallback":
+        method_warning = (
+            "⚠️ Используется fallback-курс.\n"
+            "Причина: все источники недоступны или вернули невалидный курс.\n"
+        )
     active_rate = manual_rate or market_rate or USD_RUB_FALLBACK_RATE
     calculated_final = active_rate * (1 + markup / 100)
     market_rate_text = f"{market_rate:.4f} ₽" if market_rate else "—"
@@ -2660,6 +2750,8 @@ def usd_rub_admin_text() -> str:
         f"Источник: <b>{html_escape(str(source))}</b>\n"
         f"Рыночный курс: <b>{market_rate_text}</b>\n"
         f"Ручной курс: <b>{manual_rate_text}</b>\n"
+        f"{method_warning}"
+        f"{diagnostics_text}"
         f"Наценка: <b>{markup:g}%</b>\n"
         f"Итоговый курс: <b>{(final_rate or calculated_final):.4f} ₽</b>\n\n"
         "Итоговый курс используется для расчёта оплаты картой."
