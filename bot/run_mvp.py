@@ -121,7 +121,12 @@ def format_order_list(orders: list, title: str) -> list[str]:
 
 
 async def track_action(context, user, action: str, extra: str = "") -> None:
-    admin_id = bot.get_admin_chat_id()
+    admin_id, route_source = bot.get_client_activity_chat_source()
+    logger.info(
+        "notification route selected: type=client_activity chat_id=%s source=%s helper=get_client_activity_chat_source run_mvp",
+        admin_id,
+        route_source,
+    )
     if not admin_id:
         return
     text = f"<b>Действие клиента</b>\n\nДействие: {escape_html(action)}"
@@ -131,7 +136,8 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
         f"\n\nИмя: {escape_html(getattr(user, 'full_name', '-'))}\n"
         f"Username: {safe_user_tag(user)}\n"
         f"Telegram ID: <code>{getattr(user, 'id', '-')}</code>\n"
-        f"Время: {bot.now_str()}"
+        f"Время: {bot.now_str()}\n"
+        f"Маршрут: client_activity · {escape_html(route_source)} · <code>{escape_html(admin_id)}</code>"
     )
     try:
         await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
@@ -154,9 +160,14 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
-    admin_id = bot.get_admin_chat_id()
+    admin_id, route_source = bot.get_orders_chat_source()
+    logger.info(
+        "notification route selected: type=orders chat_id=%s source=%s helper=get_orders_chat_source run_mvp",
+        admin_id,
+        route_source,
+    )
     if not admin_id:
-        logger.warning("ADMIN_CHAT_ID is not set; order notification was not sent")
+        logger.warning("Orders notification chat and ADMIN_CHAT_ID are not set; order notification was not sent")
         return
     payment_line = f"Оплата: <b>{escape_html(order.get('payment_method'))}</b>\n" if order.get("payment_method") else ""
     text = (
@@ -167,7 +178,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         f"{payment_line}\n"
         f"Имя: <b>{escape_html(order.get('name'))}</b>\n"
         f"Telegram: <b>{escape_html(order.get('tg_handle'))}</b>\n\n"
-        f"{escape_html(order.get('created_at'))}"
+        f"{escape_html(order.get('created_at'))}\n"
+        f"Маршрут: orders · {escape_html(route_source)} · <code>{escape_html(admin_id)}</code>"
     )
     try:
         await context.bot.send_message(

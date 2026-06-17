@@ -63,7 +63,8 @@ PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
 
 USD_RUB_FALLBACK_RATE = float(os.environ.get("USD_RUB_FALLBACK_RATE", "90"))
-CARD_PAYMENT_MARKUP_PERCENT = 1.5
+DEFAULT_USD_RUB_MARKUP_PERCENT = float(os.environ.get("USD_RUB_MARKUP_PERCENT", "0") or 0)
+CARD_PAYMENT_MARKUP_PERCENT = DEFAULT_USD_RUB_MARKUP_PERCENT
 CARD_RATE_LOCK_SECONDS = 5 * 60
 
 def env_int(name: str, default: int) -> int:
@@ -77,6 +78,10 @@ ABANDONED_CHECKOUT_MAX_AGE_HOURS = 24
 ESIM_EXPIRY_REMINDER_DAYS_BEFORE = env_int("ESIM_EXPIRY_REMINDER_DAYS_BEFORE", 1)
 ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS = env_int("ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS", 60)
 ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS = 60 * 60
+
+
+def is_cashback_enabled() -> bool:
+    return str(os.environ.get("CASHBACK_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BACKUPS_DIR = PROJECT_ROOT / "backups"
@@ -291,6 +296,8 @@ DEFAULT_PAYMENT_METHODS = {
 
 PAYMENT_ADMIN_INPUT_TITLE = "payment_title"
 PAYMENT_ADMIN_INPUT_CREDENTIALS = "payment_credentials"
+USD_RATE_INPUT_MANUAL = "usd_rate_manual"
+USD_RATE_INPUT_MARKUP = "usd_rate_markup"
 
 
 def runtime_default_value(path: Path):
@@ -667,7 +674,56 @@ async def fetch_exchangerate_host_usd_rub_rate(client: httpx.AsyncClient) -> flo
     return normalize_rate(data.get("rates", {}).get("RUB"))
 
 
+def get_payment_settings() -> dict:
+    cfg = load_config()
+    payment = cfg.get("payment") if isinstance(cfg.get("payment"), dict) else {}
+    return payment
+
+
+def get_manual_usd_rub_rate() -> float | None:
+    return normalize_rate(get_payment_settings().get("manual_usd_rub_rate"))
+
+
+def get_usd_rub_markup_percent() -> float:
+    payment = get_payment_settings()
+    raw_markup = payment.get("usd_rub_markup_percent")
+    if raw_markup in {None, ""}:
+        raw_markup = os.environ.get("USD_RUB_MARKUP_PERCENT", DEFAULT_USD_RUB_MARKUP_PERCENT)
+    try:
+        markup = float(str(raw_markup).replace(",", "."))
+    except (TypeError, ValueError):
+        return DEFAULT_USD_RUB_MARKUP_PERCENT
+    return max(0.0, min(markup, 100.0))
+
+
+def set_manual_usd_rub_rate(rate: float | None) -> None:
+    cfg = load_config()
+    if not isinstance(cfg.get("payment"), dict):
+        cfg["payment"] = {}
+    payment = cfg["payment"]
+    if rate is None:
+        payment.pop("manual_usd_rub_rate", None)
+    else:
+        payment["manual_usd_rub_rate"] = round(rate, 4)
+    save_config(cfg)
+
+
+def set_usd_rub_markup_percent(markup: float | None) -> None:
+    cfg = load_config()
+    if not isinstance(cfg.get("payment"), dict):
+        cfg["payment"] = {}
+    payment = cfg["payment"]
+    if markup is None:
+        payment.pop("usd_rub_markup_percent", None)
+    else:
+        payment["usd_rub_markup_percent"] = round(max(0.0, min(markup, 100.0)), 4)
+    save_config(cfg)
+
+
 async def get_usd_rub_rate() -> tuple[float, str]:
+    manual_rate = get_manual_usd_rub_rate()
+    if manual_rate is not None:
+        return round(manual_rate, 4), "manual"
     providers = [
         ("Яндекс", fetch_yandex_usd_rub_rate),
         ("ЦБ РФ", fetch_cbr_usd_rub_rate),
@@ -686,19 +742,23 @@ async def get_usd_rub_rate() -> tuple[float, str]:
         "Не удалось получить USD/RUB из внешних источников; используется fallback %.2f",
         USD_RUB_FALLBACK_RATE,
     )
-    return USD_RUB_FALLBACK_RATE, "USD_RUB_FALLBACK_RATE"
+    return USD_RUB_FALLBACK_RATE, "fallback USD_RUB_FALLBACK_RATE"
 
 
 async def create_card_payment_lock(plan: dict) -> dict:
     usd_price = parse_price(plan.get("price", "0"))
     rate, source = await get_usd_rub_rate()
-    rub_amount = math.ceil(usd_price * rate * (1 + CARD_PAYMENT_MARKUP_PERCENT / 100))
+    markup_percent = get_usd_rub_markup_percent()
+    final_rate = rate * (1 + markup_percent / 100)
+    rub_amount = math.ceil(usd_price * final_rate)
     locked_until = rate_lock_now() + datetime.timedelta(seconds=CARD_RATE_LOCK_SECONDS)
     return {
         "usd_price": usd_price,
         "usd_rub_rate": round(rate, 2),
+        "final_usd_rub_rate": round(final_rate, 2),
         "rate_source": source,
-        "markup_percent": CARD_PAYMENT_MARKUP_PERCENT,
+        "rate_checked_at": now_str(),
+        "markup_percent": markup_percent,
         "rub_amount": rub_amount,
         "rate_locked_until": locked_until.isoformat(timespec="seconds"),
     }
@@ -711,7 +771,7 @@ def build_card_payment_text(plan: dict, card: str, lock: dict) -> str:
         f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
         "К оплате:\n"
         f"<b>{format_rub(lock.get('rub_amount'))}</b>\n"
-        "Сумма зафиксирована на 5 минут.\n"
+        "Курс и сумма зафиксированы на момент создания заявки на 5 минут.\n"
         "Карта:\n"
         f"{card_text}\n"
         "Переведите сумму и нажмите «Я оплатил»."
@@ -735,7 +795,9 @@ def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> di
         "usd_price": lock.get("usd_price"),
         "usd_rub_rate": lock.get("usd_rub_rate"),
         "rate_source": lock.get("rate_source"),
+        "rate_checked_at": lock.get("rate_checked_at"),
         "markup_percent": lock.get("markup_percent"),
+        "final_usd_rub_rate": lock.get("final_usd_rub_rate"),
         "rub_amount": lock.get("rub_amount"),
         "rate_locked_until": lock.get("rate_locked_until"),
     }
@@ -973,6 +1035,8 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
 
 
 def award_cashback_if_needed(profile: dict, order: dict) -> float:
+    if not is_cashback_enabled():
+        return 0.0
     if order.get("cashback_awarded"):
         return 0.0
     if not is_revenue_order(order):
@@ -1583,7 +1647,7 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
     """Отправляет уведомление о действии клиента в выбранный чат."""
     admin_id = get_client_activity_chat_id()
     _route_chat_id, source = get_client_activity_chat_source()
-    logger.info("client activity route: client_activity chat %s (source: %s, helper: get_client_activity_chat_id)", admin_id, source)
+    logger.info("notification route selected: type=client_activity chat_id=%s source=%s helper=get_client_activity_chat_id", admin_id, source)
     if not admin_id:
         return
     text = f"👣 <b>Действие клиента</b>\n\nДействие: {html_escape(action)}"
@@ -1593,7 +1657,8 @@ async def track_action(context, user, action: str, extra: str = "") -> None:
         f"\n\n👤 Имя: {html_escape(user.full_name)}\n"
         f"📨 Username: {user_tag_html(user)}\n"
         f"🆔 Telegram ID: <code>{user.id}</code>\n"
-        f"🕒 Время: {now_str()}"
+        f"🕒 Время: {now_str()}\n"
+        f"Маршрут: client_activity · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
     )
     try:
         await context.bot.send_message(chat_id=admin_id, text=text, parse_mode="HTML")
@@ -1619,6 +1684,8 @@ async def notify_new_client(
         return
 
     chat_id = get_new_clients_chat_id()
+    _route_chat_id, route_source = get_new_clients_chat_source()
+    logger.info("notification route selected: type=new_clients chat_id=%s source=%s helper=get_new_clients_chat_id", chat_id, route_source)
     if not chat_id:
         return
 
@@ -2497,8 +2564,55 @@ def payment_methods_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(str(method.get("title") or key), callback_data=f"payment_method:{key}")]
         for key, method in load_payment_methods().items()
     ]
+    rows.append([InlineKeyboardButton("💱 Курс USD/RUB", callback_data="usd_rate")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
+
+
+def usd_rate_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверить сейчас", callback_data="usd_rate_refresh")],
+        [InlineKeyboardButton("🧾 Проверить расчёт $10", callback_data="usd_rate_calc_10")],
+        [InlineKeyboardButton("✏️ Ручной курс", callback_data="usd_rate_set_manual")],
+        [InlineKeyboardButton("🧹 Сбросить ручной курс", callback_data="usd_rate_reset_manual")],
+        [InlineKeyboardButton("✏️ Изменить наценку", callback_data="usd_rate_set_markup")],
+        [InlineKeyboardButton("🧹 Сбросить наценку", callback_data="usd_rate_reset_markup")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_payments")],
+    ])
+
+
+def format_rate_amount(usd_amount: float, final_rate: float) -> str:
+    return format_rub(math.ceil(usd_amount * final_rate))
+
+
+async def usd_rate_admin_text() -> str:
+    try:
+        rate, source = await get_usd_rub_rate()
+        error_text = ""
+    except Exception as exc:
+        logger.warning("USD/RUB admin check failed: %s", exc)
+        rate, source = USD_RUB_FALLBACK_RATE, "fallback USD_RUB_FALLBACK_RATE"
+        error_text = f"⚠️ Не удалось получить курс: {html_escape(exc)}\nИспользуется fallback: <b>{USD_RUB_FALLBACK_RATE:.2f} ₽</b>\n\n"
+    markup_percent = get_usd_rub_markup_percent()
+    final_rate = rate * (1 + markup_percent / 100)
+    checked_at = now_str()
+    manual_rate = get_manual_usd_rub_rate()
+    manual_text = f"\nРучной курс: <b>{manual_rate:.2f} ₽</b>" if manual_rate is not None else "\nРучной курс: <b>не задан</b>"
+    return (
+        "💱 <b>Курс USD/RUB</b>\n\n"
+        f"{error_text}"
+        f"Текущий курс бота: <b>{rate:.2f} ₽</b>\n"
+        f"Источник: <b>{html_escape(source)}</b>\n"
+        f"Время проверки: <b>{html_escape(checked_at)}</b>\n"
+        f"Наценка к курсу: <b>{markup_percent:g}%</b>\n"
+        f"Курс без наценки: <b>{rate:.2f} ₽</b>\n"
+        f"Итоговый курс с наценкой: <b>{final_rate:.2f} ₽</b>"
+        f"{manual_text}\n\n"
+        "<b>Примеры расчёта:</b>\n"
+        f"$10 → <b>{format_rate_amount(10, final_rate)}</b>\n"
+        f"$20 → <b>{format_rate_amount(20, final_rate)}</b>\n"
+        f"$50 → <b>{format_rate_amount(50, final_rate)}</b>"
+    )
 
 
 def credentials_summary(credentials: dict) -> str:
@@ -2716,7 +2830,14 @@ def notification_routes_text() -> str:
         chat_id, source = get_notification_chat_source(kind)
         chat_text = str(chat_id) if chat_id is not None else "не задан"
         lines.append(f"• <b>{html_escape(title)}</b>: <code>{html_escape(chat_text)}</code> — {html_escape(source)}")
-    return "🔔 <b>Реальные маршруты уведомлений</b>\n\n" + "\n".join(lines)
+    cfg = load_config()
+    chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
+    return (
+        "🔔 <b>Реальные маршруты уведомлений</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\nconfig.json: <code>{html_escape(str(CONFIG_FILE))}</code>"
+        + f"\nnotification_chats: <code>{html_escape(json.dumps(chats, ensure_ascii=False))}</code>"
+    )
 
 
 def notification_chat_detail_keyboard(kind: str) -> InlineKeyboardMarkup:
@@ -3788,7 +3909,7 @@ async def send_admin_order_message(
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     admin_id = get_orders_chat_id()
     _route_chat_id, source = get_orders_chat_source()
-    logger.info("order notification route: orders chat %s (source: %s, helper: get_orders_chat_id)", admin_id, source)
+    logger.info("notification route selected: type=orders chat_id=%s source=%s helper=get_orders_chat_id", admin_id, source)
     order_number = order.get("number", "—")
     order_id = order.get("id")
     if not admin_id:
@@ -3810,12 +3931,15 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     payment_details_line = ""
     if payment_method == "Карта" and payment_details:
         rate_text = f"{float(payment_details.get('usd_rub_rate') or 0):.2f}"
+        final_rate_text = f"{float(payment_details.get('final_usd_rub_rate') or payment_details.get('usd_rub_rate') or 0):.2f}"
         markup_text = f"{float(payment_details.get('markup_percent') or 0):g}"
         payment_details_line = (
             f"Источник курса: <b>{html_escape(payment_details.get('rate_source', '—'))}</b>\n"
-            f"Курс: <b>{html_escape(rate_text)} ₽</b>\n"
-            f"Комиссия: <b>{html_escape(markup_text)}%</b>\n"
-            f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
+            f"Время проверки курса: <b>{html_escape(payment_details.get('rate_checked_at', '—'))}</b>\n"
+            f"Курс USD/RUB: <b>{html_escape(rate_text)} ₽</b>\n"
+            f"Наценка: <b>{html_escape(markup_text)}%</b>\n"
+            f"Итоговый курс: <b>{html_escape(final_rate_text)} ₽</b>\n"
+            f"К оплате в ₽: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
         )
     text = (
         "🔥 <b>Новый заказ</b>\n\n"
@@ -3826,7 +3950,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         f"{payment_details_line}\n"
         f"👤 Имя: <b>{html_escape(order.get('name', '—'))}</b>\n"
         f"📨 Telegram: <b>{html_escape(order.get('tg_handle', '—'))}</b>\n\n"
-        f"🕒 {html_escape(order.get('created_at', '—'))}"
+        f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+        f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
     )
     await send_admin_order_message(context, admin_id, text, order_id)
 
@@ -3886,6 +4011,32 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         context.user_data.pop("notification_chat_kind", None)
         await msg.reply_text("✅ Чат уведомлений сохранён.", parse_mode="HTML", reply_markup=notification_chat_detail_keyboard(kind))
+        return
+
+    if input_mode == USD_RATE_INPUT_MANUAL:
+        raw_rate = msg.text.strip().replace(",", ".")
+        rate = normalize_rate(raw_rate)
+        if rate is None:
+            await msg.reply_text("Введите курс USD/RUB числом от 30 до 200, например <code>91.50</code>.", parse_mode="HTML")
+            return
+        set_manual_usd_rub_rate(rate)
+        context.user_data.pop("client_input", None)
+        await msg.reply_text("✅ Ручной курс USD/RUB сохранён.", reply_markup=usd_rate_admin_keyboard())
+        return
+
+    if input_mode == USD_RATE_INPUT_MARKUP:
+        raw_markup = msg.text.strip().replace(",", ".")
+        try:
+            markup = float(raw_markup)
+        except ValueError:
+            await msg.reply_text("Введите наценку в процентах, например <code>5</code> или <code>7.5</code>.", parse_mode="HTML")
+            return
+        if markup < 0 or markup > 100:
+            await msg.reply_text("Наценка должна быть от 0 до 100%.")
+            return
+        set_usd_rub_markup_percent(markup)
+        context.user_data.pop("client_input", None)
+        await msg.reply_text("✅ Наценка к курсу USD/RUB сохранена.", reply_markup=usd_rate_admin_keyboard())
         return
 
     if input_mode in {PAYMENT_ADMIN_INPUT_TITLE, PAYMENT_ADMIN_INPUT_CREDENTIALS}:
@@ -4300,6 +4451,42 @@ async def cmd_deladmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ─── Способы оплаты ───────────────────────────────────────────────────────────
 
+async def cmd_set_usd_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: <code>/set_usd_rate 91.50</code>", parse_mode="HTML")
+        return
+    rate = normalize_rate(args[0].replace(",", "."))
+    if rate is None:
+        await update.message.reply_text("Введите курс USD/RUB числом от 30 до 200, например <code>91.50</code>.", parse_mode="HTML")
+        return
+    set_manual_usd_rub_rate(rate)
+    await update.message.reply_text("✅ Ручной курс USD/RUB сохранён. Источник курса: <b>manual</b>.", parse_mode="HTML")
+
+
+async def cmd_set_rate_markup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not has_admin_access(update.effective_user):
+        await deny_admin_access(update)
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: <code>/set_rate_markup 5</code>", parse_mode="HTML")
+        return
+    try:
+        markup = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Введите наценку в процентах, например <code>5</code> или <code>7.5</code>.", parse_mode="HTML")
+        return
+    if markup < 0 or markup > 100:
+        await update.message.reply_text("Наценка должна быть от 0 до 100%.")
+        return
+    set_usd_rub_markup_percent(markup)
+    await update.message.reply_text(f"✅ Наценка к курсу USD/RUB сохранена: <b>{markup:g}%</b>.", parse_mode="HTML")
+
+
 async def cmd_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not has_admin_access(update.effective_user):
         await deny_admin_access(update)
@@ -4622,6 +4809,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/payment_details — реквизиты\n"
         "/setpayment card <i>номер</i>\n"
         "/setpayment crypto <i>ссылка</i>\n"
+        "/set_usd_rate <i>91.50</i> — ручной курс USD/RUB\n"
+        "/set_rate_markup <i>5</i> — наценка к курсу\n"
         "/notification_routes — реальные маршруты уведомлений\n\n"
         "<b>Бэкапы:</b>\n"
         "/backup — создать и отправить ZIP сейчас\n"
@@ -4677,6 +4866,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "payment_toggle:",
         "payment_instructions:",
         "payment_edit_",
+        "usd_rate",
     )
     if data in backup_callbacks and not has_backup_access(query.from_user):
         await deny_admin_access(update)
@@ -4816,6 +5006,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     elif data == "admin_payments":
         await show_admin_payments(update, context)
+    elif data in {"usd_rate", "usd_rate_refresh", "usd_rate_calc_10"}:
+        await query.answer("Проверяю курс..." if data == "usd_rate_refresh" else None)
+        await edit_or_send(query, context, await usd_rate_admin_text(), usd_rate_admin_keyboard())
+    elif data == "usd_rate_set_manual":
+        context.user_data["client_input"] = USD_RATE_INPUT_MANUAL
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✏️ <b>Ручной курс USD/RUB</b>\n\nВведите курс числом, например <code>91.50</code>.\nТакже доступна команда <code>/set_usd_rate 91.50</code>.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="usd_rate")]]),
+        )
+    elif data == "usd_rate_reset_manual":
+        set_manual_usd_rub_rate(None)
+        await query.answer("Ручной курс сброшен.")
+        await edit_or_send(query, context, await usd_rate_admin_text(), usd_rate_admin_keyboard())
+    elif data == "usd_rate_set_markup":
+        context.user_data["client_input"] = USD_RATE_INPUT_MARKUP
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "✏️ <b>Изменить наценку</b>\n\nВведите наценку в процентах, например <code>5</code> или <code>7.5</code>.\nТакже доступна команда <code>/set_rate_markup 5</code>.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="usd_rate")]]),
+        )
+    elif data == "usd_rate_reset_markup":
+        set_usd_rub_markup_percent(None)
+        await query.answer("Наценка сброшена.")
+        await edit_or_send(query, context, await usd_rate_admin_text(), usd_rate_admin_keyboard())
     elif data == "admin_notification_chats":
         await query.answer()
         await edit_or_send(query, context, notification_chats_admin_text(), notification_chats_keyboard())
@@ -5140,6 +5357,8 @@ def main() -> None:
     app.add_handler(CommandHandler("delbanner",       cmd_delbanner))
     app.add_handler(CommandHandler("payment_details", cmd_payment_details))
     app.add_handler(CommandHandler("setpayment",      cmd_setpayment))
+    app.add_handler(CommandHandler("set_usd_rate",    cmd_set_usd_rate))
+    app.add_handler(CommandHandler("set_rate_markup", cmd_set_rate_markup))
     app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_handler(CommandHandler("backups",         cmd_backups))
     app.add_handler(CommandHandler("chatid",          cmd_chatid))

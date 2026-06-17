@@ -67,7 +67,7 @@ def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> Non
     )
 
 
-def check_bot_contract(bot_text: str) -> None:
+def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
         "buy_esim",
         "profile",
@@ -195,7 +195,7 @@ def check_bot_contract(bot_text: str) -> None:
     )
     record(
         "track_action logs client activity route",
-        "client activity route: client_activity chat" in track_action_text,
+        "type=client_activity" in track_action_text and "source=%s" in track_action_text,
     )
     record(
         "notify_admin/order notifications use get_orders_chat_id",
@@ -203,7 +203,7 @@ def check_bot_contract(bot_text: str) -> None:
     )
     record(
         "notify_admin/order notifications log orders route",
-        "order notification route: orders chat" in notify_admin_text,
+        "type=orders" in notify_admin_text and "source=%s" in notify_admin_text,
     )
     record(
         "send_admin_order_message does not call get_admin_chat_id",
@@ -240,6 +240,66 @@ def check_bot_contract(bot_text: str) -> None:
             bot_text,
             re.DOTALL,
         )),
+    )
+
+
+    record(
+        "cashback feature flag env exists",
+        "CASHBACK_ENABLED" in bot_text or "CASHBACK_ENABLED" in env_example_text,
+    )
+    record(
+        "is_cashback_enabled helper exists",
+        "def is_cashback_enabled()" in bot_text,
+    )
+    record(
+        "award_cashback_if_needed checks is_cashback_enabled before awarding",
+        bool(re.search(r"def\s+award_cashback_if_needed\(.*?if\s+not\s+is_cashback_enabled\(\).*?credit_slik_balance", bot_text, re.DOTALL)),
+    )
+    record(
+        "notify_cashback_awarded only called after positive cashback",
+        bool(re.search(r"if\s+cashback_amount\s*>\s*0\s*:\s*\n\s*await\s+notify_cashback_awarded", bot_text)),
+    )
+
+
+    record(
+        "USD/RUB admin screen text exists",
+        "💱 <b>Курс USD/RUB</b>" in bot_text and "Наценка к курсу" in bot_text,
+    )
+    record(
+        "USD/RUB refresh callback exists",
+        "usd_rate_refresh" in bot_text,
+    )
+    record(
+        "manual USD/RUB command exists",
+        "cmd_set_usd_rate" in bot_text and "set_manual_usd_rub_rate" in bot_text,
+    )
+    record(
+        "rate markup command or callback exists",
+        "cmd_set_rate_markup" in bot_text and "usd_rate_set_markup" in bot_text,
+    )
+    record(
+        "USD/RUB callbacks pass admin gate",
+        '"usd_rate"' in admin_prefix_text,
+    )
+    record(
+        "manual_usd_rub_rate used in rate calculation",
+        "manual_usd_rub_rate" in bot_text and "rate_source" in bot_text and '"manual"' in bot_text,
+    )
+    record(
+        "payment_details saves rate_checked_at",
+        '"rate_checked_at": lock.get("rate_checked_at")' in bot_text,
+    )
+    record(
+        "payment_details saves markup_percent",
+        '"markup_percent": lock.get("markup_percent")' in bot_text,
+    )
+    record(
+        "payment_details saves final_usd_rub_rate",
+        '"final_usd_rub_rate": lock.get("final_usd_rub_rate")' in bot_text,
+    )
+    record(
+        "cashback remains disabled by default",
+        'os.environ.get("CASHBACK_ENABLED", "false")' in bot_text,
     )
 
     record(
@@ -307,11 +367,44 @@ def check_bot_contract(bot_text: str) -> None:
     )
 
 
+def check_run_mvp_contract(run_mvp_text: str) -> None:
+    run_mvp_track_action_text = function_block(run_mvp_text, "track_action")
+    run_mvp_notify_admin_text = function_block(run_mvp_text, "notify_admin")
+    record(
+        "run_mvp notify_admin does not call bot.get_admin_chat_id",
+        "bot.get_admin_chat_id(" not in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action does not call bot.get_admin_chat_id",
+        "bot.get_admin_chat_id(" not in run_mvp_track_action_text,
+    )
+    record(
+        "run_mvp notify_admin uses orders route helper",
+        "bot.get_orders_chat_id(" in run_mvp_notify_admin_text
+        or "bot.get_orders_chat_source(" in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action uses client activity route helper",
+        "bot.get_client_activity_chat_id(" in run_mvp_track_action_text
+        or "bot.get_client_activity_chat_source(" in run_mvp_track_action_text,
+    )
+    record(
+        "run_mvp notify_admin includes route diagnostics",
+        "Маршрут: orders" in run_mvp_notify_admin_text and "route_source" in run_mvp_notify_admin_text,
+    )
+    record(
+        "run_mvp track_action includes route diagnostics",
+        "Маршрут: client_activity" in run_mvp_track_action_text and "route_source" in run_mvp_track_action_text,
+    )
+
+
 def main() -> int:
     check_syntax("bot/bot.py")
+    check_syntax("bot/run_mvp.py")
     check_syntax("bot/bot_healthcheck.py")
 
     bot_text = read_text("bot/bot.py")
+    run_mvp_text = read_text("bot/run_mvp.py")
     readme_text = read_text("README.md")
     env_example_text = read_text(".env.example")
     config_example_text = read_text("bot/config.example.json")
@@ -331,13 +424,17 @@ def main() -> int:
         },
         readme_text,
     )
-    check_bot_contract(bot_text)
+    check_bot_contract(bot_text, env_example_text)
+    check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',
         'CLIENT_ACTIVITY_CHAT_ID',
         'NEW_CLIENTS_CHAT_ID',
         'PAYMENTS_CHAT_ID',
         'TECH_ALERTS_CHAT_ID',
+        'CASHBACK_ENABLED=false',
+        'USD_RUB_MARKUP_PERCENT=0',
+        'USD_RUB_FALLBACK_RATE=90',
     ]:
         check_contains(env_example_text, needle, ".env.example notification routing")
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
