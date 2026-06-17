@@ -579,6 +579,52 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and 'auto_issue_enabled": True' not in bot_text,
     )
     record(
+        "Apple ID products support FazerCards mapping fields",
+        all(field in function_block(bot_text, "normalize_apple_id_product") for field in (
+            "fazercards_product_id",
+            "fazercards_product_name",
+            "fazercards_last_seen",
+            "fazercards_available",
+        )),
+    )
+    record(
+        "Apple ID admin has FazerCards link and unlink callbacks",
+        "🔗 Привязать FazerCards товар" in bot_text
+        and "admin_apple_id_fazer_link:" in bot_text
+        and "❌ Отвязать FazerCards товар" in bot_text
+        and "admin_apple_id_fazer_unlink:" in bot_text,
+    )
+    readonly_fetch_text = function_block(bot_text, "fetch_fazercards_products_readonly")
+    mapping_handlers_text = "\n".join(
+        function_block(bot_text, name)
+        for name in ("fetch_fazercards_products_readonly", "fazercards_select_keyboard", "apple_giftcard_candidates")
+    )
+    record(
+        "FazerCards mapping uses only GET/read-only product list",
+        "await fetch_fazercards_products(client, api_key)" in readonly_fetch_text
+        and "client.get(FAZERCARDS_PRODUCTS_ENDPOINT" in function_block(bot_text, "fetch_fazercards_products")
+        and "client.post" not in mapping_handlers_text,
+    )
+    record(
+        "FazerCards mapping avoids purchase/order/create endpoints",
+        all(endpoint not in bot_text for endpoint in (
+            "/giftcards/order",
+            "/topups/order",
+            "/gamekeys/order",
+            "/steam-gifts/order",
+            "/steam-topup/order",
+            "/manual-services/order",
+            "/payments/create",
+        )),
+    )
+    record(
+        "Apple ID user purchase remains manual with FazerCards status only",
+        "create_apple_id_checkout_order" in bot_text
+        and "ручная выдача" in function_block(bot_text, "apple_id_product_plan")
+        and "После подтверждения оплаты отправьте клиенту код вручную" in bot_text
+        and "FazerCards: <b>{fazercards_status}</b>" in bot_text,
+    )
+    record(
         "legacy admin section callbacks are still routed",
         all(
             token in bot_text
