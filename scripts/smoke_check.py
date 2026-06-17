@@ -182,6 +182,40 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "PLAN_MAP" in bot_text and "start_purchase_for_plan" in bot_text and 'CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_")' in bot_text,
     )
     record(
+        "Apple ID runtime catalog helpers exist",
+        all(token in bot_text for token in (
+            "def get_apple_id_products()",
+            "def save_apple_id_products(products",
+            "def apple_id_products_by_region",
+            "def apple_id_product_by_id(product_id",
+        )),
+    )
+    record(
+        "Apple ID user flow uses runtime catalog and hides disabled products",
+        "apple_id_products_by_region(region, enabled_only=True)" in bot_text
+        and "Сейчас товары этого региона временно недоступны" in bot_text
+        and "for product in apple_id_products_by_region(region, enabled_only=True)" in bot_text,
+    )
+    record(
+        "Apple ID admin catalog handlers can edit toggle add and delete",
+        all(token in bot_text for token in (
+            "admin_apple_id_catalog",
+            "admin_apple_id_price:",
+            "admin_apple_id_toggle:",
+            "admin_apple_id_add:",
+            "admin_apple_id_delete_confirm:",
+            "APPLE_ID_INPUT_PRICE",
+            "APPLE_ID_INPUT_ADD_AMOUNT",
+            "APPLE_ID_INPUT_ADD_PRICE",
+        )),
+    )
+    record(
+        "Apple ID catalog admin access excludes managers",
+        "def has_catalog_admin_access" in bot_text
+        and "{ROLE_OWNER, ROLE_ADMIN}" in function_block(bot_text, "has_catalog_admin_access")
+        and "Недостаточно прав" in bot_text,
+    )
+    record(
         "Apple ID payments reuse existing payment flow",
         "start_apple_id_purchase" in bot_text and "enabled_payment_methods()" in function_block(bot_text, "start_apple_id_purchase")
         and "create_card_payment_lock(plan)" in function_block(bot_text, "start_apple_id_purchase")
@@ -478,6 +512,32 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "service text mentions administrators only for owners",
         "👤 Администраторы" in service_text_block and "has_owner_access(user)" in service_text_block,
+    )
+    record(
+        "FazerCards owner-only API settings UI and handlers exist",
+        "🔑 FazerCards API" in service_keyboard_text
+        and "admin_fazercards_api" in bot_text
+        and "FAZERCARDS_INPUT_API_KEY" in bot_text
+        and "has_owner_access(query.from_user)" in bot_text,
+    )
+    record(
+        "FazerCards key is masked and full key is not shown by settings screen",
+        "def mask_secret" in bot_text
+        and "••••••" in function_block(bot_text, "mask_secret")
+        and "mask_secret(settings.get('api_key'))" in function_block(bot_text, "fazercards_api_text"),
+    )
+    record(
+        "FazerCards runtime save clear helpers keep auto issue disabled",
+        all(token in bot_text for token in (
+            "def get_fazercards_settings()",
+            "def save_fazercards_api_key(api_key",
+            "def clear_fazercards_api_key()",
+            '"auto_issue_enabled": False',
+        )),
+    )
+    record(
+        "FazerCards has no external API integration yet",
+        "fazercards.com" not in bot_text.lower() and "fazer" not in bot_text.lower().replace("fazercards", ""),
     )
     record(
         "legacy admin section callbacks are still routed",

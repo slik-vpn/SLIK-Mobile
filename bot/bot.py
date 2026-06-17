@@ -145,18 +145,18 @@ PLAN_MAP = {p[3]: {"gb": p[0], "days": p[1], "price": p[2]} for p in RUSSIA_PLAN
 
 APPLE_ID_PRODUCTS = {
     "US": [
-        {"id": "apple_us_5", "region": "US", "title": "Apple Gift Card USA $5", "amount": 5, "currency": "USD", "price_usd": 5},
-        {"id": "apple_us_10", "region": "US", "title": "Apple Gift Card USA $10", "amount": 10, "currency": "USD", "price_usd": 10},
-        {"id": "apple_us_15", "region": "US", "title": "Apple Gift Card USA $15", "amount": 15, "currency": "USD", "price_usd": 15},
-        {"id": "apple_us_25", "region": "US", "title": "Apple Gift Card USA $25", "amount": 25, "currency": "USD", "price_usd": 25},
-        {"id": "apple_us_50", "region": "US", "title": "Apple Gift Card USA $50", "amount": 50, "currency": "USD", "price_usd": 50},
-        {"id": "apple_us_100", "region": "US", "title": "Apple Gift Card USA $100", "amount": 100, "currency": "USD", "price_usd": 100},
+        {"id": "apple_us_5", "region": "US", "title": "Apple Gift Card USA $5", "amount": 5, "currency": "USD", "price_usd": 5, "enabled": True},
+        {"id": "apple_us_10", "region": "US", "title": "Apple Gift Card USA $10", "amount": 10, "currency": "USD", "price_usd": 10, "enabled": True},
+        {"id": "apple_us_15", "region": "US", "title": "Apple Gift Card USA $15", "amount": 15, "currency": "USD", "price_usd": 15, "enabled": True},
+        {"id": "apple_us_25", "region": "US", "title": "Apple Gift Card USA $25", "amount": 25, "currency": "USD", "price_usd": 25, "enabled": True},
+        {"id": "apple_us_50", "region": "US", "title": "Apple Gift Card USA $50", "amount": 50, "currency": "USD", "price_usd": 50, "enabled": True},
+        {"id": "apple_us_100", "region": "US", "title": "Apple Gift Card USA $100", "amount": 100, "currency": "USD", "price_usd": 100, "enabled": True},
     ],
     "TR": [
-        {"id": "apple_tr_100", "region": "TR", "title": "Apple Gift Card Turkey 100₺", "amount": 100, "currency": "TRY", "price_usd": 4},
-        {"id": "apple_tr_250", "region": "TR", "title": "Apple Gift Card Turkey 250₺", "amount": 250, "currency": "TRY", "price_usd": 9},
-        {"id": "apple_tr_500", "region": "TR", "title": "Apple Gift Card Turkey 500₺", "amount": 500, "currency": "TRY", "price_usd": 18},
-        {"id": "apple_tr_1000", "region": "TR", "title": "Apple Gift Card Turkey 1000₺", "amount": 1000, "currency": "TRY", "price_usd": 36},
+        {"id": "apple_tr_100", "region": "TR", "title": "Apple Gift Card Turkey 100₺", "amount": 100, "currency": "TRY", "price_usd": 4, "enabled": True},
+        {"id": "apple_tr_250", "region": "TR", "title": "Apple Gift Card Turkey 250₺", "amount": 250, "currency": "TRY", "price_usd": 9, "enabled": True},
+        {"id": "apple_tr_500", "region": "TR", "title": "Apple Gift Card Turkey 500₺", "amount": 500, "currency": "TRY", "price_usd": 18, "enabled": True},
+        {"id": "apple_tr_1000", "region": "TR", "title": "Apple Gift Card Turkey 1000₺", "amount": 1000, "currency": "TRY", "price_usd": 36, "enabled": True},
     ],
 }
 
@@ -281,6 +281,8 @@ DEFAULT_CONFIG = {
         "payments": "",
         "tech_alerts": "",
     },
+    "apple_id_products": {},
+    "fazercards": {"api_key": "", "enabled": False, "auto_issue_enabled": False},
 }
 
 PAYMENT_METHOD_LABELS = {
@@ -342,6 +344,10 @@ PAYMENT_ADMIN_INPUT_TITLE = "payment_title"
 PAYMENT_ADMIN_INPUT_CREDENTIALS = "payment_credentials"
 USD_RUB_INPUT_MANUAL_RATE = "usd_rub_manual_rate"
 USD_RUB_INPUT_MARKUP = "usd_rub_markup"
+APPLE_ID_INPUT_PRICE = "apple_id_price"
+APPLE_ID_INPUT_ADD_AMOUNT = "apple_id_add_amount"
+APPLE_ID_INPUT_ADD_PRICE = "apple_id_add_price"
+FAZERCARDS_INPUT_API_KEY = "fazercards_api_key"
 ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
 ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
 
@@ -419,6 +425,15 @@ def load_config() -> dict:
         data["usd_rub"] = usd_rub
     for key, value in DEFAULT_CONFIG["usd_rub"].items():
         usd_rub.setdefault(key, value)
+    if not isinstance(data.get("apple_id_products"), dict):
+        data["apple_id_products"] = {}
+    fazercards = data.get("fazercards")
+    if not isinstance(fazercards, dict):
+        fazercards = {}
+        data["fazercards"] = fazercards
+    fazercards.setdefault("api_key", "")
+    fazercards.setdefault("enabled", False)
+    fazercards.setdefault("auto_issue_enabled", False)
     return data
 
 
@@ -1360,12 +1375,71 @@ def create_checkout_order(user, plan_key: str, plan: dict) -> dict:
     })
 
 
+def normalize_apple_id_product(product: dict) -> dict:
+    item = dict(product)
+    item.setdefault("enabled", True)
+    return item
+
+
+def default_apple_id_products() -> dict:
+    return {region: [normalize_apple_id_product(p) for p in products] for region, products in APPLE_ID_PRODUCTS.items()}
+
+
+def get_apple_id_products() -> dict:
+    cfg = load_config()
+    products = cfg.get("apple_id_products")
+    if not isinstance(products, dict) or not products:
+        products = default_apple_id_products()
+        cfg["apple_id_products"] = products
+        save_config(cfg)
+    return {region: [normalize_apple_id_product(p) for p in items if isinstance(p, dict)] for region, items in products.items()}
+
+
+def save_apple_id_products(products: dict) -> None:
+    cfg = load_config()
+    cfg["apple_id_products"] = {region: [normalize_apple_id_product(p) for p in items] for region, items in products.items()}
+    save_config(cfg)
+
+
+def apple_id_products_by_region(region: str, enabled_only: bool = False) -> list[dict]:
+    products = get_apple_id_products().get(region, [])
+    if enabled_only:
+        products = [p for p in products if p.get("enabled", True)]
+    return products
+
+
 def apple_id_product_by_id(product_id: str) -> dict | None:
-    for products in APPLE_ID_PRODUCTS.values():
+    for products in get_apple_id_products().values():
         for product in products:
-            if product["id"] == product_id:
+            if product.get("id") == product_id:
                 return product
     return None
+
+
+def get_fazercards_settings() -> dict:
+    settings = load_config().get("fazercards") or {}
+    return {"api_key": str(settings.get("api_key") or ""), "enabled": bool(settings.get("enabled", False)), "auto_issue_enabled": bool(settings.get("auto_issue_enabled", False))}
+
+
+def save_fazercards_api_key(api_key: str) -> None:
+    cfg = load_config()
+    cfg["fazercards"] = {"api_key": str(api_key or "").strip(), "enabled": False, "auto_issue_enabled": False}
+    save_config(cfg)
+
+
+def clear_fazercards_api_key() -> None:
+    cfg = load_config()
+    cfg["fazercards"] = {"api_key": "", "enabled": False, "auto_issue_enabled": False}
+    save_config(cfg)
+
+
+def mask_secret(value) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return "не подключён"
+    if len(value) <= 4:
+        return "••••"
+    return "••••••" + value[-4:]
 
 
 def apple_id_product_plan(product: dict) -> dict:
@@ -1499,6 +1573,10 @@ def has_admin_access(user) -> bool:
 
 def has_owner_access(user) -> bool:
     return get_user_role(user) == ROLE_OWNER
+
+
+def has_catalog_admin_access(user) -> bool:
+    return get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}
 
 
 def has_backup_access(user) -> bool:
@@ -3005,6 +3083,7 @@ def admin_payment_sections_keyboard(user=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
         [InlineKeyboardButton("💱 Курс USD/RUB", callback_data="admin_usd_rub")],
+        [InlineKeyboardButton("🍎 Apple ID каталог", callback_data="admin_apple_id_catalog")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
     ])
 
@@ -3015,6 +3094,7 @@ def admin_service_sections_keyboard(user=None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
     if has_owner_access(user):
+        rows.append([InlineKeyboardButton("🔑 FazerCards API", callback_data="admin_fazercards_api")])
         rows.append([InlineKeyboardButton("👤 Администраторы", callback_data="admin_admins")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
@@ -3150,7 +3230,7 @@ def apple_id_start_keyboard() -> InlineKeyboardMarkup:
 
 def apple_id_products_keyboard(region: str) -> InlineKeyboardMarkup:
     rows = []
-    for product in APPLE_ID_PRODUCTS.get(region, []):
+    for product in apple_id_products_by_region(region, enabled_only=True):
         amount = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
         rows.append([InlineKeyboardButton(amount, callback_data=f"apple_id_product:{product['id']}")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="buy_apple_id")])
@@ -3338,12 +3418,16 @@ async def show_apple_id_region(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     region = query.data.split(":", 1)[1]
-    if region not in APPLE_ID_PRODUCTS:
+    if region not in APPLE_ID_REGION_TITLES:
         await query.answer("Регион не найден.", show_alert=True)
         return
     flag = APPLE_ID_REGION_FLAGS.get(region, "")
     title = APPLE_ID_REGION_TITLES.get(region, region)
-    text = f"{flag} <b>Apple ID {html_escape(title)}</b>\n\nВыберите номинал:"
+    enabled_products = apple_id_products_by_region(region, enabled_only=True)
+    if not enabled_products:
+        text = f"{flag} <b>Apple ID {html_escape(title)}</b>\n\nСейчас товары этого региона временно недоступны. Напишите менеджеру."
+    else:
+        text = f"{flag} <b>Apple ID {html_escape(title)}</b>\n\nВыберите номинал:"
     await edit_or_send(query, context, text, apple_id_products_keyboard(region))
 
 
@@ -4521,6 +4605,90 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         await msg.reply_text("✅ Чат уведомлений сохранён.", parse_mode="HTML", reply_markup=notification_chat_detail_keyboard(kind))
         return
 
+    if input_mode == APPLE_ID_INPUT_PRICE:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        product_id = str(context.user_data.get("apple_id_product_id") or "")
+        try:
+            price = float(msg.text.strip().replace(",", "."))
+        except ValueError:
+            price = 0
+        if price <= 0:
+            await msg.reply_text("Введите число больше 0, например <code>10.5</code>.", parse_mode="HTML")
+            return
+        product = set_apple_id_product(product_id, {"price_usd": round(price, 2)})
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("apple_id_product_id", None)
+        if not product:
+            await msg.reply_text("Товар не найден.", reply_markup=apple_id_catalog_keyboard())
+            return
+        await msg.reply_text("✅ Цена обновлена.", parse_mode="HTML", reply_markup=apple_id_admin_product_keyboard(product))
+        return
+
+    if input_mode == APPLE_ID_INPUT_ADD_AMOUNT:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        try:
+            amount = float(msg.text.strip().replace(",", "."))
+        except ValueError:
+            amount = 0
+        if amount <= 0:
+            await msg.reply_text("Введите номинал числом больше 0.", parse_mode="HTML")
+            return
+        context.user_data["apple_id_add_amount"] = int(amount) if amount.is_integer() else amount
+        context.user_data["client_input"] = APPLE_ID_INPUT_ADD_PRICE
+        await msg.reply_text("Введите цену продажи в USD.\n\nПример: <code>9.5</code>", parse_mode="HTML")
+        return
+
+    if input_mode == APPLE_ID_INPUT_ADD_PRICE:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        region = str(context.user_data.get("apple_id_add_region") or "")
+        amount = context.user_data.get("apple_id_add_amount")
+        try:
+            price = float(msg.text.strip().replace(",", "."))
+        except ValueError:
+            price = 0
+        if region not in APPLE_ID_REGION_TITLES or not amount or price <= 0:
+            await msg.reply_text("Введите корректную цену больше 0.", parse_mode="HTML")
+            return
+        suffix = str(amount).replace(".", "_")
+        product_id = f"apple_{region.lower()}_{suffix}"
+        if apple_id_product_by_id(product_id):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("Такой номинал уже есть.", reply_markup=apple_id_admin_region_keyboard(region))
+            return
+        currency = "USD" if region == "US" else "TRY"
+        title = f"Apple Gift Card USA ${amount:g}" if region == "US" else f"Apple Gift Card Turkey {amount:g}₺"
+        catalog = get_apple_id_products()
+        catalog.setdefault(region, []).append({"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "price_usd": round(price, 2), "enabled": True})
+        save_apple_id_products(catalog)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("apple_id_add_region", None)
+        context.user_data.pop("apple_id_add_amount", None)
+        await msg.reply_text("✅ Номинал добавлен.", parse_mode="HTML", reply_markup=apple_id_admin_region_keyboard(region))
+        return
+
+    if input_mode == FAZERCARDS_INPUT_API_KEY:
+        if not has_owner_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        api_key = msg.text.strip()
+        if not api_key:
+            await msg.reply_text("Введите FazerCards API key.")
+            return
+        save_fazercards_api_key(api_key)
+        context.user_data.pop("client_input", None)
+        await msg.reply_text("✅ API key сохранён.", parse_mode="HTML", reply_markup=fazercards_api_keyboard())
+        return
+
     if input_mode in {USD_RUB_INPUT_MANUAL_RATE, USD_RUB_INPUT_MARKUP}:
         if not has_admin_access(update.effective_user):
             context.user_data.pop("client_input", None)
@@ -5404,6 +5572,110 @@ async def show_admin_business_sections(update: Update, context: ContextTypes.DEF
     )
 
 
+def apple_nominal_text(product: dict) -> str:
+    return f"${product.get('amount'):g}" if product.get("currency") == "USD" else f"{product.get('amount'):g}₺"
+
+
+def apple_id_catalog_text() -> str:
+    return (
+        "🍎 <b>Apple ID каталог</b>\n\n"
+        "Здесь можно управлять товарами Apple Gift Card.\n\n"
+        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n\nВыберите регион:"
+    )
+
+
+def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US")],
+        [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
+    ])
+
+
+def apple_id_admin_region_text(region: str) -> str:
+    flag = APPLE_ID_REGION_FLAGS.get(region, "")
+    title = APPLE_ID_REGION_TITLES.get(region, region)
+    lines = [f"{flag} <b>Apple ID {html_escape(title)}</b>", "", "Товары:"]
+    products = apple_id_products_by_region(region)
+    if not products:
+        lines.append("— товаров нет")
+    for product in products:
+        status = "✅" if product.get("enabled", True) else "⛔️"
+        lines.append(f"{status} {html_escape(apple_nominal_text(product))} — {html_escape(format_usd(product.get('price_usd')))}")
+    return "\n".join(lines)
+
+
+def apple_id_admin_region_keyboard(region: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(apple_nominal_text(p), callback_data=f"admin_apple_id_product:{p['id']}")] for p in apple_id_products_by_region(region)]
+    rows.append([InlineKeyboardButton("➕ Добавить номинал", callback_data=f"admin_apple_id_add:{region}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
+    return InlineKeyboardMarkup(rows)
+
+
+def apple_id_admin_product_text(product: dict) -> str:
+    region = product.get("region", "")
+    return (
+        f"🍎 <b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>\n\n"
+        f"Регион: {html_escape(APPLE_ID_REGION_TITLES.get(region, region))}\n"
+        f"Номинал: {html_escape(apple_nominal_text(product))}\n"
+        f"Валюта номинала: {html_escape(str(product.get('currency', '')))}\n"
+        f"Цена продажи: {html_escape(format_usd(product.get('price_usd')))}\n"
+        f"Статус: {'включён' if product.get('enabled', True) else 'выключен'}"
+    )
+
+
+def apple_id_admin_product_keyboard(product: dict) -> InlineKeyboardMarkup:
+    toggle = "🔴 Выключить товар" if product.get("enabled", True) else "🟢 Включить товар"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить цену", callback_data=f"admin_apple_id_price:{product['id']}")],
+        [InlineKeyboardButton(toggle, callback_data=f"admin_apple_id_toggle:{product['id']}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_apple_id_delete:{product['id']}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_region:{product['region']}")],
+    ])
+
+
+def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
+    catalog = get_apple_id_products()
+    for products in catalog.values():
+        for product in products:
+            if product.get("id") == product_id:
+                product.update(updates)
+                save_apple_id_products(catalog)
+                return product
+    return None
+
+
+def delete_apple_id_product(product_id: str) -> dict | None:
+    catalog = get_apple_id_products()
+    for region, products in catalog.items():
+        for idx, product in enumerate(products):
+            if product.get("id") == product_id:
+                removed = products.pop(idx)
+                save_apple_id_products(catalog)
+                return removed
+    return None
+
+
+def fazercards_api_text() -> str:
+    settings = get_fazercards_settings()
+    connected = bool(settings.get("api_key"))
+    return (
+        "🔑 <b>FazerCards API</b>\n\n"
+        f"Статус: {'подключён' if connected else 'не подключён'}\n\n"
+        f"API key: <code>{html_escape(mask_secret(settings.get('api_key')))}</code>\n\n"
+        "Здесь можно сохранить API ключ FazerCards для будущей автовыдачи Apple Gift Card.\n\n"
+        "На этом этапе автовыдача отключена."
+    )
+
+
+def fazercards_api_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Указать API key", callback_data="admin_fazercards_set")],
+        [InlineKeyboardButton("🧹 Удалить API key", callback_data="admin_fazercards_clear")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_service_sections")],
+    ])
+
+
 async def show_admin_payment_sections(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not has_admin_access(query.from_user):
@@ -5838,6 +6110,106 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"✅ Права администратора у пользователя {admin_target_label(user_id)} удалены.",
                 admin_management_keyboard(),
             )
+    elif data == "admin_apple_id_catalog":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_catalog_text(), apple_id_catalog_keyboard())
+    elif data.startswith("admin_apple_id_region:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        region = data.split(":", 1)[1]
+        if region not in APPLE_ID_REGION_TITLES:
+            await query.answer("Регион не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_admin_region_text(region), apple_id_admin_region_keyboard(region))
+    elif data.startswith("admin_apple_id_product:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product = apple_id_product_by_id(data.split(":", 1)[1])
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
+    elif data.startswith("admin_apple_id_price:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product_id = data.split(":", 1)[1]
+        context.user_data["client_input"] = APPLE_ID_INPUT_PRICE
+        context.user_data["apple_id_product_id"] = product_id
+        await query.answer()
+        await edit_or_send(query, context, "Введите новую цену продажи в USD.\n\nНапример: <code>10.5</code>", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]))
+    elif data.startswith("admin_apple_id_toggle:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product = apple_id_product_by_id(data.split(":", 1)[1])
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        product = set_apple_id_product(product["id"], {"enabled": not product.get("enabled", True)})
+        await query.answer("Настройки сохранены.")
+        await edit_or_send(query, context, apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
+    elif data.startswith("admin_apple_id_add:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        region = data.split(":", 1)[1]
+        context.user_data["client_input"] = APPLE_ID_INPUT_ADD_AMOUNT
+        context.user_data["apple_id_add_region"] = region
+        example = "10" if region == "US" else "250"
+        await query.answer()
+        await edit_or_send(query, context, f"Введите номинал.\n\nПример: <code>{example}</code>", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_region:{region}")]]))
+    elif data.startswith("admin_apple_id_delete:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product = apple_id_product_by_id(data.split(":", 1)[1])
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, f"Удалить товар {html_escape(product['title'])}?", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data=f"admin_apple_id_delete_confirm:{product['id']}")], [InlineKeyboardButton("❌ Отмена", callback_data=f"admin_apple_id_product:{product['id']}")]]))
+    elif data.startswith("admin_apple_id_delete_confirm:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        removed = delete_apple_id_product(data.split(":", 1)[1])
+        await query.answer("Товар удалён.")
+        region = removed.get("region") if removed else "US"
+        await edit_or_send(query, context, apple_id_admin_region_text(region), apple_id_admin_region_keyboard(region))
+    elif data == "admin_fazercards_api":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, fazercards_api_text(), fazercards_api_keyboard())
+    elif data == "admin_fazercards_set":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        context.user_data["client_input"] = FAZERCARDS_INPUT_API_KEY
+        await query.answer()
+        await edit_or_send(query, context, "Введите FazerCards API key.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_fazercards_api")]]))
+    elif data == "admin_fazercards_clear":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, "Удалить сохранённый FazerCards API key?", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Подтвердить", callback_data="admin_fazercards_clear_confirm")], [InlineKeyboardButton("❌ Отмена", callback_data="admin_fazercards_api")]]))
+    elif data == "admin_fazercards_clear_confirm":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        clear_fazercards_api_key()
+        await query.answer("API key удалён.")
+        await edit_or_send(query, context, "✅ API key удалён.", fazercards_api_keyboard())
     elif data == "admin_payments":
         await show_admin_payments(update, context)
     elif data == "admin_usd_rub":
