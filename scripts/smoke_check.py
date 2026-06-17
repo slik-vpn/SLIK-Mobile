@@ -617,6 +617,48 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
             "/payments/create",
         )),
     )
+    apple_candidates_text = function_block(bot_text, "apple_giftcard_candidates")
+    apple_name_text = function_block(bot_text, "is_apple_itunes_fazercards_name")
+    record(
+        "App Store & iTunes (US) is recognized as Apple/iTunes candidate for US",
+        "app\\s*store" in bot_text
+        and "itunes" in bot_text.lower()
+        and "\\(\\s*us\\s*\\)" in bot_text
+        and "fazercards_name_has_region(name, region)" in apple_candidates_text,
+    )
+    record(
+        "App Store & iTunes (TR) is recognized as Apple/iTunes candidate for TR",
+        "app\\s*store" in bot_text
+        and "itunes" in bot_text.lower()
+        and "\\(\\s*tr\\s*\\)" in bot_text
+        and "türkiye" in bot_text.lower()
+        and "fazercards_name_has_region(name, region)" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes candidates are not rejected when amount is missing",
+        "if not fazercards_name_has_amount" not in apple_candidates_text
+        and "has_amount = fazercards_name_has_amount(name, amount)" in apple_candidates_text
+        and "if has_amount:" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes candidates no longer require gift/card terms",
+        '("gift" not in text and "card" not in text)' not in apple_candidates_text
+        and '("gift" not in text or "card" not in text)' not in apple_candidates_text
+        and "if not is_apple_itunes_fazercards_name(name):" in apple_candidates_text,
+    )
+    record(
+        "FazerCards Apple/iTunes mapping has no client.post",
+        "client.post" not in mapping_handlers_text,
+    )
+    record(
+        "FazerCards Apple/iTunes mapping has no purchase/order/create endpoints",
+        all(token not in mapping_handlers_text.lower() for token in ("/purchase", "/order", "/create")),
+    )
+    record(
+        "FazerCards missing nominal warning is shown for category-like products",
+        "В названии FazerCards товара не найден номинал" in bot_text
+        and "Автовыдача пока отключена" in bot_text,
+    )
     record(
         "Apple ID user purchase remains manual with FazerCards status only",
         "create_apple_id_checkout_order" in bot_text

@@ -5821,25 +5821,56 @@ def fazercards_product_value(item: dict, key: str) -> str:
     return ""
 
 
+APPLE_ITUNES_PATTERNS = (
+    r"\bapple\b",
+    r"\bitunes\b",
+    r"\bapp\s*store\b",
+    r"\bappstore\b",
+    r"\bapp\s*store\s*(?:&|and)\s*itunes\b",
+)
+
+APPLE_REGION_PATTERNS = {
+    "US": (r"\(\s*us\s*\)", r"\bus\b", r"\busa\b", r"\bunited\s+states\b", r"\busd\b"),
+    "TR": (r"\(\s*tr\s*\)", r"\btr\b", r"\bturkey\b", r"\btürkiye\b", r"\btry\b", r"\btl\b", r"₺"),
+}
+
+
+def is_apple_itunes_fazercards_name(name: str) -> bool:
+    text = str(name or "").lower()
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in APPLE_ITUNES_PATTERNS)
+
+
+def fazercards_name_has_region(name: str, region: str) -> bool:
+    text = str(name or "").lower()
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in APPLE_REGION_PATTERNS.get(region, ()))
+
+
+def fazercards_name_has_amount(name: str, amount: str) -> bool:
+    if not amount:
+        return False
+    return bool(re.search(rf"(?<!\d){re.escape(amount)}(?!\d)", str(name or "")))
+
+
 def apple_giftcard_candidates(product: dict, items: list[dict], limit: int = 8, offset: int = 0) -> tuple[list[dict], bool]:
-    amount = str(int(product.get("amount", 0))) if float(product.get("amount", 0) or 0).is_integer() else str(product.get("amount", ""))
-    region_terms = ("us", "usa", "united states", "usd") if product.get("region") == "US" else ("turkey", "tr", "try", "tl", "₺")
+    raw_amount = float(product.get("amount", 0) or 0)
+    amount = str(int(raw_amount)) if raw_amount.is_integer() else str(product.get("amount", ""))
+    region = str(product.get("region") or "")
     scored = []
     for item in items:
         if not isinstance(item, dict):
             continue
         name = fazercards_product_value(item, "name")
-        text = name.lower()
-        if "apple" not in text or ("gift" not in text and "card" not in text):
+        if not is_apple_itunes_fazercards_name(name):
             continue
-        score = 1
-        if any(term in text for term in region_terms):
-            score += 3
-        if re.search(rf"(?<!\d){re.escape(amount)}(?!\d)", text):
+        if not fazercards_name_has_region(name, region):
+            continue
+        has_amount = fazercards_name_has_amount(name, amount)
+        score = 8
+        if has_amount:
             score += 4
-        scored.append((score, name, item))
-    scored.sort(key=lambda row: (-row[0], row[1].lower()))
-    return [item for _score, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][0] >= 8)
+        scored.append((score, 0 if has_amount else 1, name, item))
+    scored.sort(key=lambda row: (-row[0], row[1], row[2].lower()))
+    return [item for _score, _missing_amount, _name, item in scored[offset:offset + limit]], bool(scored and scored[0][1] == 0)
 
 
 def fazercards_select_text(product: dict, exact_match: bool, error: str = "") -> str:
@@ -6516,12 +6547,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data[f"fazercards_selected:{product_id}"] = item
         item_id = fazercards_product_value(item, "id")
         item_name = fazercards_product_value(item, "name")
+        amount = str(int(float(product.get("amount", 0) or 0))) if float(product.get("amount", 0) or 0).is_integer() else str(product.get("amount", ""))
+        nominal_warning = ""
+        if not fazercards_name_has_amount(item_name, amount):
+            nominal_warning = (
+                "\n\n⚠️ В названии FazerCards товара не найден номинал. "
+                "Возможно, это категория. Автовыдача пока отключена, поэтому это безопасно для ручной привязки."
+            )
         text = (
             "Привязать товар?\n\n"
             f"Наш товар:\n<b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>\n\n"
             "FazerCards:\n"
             f"ID: <code>{html_escape(item_id)}</code>\n"
             f"Название: {html_escape(item_name)}"
+            f"{nominal_warning}"
         )
         await query.answer()
         await edit_or_send(query, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Привязать", callback_data=f"admin_apple_id_fazer_confirm:{product_id}")], [InlineKeyboardButton("❌ Отмена", callback_data=f"admin_apple_id_product:{product_id}")]]))
