@@ -171,10 +171,21 @@ APPLE_ID_PRODUCTS = {
         {"id": "apple_tr_500", "region": "TR", "title": "Apple Gift Card Turkey 500₺", "amount": 500, "currency": "TRY", "price_usd": 18, "enabled": True},
         {"id": "apple_tr_1000", "region": "TR", "title": "Apple Gift Card Turkey 1000₺", "amount": 1000, "currency": "TRY", "price_usd": 36, "enabled": True},
     ],
+    "RU": [
+        {"id": "apple_ru_100", "region": "RU", "title": "Apple Gift Card Russia 100₽", "amount": 100, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_250", "region": "RU", "title": "Apple Gift Card Russia 250₽", "amount": 250, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_500", "region": "RU", "title": "Apple Gift Card Russia 500₽", "amount": 500, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_1000", "region": "RU", "title": "Apple Gift Card Russia 1000₽", "amount": 1000, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_1500", "region": "RU", "title": "Apple Gift Card Russia 1500₽", "amount": 1500, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_3000", "region": "RU", "title": "Apple Gift Card Russia 3000₽", "amount": 3000, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_5000", "region": "RU", "title": "Apple Gift Card Russia 5000₽", "amount": 5000, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_10000", "region": "RU", "title": "Apple Gift Card Russia 10000₽", "amount": 10000, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+        {"id": "apple_ru_15000", "region": "RU", "title": "Apple Gift Card Russia 15000₽", "amount": 15000, "currency": "RUB", "enabled": True, "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "price_rub": ""},
+    ],
 }
 
-APPLE_ID_REGION_TITLES = {"US": "USA", "TR": "Turkey"}
-APPLE_ID_REGION_FLAGS = {"US": "🇺🇸", "TR": "🇹🇷"}
+APPLE_ID_REGION_TITLES = {"US": "USA", "TR": "Turkey", "RU": "Russia"}
+APPLE_ID_REGION_FLAGS = {"US": "🇺🇸", "TR": "🇹🇷", "RU": "🇷🇺"}
 
 FRIEND_REFERRAL_REWARD_USD = 1.0
 STATUS_LEVELS = [
@@ -1629,6 +1640,17 @@ def save_apple_id_pricing_settings(updates: dict) -> None:
     save_config(cfg)
 
 
+
+def apple_id_currency_for_region(region: str) -> str:
+    region = str(region or "").upper()
+    if region == "US":
+        return "USD"
+    if region == "TR":
+        return "TRY"
+    if region == "RU":
+        return "RUB"
+    return ""
+
 def is_valid_apple_id_nominal(region: str, currency: str, amount) -> bool:
     if isinstance(amount, bool) or not isinstance(amount, int):
         return False
@@ -1641,6 +1663,8 @@ def is_valid_apple_id_nominal(region: str, currency: str, amount) -> bool:
         return 1 <= nominal <= 200
     if region == "TR" and currency == "TRY":
         return 100 <= nominal <= 2000
+    if region == "RU" and currency == "RUB":
+        return 100 <= nominal <= 15000
     return False
 
 
@@ -1676,6 +1700,8 @@ def apple_id_grid_columns(region: str, count: int = 0) -> int:
         return 3
     if region == "TR":
         return 3 if count > 4 else 2
+    if region == "RU":
+        return 3
     return 2
 
 
@@ -1686,10 +1712,20 @@ def default_apple_id_products() -> dict:
 def get_apple_id_products() -> dict:
     cfg = load_config()
     products = cfg.get("apple_id_products")
+    defaults = default_apple_id_products()
     if not isinstance(products, dict) or not products:
-        products = default_apple_id_products()
+        products = defaults
         cfg["apple_id_products"] = products
         save_config(cfg)
+    else:
+        changed = False
+        for region, default_items in defaults.items():
+            if region not in products:
+                products[region] = default_items
+                changed = True
+        if changed:
+            cfg["apple_id_products"] = products
+            save_config(cfg)
     return {region: [normalize_apple_id_product(p) for p in items if isinstance(p, dict)] for region, items in products.items()}
 
 
@@ -2450,12 +2486,13 @@ def fazercards_items_from_payload(payload: dict) -> list[dict]:
     return fazercards_cards_from_payload(payload)
 
 
+def has_apple_fazercards_branding(name: str) -> bool:
+    return is_apple_itunes_fazercards_name(name)
+
+
 def is_apple_fazercards_category(item: dict) -> bool:
     name = str(item.get("name") or item.get("title") or "")
-    text = name.lower()
-    return is_apple_itunes_fazercards_name(name) and (
-        "app store" in text or "itunes" in text or "apple id" in text or "apple gift card" in text
-    )
+    return has_apple_fazercards_branding(name)
 
 
 def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -> bool:
@@ -2463,11 +2500,15 @@ def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -
     currency = str(product.get("currency") or "").upper()
     amount = float(product.get("amount") or 0)
     names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
+    if not has_apple_fazercards_branding(names):
+        return False
     if not fazercards_name_has_region(names, region):
         return False
     if currency == "USD" and not re.search(r"(?:\$|\busd\b)", names, re.I):
         return False
     if currency == "TRY" and not re.search(r"(?:₺|\btry\b|\btl\b)", names, re.I):
+        return False
+    if currency == "RUB" and not re.search(r"(?:₽|\brub\b|\brur\b|\bруб\b|\bрублей\b|\bр\.)", names, re.I):
         return False
     amount_text = str(int(amount)) if amount.is_integer() else str(amount)
     return fazercards_name_has_amount(names, amount_text)
@@ -2496,6 +2537,17 @@ def extract_exact_apple_nominal_from_text(text: str, currency: str) -> int | Non
             r"\bTL\s*(\d+(?:[.,]\d+)?)\b",
             r"\b(\d+(?:[.,]\d+)?)\s*TL\b",
         )
+    elif str(currency or "").upper() == "RUB":
+        patterns = (
+            r"₽\s*(\d+(?:[.,]\d+)?)",
+            r"(\d+(?:[.,]\d+)?)\s*₽",
+            r"\bRUB\s*(\d+(?:[.,]\d+)?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*RUB\b",
+            r"\bRUR\s*(\d+(?:[.,]\d+)?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*RUR\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*(?:руб|рублей)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*р\.?(?=\s|$)",
+        )
     else:
         return None
     values = set()
@@ -2520,11 +2572,15 @@ def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
         region = "US"
     elif re.search(r"\b(?:tr|turkey|турция|türkiye|turkiye)\b", names, re.I):
         region = "TR"
+    elif re.search(r"\b(?:ru|rus|russia|russian\s+federation|россия|рф)\b", names, re.I):
+        region = "RU"
     currency = None
     if re.search(r"(?:\$|\busd\b)", names, re.I):
         currency = "USD"
     elif re.search(r"(?:₺|\btry\b|\btl\b)", names, re.I):
         currency = "TRY"
+    elif re.search(r"(?:₽|\brub\b|\brur\b|\bруб\b|\bрублей\b|\bр\.)", names, re.I):
+        currency = "RUB"
     if not region or not currency:
         return None
     amount = extract_exact_apple_nominal_from_text(names, currency)
@@ -2542,7 +2598,12 @@ def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
         stock = int(float(fazercards_product_value(card, "stock") or 0))
     except (TypeError, ValueError):
         stock = 0
-    title = f"Apple Gift Card USA ${amount}" if region == "US" else f"Apple Gift Card Turkey {amount}₺"
+    if region == "US":
+        title = f"Apple Gift Card USA ${amount}"
+    elif region == "TR":
+        title = f"Apple Gift Card Turkey {amount}₺"
+    else:
+        title = f"Apple Gift Card Russia {amount}₽"
     return {
         "region": region,
         "currency": currency,
@@ -2630,10 +2691,10 @@ async def sync_apple_id_fazercards_bulk() -> dict:
                 parsed = parse_apple_id_supplier_position(category, card)
                 if not parsed:
                     raw_names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
-                    for candidate_region, candidate_currency in (("US", "USD"), ("TR", "TRY")):
+                    for candidate_region, candidate_currency in (("US", "USD"), ("TR", "TRY"), ("RU", "RUB")):
                         candidate_amount = extract_exact_apple_nominal_from_text(raw_names, candidate_currency)
                         if candidate_amount is not None and not is_valid_apple_id_nominal(candidate_region, candidate_currency, candidate_amount):
-                            label = f"{APPLE_ID_REGION_TITLES.get(candidate_region, candidate_region)} ${candidate_amount}" if candidate_currency == "USD" else f"{APPLE_ID_REGION_TITLES.get(candidate_region, candidate_region)} {candidate_amount} TRY"
+                            label = f"{APPLE_ID_REGION_TITLES.get(candidate_region, candidate_region)} {apple_id_product_nominal_label({'amount': candidate_amount, 'currency': candidate_currency})}"
                             report["lines"].append(f"⚠️ {label} — вне допустимого диапазона")
                             break
                     continue
@@ -2691,7 +2752,7 @@ def apple_id_pending_supplier_positions_text(positions: list[dict]) -> str:
         lines.append(f"<b>{APPLE_ID_REGION_TITLES.get(region, region)}:</b>")
         for item in sorted(items, key=lambda x: float(x.get("amount") or 0)):
             amount = int(item.get("amount") or 0)
-            nominal = f"${amount}" if item.get("currency") == "USD" else f"{amount} TRY"
+            nominal = apple_id_product_nominal_label({"amount": amount, "currency": item.get("currency")})
             lines.append(f"{html_escape(nominal)} — закуп {html_escape(format_usd(item.get('fazercards_price_usd')))}")
         lines.append("")
     lines.append(f"Добавить {len(positions)} позиций?")
@@ -2712,7 +2773,7 @@ def add_apple_id_pending_supplier_positions() -> dict:
             continue
         if not is_valid_apple_id_nominal(region, currency, amount):
             report["skipped"] += 1
-            label = f"{APPLE_ID_REGION_TITLES.get(region, region)} ${amount}" if currency == "USD" else f"{APPLE_ID_REGION_TITLES.get(region, region)} {amount} TRY"
+            label = f"{APPLE_ID_REGION_TITLES.get(region, region)} {apple_id_product_nominal_label({'amount': amount, 'currency': currency})}"
             report["lines"].append(f"⚠️ {label} — пропущено: вне допустимого диапазона")
             continue
         if apple_id_catalog_has_nominal(catalog, region, amount, currency):
@@ -2721,7 +2782,7 @@ def add_apple_id_pending_supplier_positions() -> dict:
             continue
         product = normalize_apple_id_product({
             "id": f"apple_{region.lower()}_{amount}",
-            "title": item.get("title") or (f"Apple Gift Card USA ${amount}" if region == "US" else f"Apple Gift Card Turkey {amount}₺"),
+            "title": item.get("title") or (f"Apple Gift Card USA ${amount}" if region == "US" else (f"Apple Gift Card Turkey {amount}₺" if region == "TR" else f"Apple Gift Card Russia {amount}₽")),
             "region": region,
             "amount": amount,
             "currency": currency,
@@ -2744,7 +2805,7 @@ def add_apple_id_pending_supplier_positions() -> dict:
         product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_price_usd": rec["supplier_price_usd"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
         catalog.setdefault(region, []).append(product)
         report["added"] += 1
-        report["lines"].append(f"✅ {APPLE_ID_REGION_TITLES.get(region, region)} {('$' + str(amount)) if currency == 'USD' else (str(amount) + ' TRY')} — цена {format_rub(product.get('price_rub'))}")
+        report["lines"].append(f"✅ {APPLE_ID_REGION_TITLES.get(region, region)} {apple_id_product_nominal_label({'amount': amount, 'currency': currency})} — цена {format_rub(product.get('price_rub'))}")
     save_apple_id_products(catalog)
     save_apple_id_pending_supplier_positions([])
     return report
@@ -2837,7 +2898,7 @@ def apple_id_product_plan(product: dict) -> dict:
         "region": product["region"],
         "amount": product["amount"],
         "currency": product["currency"],
-        "price_usd": product["price_usd"],
+        "price_usd": product.get("price_usd") or product.get("fazercards_price_usd") or product.get("supplier_price_usd"),
         "pricing_currency": "RUB",
         "price_rub": price_rub,
         "supplier_price_usd": product.get("fazercards_price_usd") or product.get("price_usd"),
@@ -3567,7 +3628,7 @@ def build_order_card_text(order: dict) -> str:
     if order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
-        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        nominal = apple_id_product_nominal_label({"amount": amount, "currency": currency})
         region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
         return (
             f"🍎 <b>Заказ Apple ID {html_escape(order_number_plain(order))}</b>\n\n"
@@ -4626,12 +4687,21 @@ def apple_id_start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇺🇸 Apple ID USA", callback_data="apple_id_region:US")],
         [InlineKeyboardButton("🇹🇷 Apple ID Turkey", callback_data="apple_id_region:TR")],
+        [InlineKeyboardButton("🇷🇺 Apple ID Russia", callback_data="apple_id_region:RU")],
         [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
     ])
 
 
 def apple_id_product_nominal_label(product: dict) -> str:
-    return f"${product['amount']}" if product.get("currency") == "USD" else f"{product.get('amount')}₺"
+    amount = product.get("amount")
+    currency = str(product.get("currency") or "").upper()
+    if currency == "USD":
+        return f"${amount}"
+    if currency == "TRY":
+        return f"{amount}₺"
+    if currency == "RUB":
+        return f"{amount}₽"
+    return f"{amount} {currency}".strip()
 
 
 def compact_apple_id_product_label(product: dict, include_price: bool = False) -> str:
@@ -4873,7 +4943,7 @@ async def show_apple_id_product(update: Update, context: ContextTypes.DEFAULT_TY
     region = product["region"]
     region_title = APPLE_ID_REGION_TITLES.get(region, region)
     flag = APPLE_ID_REGION_FLAGS.get(region, "")
-    nominal = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
+    nominal = apple_id_product_nominal_label(product)
     text = (
         f"🍎 <b>{html_escape(product['title'])}</b>\n\n"
         f"Регион: {flag} {html_escape(region_title)}\n"
@@ -5276,7 +5346,7 @@ def build_user_order_card_text(order: dict) -> str:
     if order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
-        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        nominal = apple_id_product_nominal_label({"amount": amount, "currency": currency})
         region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
         return (
             "🍎 <b>Заказ Apple ID</b>\n\n"
@@ -5429,7 +5499,7 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     plan = apple_id_product_plan(product)
     if apple_id_payment_amount_rub(plan) <= 0:
-        await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
+        await query.message.reply_text("⚠️ Товар временно недоступен. Напишите менеджеру или попробуйте позже.", parse_mode="HTML")
         return ConversationHandler.END
     context.user_data["plan_key"] = product_id
     context.user_data["plan"] = plan
@@ -5656,7 +5726,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             region = product["region"]
             region_title = APPLE_ID_REGION_TITLES.get(region, region)
             flag = APPLE_ID_REGION_FLAGS.get(region, "")
-            nominal = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
+            nominal = apple_id_product_nominal_label(product)
             text = (
                 f"🍎 <b>{html_escape(product['title'])}</b>\n\n"
                 f"Регион: {flag} {html_escape(region_title)}\n"
@@ -5787,7 +5857,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
     if plan.get("product_type") == "apple_id":
-        nominal = f"${plan.get('amount')}" if plan.get("currency") == "USD" else f"{plan.get('amount')}₺"
+        nominal = apple_id_product_nominal_label({"amount": plan.get("amount"), "currency": plan.get("currency")})
         client_text = (
             "✅ <b>Заявка создана</b>\n\n"
             f"🧾 Номер заказа: <b>{order['number']}</b>\n\n"
@@ -5926,7 +5996,7 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
     if order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
-        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
+        nominal = apple_id_product_nominal_label({"amount": amount, "currency": currency})
         region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
         fazercards_status = "привязан" if order.get("fazercards_mapped") else "не привязан"
         text = (
@@ -6092,13 +6162,16 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         except ValueError:
             amount = 0
         region = str(context.user_data.get("apple_id_add_region") or "")
-        currency = "USD" if region == "US" else "TRY"
+        currency = apple_id_currency_for_region(region)
         if amount <= 0 or not amount.is_integer() or not is_valid_apple_id_nominal(region, currency, int(amount)):
-            await msg.reply_text("Введите целый номинал в допустимом диапазоне: USA $1–$200 или Turkey 100–2000₺.", parse_mode="HTML")
+            await msg.reply_text("Введите целый номинал в допустимом диапазоне: USA $1–$200, Turkey 100–2000₺ или Russia 100–15000₽.", parse_mode="HTML")
             return
         context.user_data["apple_id_add_amount"] = int(amount)
         context.user_data["client_input"] = APPLE_ID_INPUT_ADD_PRICE
-        await msg.reply_text("Введите цену продажи в USD.\n\nПример: <code>9.5</code>", parse_mode="HTML")
+        if region == "RU":
+            await msg.reply_text("Введите цену продажи в RUB.\n\nПример: <code>1000</code>", parse_mode="HTML")
+        else:
+            await msg.reply_text("Введите цену продажи в USD.\n\nПример: <code>9.5</code>", parse_mode="HTML")
         return
 
     if input_mode == APPLE_ID_INPUT_ADD_PRICE:
@@ -6121,13 +6194,18 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             context.user_data.pop("client_input", None)
             await msg.reply_text("Такой номинал уже есть.", reply_markup=apple_id_admin_region_keyboard(region))
             return
-        currency = "USD" if region == "US" else "TRY"
-        title = f"Apple Gift Card USA ${amount:g}" if region == "US" else f"Apple Gift Card Turkey {amount:g}₺"
+        currency = apple_id_currency_for_region(region)
+        title = f"Apple Gift Card USA ${amount:g}" if region == "US" else (f"Apple Gift Card Turkey {amount:g}₺" if region == "TR" else f"Apple Gift Card Russia {amount:g}₽")
         catalog = get_apple_id_products()
         if not is_valid_apple_id_nominal(region, currency, amount):
-            await msg.reply_text("Номинал вне допустимого диапазона: USA $1–$200 или Turkey 100–2000₺.", parse_mode="HTML")
+            await msg.reply_text("Номинал вне допустимого диапазона: USA $1–$200, Turkey 100–2000₺ или Russia 100–15000₽.", parse_mode="HTML")
             return
-        catalog.setdefault(region, []).append({"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "price_usd": round(price, 2), "enabled": True})
+        product = {"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "enabled": True}
+        if region == "RU":
+            product.update({"price_rub": int(round(price)), "pricing_currency": "RUB", "pricing_mode": "supplier_markup"})
+        else:
+            product.update({"price_usd": round(price, 2)})
+        catalog.setdefault(region, []).append(product)
         save_apple_id_products(catalog)
         context.user_data.pop("client_input", None)
         context.user_data.pop("apple_id_add_region", None)
@@ -7036,7 +7114,19 @@ async def show_admin_business_sections(update: Update, context: ContextTypes.DEF
 
 
 def apple_nominal_text(product: dict) -> str:
-    return f"${product.get('amount'):g}" if product.get("currency") == "USD" else f"{product.get('amount'):g}₺"
+    amount = product.get("amount")
+    try:
+        amount_text = f"{float(amount):g}"
+    except (TypeError, ValueError):
+        amount_text = str(amount or "")
+    currency = str(product.get("currency") or "").upper()
+    if currency == "USD":
+        return f"${amount_text}"
+    if currency == "TRY":
+        return f"{amount_text}₺"
+    if currency == "RUB":
+        return f"{amount_text}₽"
+    return f"{amount_text} {currency}".strip()
 
 
 def apple_id_display_title_with_nominal(product: dict) -> str:
@@ -7055,7 +7145,7 @@ def apple_id_catalog_text() -> str:
     return (
         "🍎 <b>Apple ID каталог</b>\n\n"
         "Здесь можно управлять товарами Apple Gift Card.\n\n"
-        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n\nВыберите регион:"
+        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n🇷🇺 Russia\n\nВыберите регион:"
     )
 
 
@@ -7063,6 +7153,7 @@ def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US")],
         [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
+        [InlineKeyboardButton("🇷🇺 Russia", callback_data="admin_apple_id_region:RU")],
         [InlineKeyboardButton("🔗 Синхронизировать FazerCards", callback_data="admin_apple_id_fazer_sync")],
         [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_apple_id_recalc_all")],
         [InlineKeyboardButton("✏️ Изменить глобальную наценку %", callback_data="admin_apple_id_global_markup")],
@@ -7279,6 +7370,7 @@ APPLE_ITUNES_PATTERNS = (
 APPLE_REGION_PATTERNS = {
     "US": (r"\(\s*us\s*\)", r"\bus\b", r"\busa\b", r"\bunited\s+states\b", r"\busd\b"),
     "TR": (r"\(\s*tr\s*\)", r"\btr\b", r"\bturkey\b", r"\btürkiye\b", r"\btry\b", r"\btl\b", r"₺"),
+    "RU": (r"\(\s*ru\s*\)", r"\bru\b", r"\brus\b", r"\brussia\b", r"\brussian\s+federation\b", r"\bроссия\b", r"\bрф\b", r"\brub\b", r"\brur\b", r"₽"),
 }
 
 
