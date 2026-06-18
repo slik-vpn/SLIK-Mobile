@@ -441,7 +441,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "admin main menu is grouped into business/payment/service sections",
         "📊 Бизнес-разделы" in admin_panel_keyboard_text
-        and "💳 Оплата и курс" in admin_panel_keyboard_text
+        and "⚙️ Настройки" in admin_panel_keyboard_text
         and "🛠 Сервис" in admin_panel_keyboard_text,
     )
     service_keyboard_text = function_block(bot_text, "admin_service_sections_keyboard")
@@ -916,6 +916,52 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("no /giftcards/order", "/giftcards/order" not in bot_text)
     record("eSIM logic present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text and "await get_usd_rub_rate()" in bot_text)
     record("cashback disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
+    record("global apple_id_pricing exists", '"apple_id_pricing"' in bot_text and "DEFAULT_APPLE_ID_PRICING" in bot_text)
+    record("default supplier_markup_percent = 20", '"supplier_markup_percent": 20' in bot_text)
+    record("settings section active name is Настройки", "⚙️ Настройки" in bot_text and "💳 Оплата и курс" not in function_block(bot_text, "admin_panel_keyboard"))
+    record("TMA/open app button hidden but TMA config remains", "def get_tma_url" in bot_text and "web_app=WebAppInfo" not in function_block(bot_text, "main_menu_keyboard"))
+    record("FazerCards bulk sync button exists", "🔗 Синхронизировать FazerCards" in bot_text and "admin_apple_id_fazer_sync" in bot_text)
+    record("bulk sync uses GET giftcards cards and not POST", "sync_apple_id_fazercards_bulk" in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bot_text and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bot_text and "client.post" not in function_block(bot_text, "sync_apple_id_fazercards_bulk"))
+    bulk_sync_block = function_block(bot_text, "sync_apple_id_fazercards_bulk")
+
+    def ordered_tokens(block: str, *tokens: str) -> bool:
+        cursor = -1
+        for token in tokens:
+            cursor = block.find(token, cursor + 1)
+            if cursor < 0:
+                return False
+        return True
+
+    ok_false_guard = 'if not products_payload.get("ok"):'
+    categories_empty_guard = "if not categories:"
+    supplier_empty_guard = 'if report["supplier_items"] <= 0:'
+    record("sync bulk checks products_payload ok before processing", ordered_tokens(bulk_sync_block, "products_payload = await fetch_fazercards_products_readonly()", ok_false_guard, "return report", "categories ="))
+    record("products_payload ok=false returns before catalog save", ordered_tokens(bulk_sync_block, ok_false_guard, "return report", "save_apple_id_products(catalog)"))
+    record("empty Apple categories do not mark all catalog unavailable", ordered_tokens(bulk_sync_block, categories_empty_guard, "return report", 'fazercards_sync_status": "not_found"'))
+    record("failed cards endpoint does not mark products unavailable before continuing", ordered_tokens(bulk_sync_block, 'if not payload.get("ok"):', "continue", 'fazercards_sync_status": "not_found"'))
+    record("not_found marking happens only after successful supplier data retrieval", ordered_tokens(bulk_sync_block, 'report["supplier_items"] += len(cards)', supplier_empty_guard, "return report", 'fazercards_sync_status": "not_found"'))
+    record("exact matching prevents region and nominal mismatch", "apple_id_exact_fazercards_match" in bot_text and "fazercards_name_has_region" in function_block(bot_text, "apple_id_exact_fazercards_match") and "fazercards_name_has_amount" in function_block(bot_text, "apple_id_exact_fazercards_match"))
+    record("global recalc all prices uses global markup and confirmation", "admin_apple_id_recalc_all" in bot_text and "admin_apple_id_recalc_all_confirm" in bot_text and "recalculate_all_apple_id_prices(apply=False)" in bot_text)
+    record("personal account orders show paginated 5-button list", "APPLE_ID_ORDER_PAGE_SIZE = 5" in bot_text and "profile_orders:{page + 1}" in bot_text and "profile_orders:{page - 1}" in bot_text)
+    fazer_sync_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_fazer_sync":')
+    global_markup_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_global_markup":')
+    recalc_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all":')
+    recalc_confirm_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all_confirm":')
+
+    def access_before_call(branch: str, call: str) -> bool:
+        access_index = branch.find("has_catalog_admin_access(query.from_user)")
+        call_index = branch.find(call)
+        return access_index >= 0 and call_index >= 0 and access_index < call_index
+
+    record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
+    record("admin_apple_id_global_markup branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in global_markup_branch)
+    record("admin_apple_id_recalc_all branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_branch)
+    record("admin_apple_id_recalc_all_confirm branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_confirm_branch)
+    record("sync_apple_id_fazercards_bulk is not called before access check", access_before_call(fazer_sync_branch, "sync_apple_id_fazercards_bulk()"))
+    record("global markup input state is not set before access check", access_before_call(global_markup_branch, 'context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP'))
+    record("recalculate_all_apple_id_prices(apply=False) is not called before access check", access_before_call(recalc_branch, "recalculate_all_apple_id_prices(apply=False)"))
+    record("recalculate_all_apple_id_prices(apply=True) is not called before access check", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)"))
+    record("bulk recalc price_rub is protected by admin access", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)") and '"price_rub": rec["recommended_price_rub"]' in function_block(bot_text, "recalculate_all_apple_id_prices"))
     record("CryptoBot Apple ID amount uses price_rub helper", "apple_id_payment_amount_rub(plan)" in cryptobot_branch and "amount <= 0" in cryptobot_branch)
     record("card payment amount uses Apple ID RUB helper", 'plan.get("product_type") == "apple_id"' in card_lock_block and "apple_id_payment_amount_rub(plan)" in card_lock_block)
     record("auto refresh logs and keeps last successful rate on failure", "logger.warning" in auto_loop_block and "keeping last successful rate" in auto_loop_block)
