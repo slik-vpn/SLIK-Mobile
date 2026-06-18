@@ -15,7 +15,7 @@
     "tech_alerts": ""
   },
   "apple_id_pricing": {
-    "supplier_markup_percent": 20,
+    "supplier_markup_percent": 40,
     "rounding_mode": "up_to_9",
     "pricing_mode": "supplier_markup"
   }
