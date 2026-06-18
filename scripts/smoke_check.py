@@ -441,7 +441,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "admin main menu is grouped into business/payment/service sections",
         "📊 Бизнес-разделы" in admin_panel_keyboard_text
-        and "💳 Оплата и курс" in admin_panel_keyboard_text
+        and "⚙️ Настройки" in admin_panel_keyboard_text
         and "🛠 Сервис" in admin_panel_keyboard_text,
     )
     service_keyboard_text = function_block(bot_text, "admin_service_sections_keyboard")
@@ -916,6 +916,15 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("no /giftcards/order", "/giftcards/order" not in bot_text)
     record("eSIM logic present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text and "await get_usd_rub_rate()" in bot_text)
     record("cashback disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
+    record("global apple_id_pricing exists", '"apple_id_pricing"' in bot_text and "DEFAULT_APPLE_ID_PRICING" in bot_text)
+    record("default supplier_markup_percent = 20", '"supplier_markup_percent": 20' in bot_text)
+    record("settings section active name is Настройки", "⚙️ Настройки" in bot_text and "💳 Оплата и курс" not in function_block(bot_text, "admin_panel_keyboard"))
+    record("TMA/open app button hidden but TMA config remains", "def get_tma_url" in bot_text and "web_app=WebAppInfo" not in function_block(bot_text, "main_menu_keyboard"))
+    record("FazerCards bulk sync button exists", "🔗 Синхронизировать FazerCards" in bot_text and "admin_apple_id_fazer_sync" in bot_text)
+    record("bulk sync uses GET giftcards cards and not POST", "sync_apple_id_fazercards_bulk" in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bot_text and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bot_text and "client.post" not in function_block(bot_text, "sync_apple_id_fazercards_bulk"))
+    record("exact matching prevents region and nominal mismatch", "apple_id_exact_fazercards_match" in bot_text and "fazercards_name_has_region" in function_block(bot_text, "apple_id_exact_fazercards_match") and "fazercards_name_has_amount" in function_block(bot_text, "apple_id_exact_fazercards_match"))
+    record("global recalc all prices uses global markup and confirmation", "admin_apple_id_recalc_all" in bot_text and "admin_apple_id_recalc_all_confirm" in bot_text and "recalculate_all_apple_id_prices(apply=False)" in bot_text)
+    record("personal account orders show paginated 5-button list", "APPLE_ID_ORDER_PAGE_SIZE = 5" in bot_text and "profile_orders:{page + 1}" in bot_text and "profile_orders:{page - 1}" in bot_text)
     record("CryptoBot Apple ID amount uses price_rub helper", "apple_id_payment_amount_rub(plan)" in cryptobot_branch and "amount <= 0" in cryptobot_branch)
     record("card payment amount uses Apple ID RUB helper", 'plan.get("product_type") == "apple_id"' in card_lock_block and "apple_id_payment_amount_rub(plan)" in card_lock_block)
     record("auto refresh logs and keeps last successful rate on failure", "logger.warning" in auto_loop_block and "keeping last successful rate" in auto_loop_block)

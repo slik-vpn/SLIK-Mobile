@@ -71,6 +71,8 @@ MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/produc
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
 APPLE_ID_PRICE_MAX_RUB = 100000
+DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 20, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
+APPLE_ID_ORDER_PAGE_SIZE = 5
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
     try:
@@ -321,6 +323,7 @@ DEFAULT_CONFIG = {
         "tech_alerts": "",
     },
     "apple_id_products": {},
+    "apple_id_pricing": DEFAULT_APPLE_ID_PRICING.copy(),
     "fazercards": {
         "api_key": "",
         "enabled": False,
@@ -477,6 +480,12 @@ def load_config() -> dict:
         usd_rub.setdefault(key, value)
     if not isinstance(data.get("apple_id_products"), dict):
         data["apple_id_products"] = {}
+    apple_id_pricing = data.get("apple_id_pricing")
+    if not isinstance(apple_id_pricing, dict):
+        apple_id_pricing = {}
+        data["apple_id_pricing"] = apple_id_pricing
+    for key, value in DEFAULT_APPLE_ID_PRICING.items():
+        apple_id_pricing.setdefault(key, value)
     fazercards = data.get("fazercards")
     if not isinstance(fazercards, dict):
         fazercards = {}
@@ -1502,8 +1511,9 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("pricing_currency", "RUB")
     item.setdefault("price_rub", "")
     item.setdefault("pricing_mode", "supplier_markup")
-    item.setdefault("supplier_markup_percent", 15)
-    item.setdefault("rounding_mode", "up_to_9")
+    # Product-level markup is kept for legacy/manual edits, but calculations use the global Apple ID pricing by default.
+    item.setdefault("supplier_markup_percent", "")
+    item.setdefault("rounding_mode", get_apple_id_pricing_settings().get("rounding_mode", "up_to_9"))
     item.setdefault("market_rounding_mode", item.get("rounding_mode", "up_to_9"))
     if not isinstance(item.get("market_sources"), list):
         item["market_sources"] = []
@@ -1517,6 +1527,22 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("fazercards_stock", None)
     item["market_sources"] = [src for src in item.get("market_sources", []) if isinstance(src, dict)]
     return item
+
+
+def get_apple_id_pricing_settings() -> dict:
+    cfg = load_config()
+    settings = cfg.get("apple_id_pricing") if isinstance(cfg.get("apple_id_pricing"), dict) else {}
+    return {**DEFAULT_APPLE_ID_PRICING, **settings}
+
+
+def save_apple_id_pricing_settings(updates: dict) -> None:
+    cfg = load_config()
+    settings = cfg.get("apple_id_pricing") if isinstance(cfg.get("apple_id_pricing"), dict) else {}
+    settings.update(updates)
+    for key, value in DEFAULT_APPLE_ID_PRICING.items():
+        settings.setdefault(key, value)
+    cfg["apple_id_pricing"] = settings
+    save_config(cfg)
 
 
 def default_apple_id_products() -> dict:
@@ -2126,14 +2152,15 @@ def calculate_apple_id_supplier_markup_price(product: dict, usd_rub_rate=None) -
     except (TypeError, ValueError):
         supplier_price_usd = 0.0
     try:
-        markup_percent = float(product.get("supplier_markup_percent") if product.get("supplier_markup_percent") not in (None, "") else 15)
+        global_pricing = get_apple_id_pricing_settings()
+        markup_percent = float(global_pricing.get("supplier_markup_percent", 20))
     except (TypeError, ValueError):
-        markup_percent = 15.0
+        markup_percent = 20.0
     if supplier_price_usd <= 0:
         return {"pricing_mode": "supplier_markup", "recommended_price_rub": 0, "supplier_price_usd": 0, "supplier_cost_rub": 0, "supplier_markup_percent": markup_percent, "estimated_margin_rub": 0, "usd_rub_rate_used": rate, "usd_rub_rate_source": rate_source, "pricing_error": "supplier_price_missing"}
     supplier_cost_rub = supplier_price_usd * rate
     recommended = supplier_cost_rub * (1 + markup_percent / 100)
-    rounded = round_apple_id_market_price(recommended, str(product.get("rounding_mode") or product.get("market_rounding_mode") or "up_to_9"))
+    rounded = round_apple_id_market_price(recommended, str(get_apple_id_pricing_settings().get("rounding_mode") or product.get("rounding_mode") or product.get("market_rounding_mode") or "up_to_9"))
     return {"pricing_mode": "supplier_markup", "recommended_price_rub": rounded, "supplier_price_usd": supplier_price_usd, "supplier_cost_rub": round(supplier_cost_rub), "supplier_markup_percent": markup_percent, "estimated_margin_rub": round(rounded - supplier_cost_rub), "usd_rub_rate_used": rate, "usd_rub_rate_source": rate_source}
 
 
@@ -2272,6 +2299,100 @@ def fazercards_cards_from_payload(payload: dict) -> list[dict]:
     return []
 
 
+def fazercards_items_from_payload(payload: dict) -> list[dict]:
+    return fazercards_cards_from_payload(payload)
+
+
+def is_apple_fazercards_category(item: dict) -> bool:
+    name = str(item.get("name") or item.get("title") or "")
+    text = name.lower()
+    return is_apple_itunes_fazercards_name(name) and (
+        "app store" in text or "itunes" in text or "apple id" in text or "apple gift card" in text
+    )
+
+
+def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -> bool:
+    region = str(product.get("region") or "")
+    currency = str(product.get("currency") or "").upper()
+    amount = float(product.get("amount") or 0)
+    names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
+    if not fazercards_name_has_region(names, region):
+        return False
+    if currency == "USD" and not re.search(r"(?:\$|\busd\b)", names, re.I):
+        return False
+    if currency == "TRY" and not re.search(r"(?:₺|\btry\b|\btl\b)", names, re.I):
+        return False
+    amount_text = str(int(amount)) if amount.is_integer() else str(amount)
+    return fazercards_name_has_amount(names, amount_text)
+
+
+async def sync_apple_id_fazercards_bulk() -> dict:
+    products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
+    categories = [item for item in fazercards_items_from_payload(products_payload) if is_apple_fazercards_category(item)]
+    report = {"categories": len(categories), "supplier_items": 0, "linked": 0, "updated_prices": 0, "not_found": 0, "new_supplier_positions": 0, "errors": 0, "lines": []}
+    catalog = get_apple_id_products()
+    flat_products = [p for items in catalog.values() for p in items]
+    seen_products: set[str] = set()
+    for category in categories:
+        category_id = fazercards_category_id_value(category)
+        payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
+        if not payload.get("ok"):
+            report["errors"] += 1
+            continue
+        cards = fazercards_cards_from_payload(payload)
+        report["supplier_items"] += len(cards)
+        for product in flat_products:
+            match = next((card for card in cards if apple_id_exact_fazercards_match(product, category, card)), None)
+            if not match:
+                continue
+            old_price = product.get("fazercards_price_usd")
+            card_id = fazercards_product_value(match, "card_id")
+            price_usd = float(fazercards_product_value(match, "price_usd") or 0)
+            stock = int(float(fazercards_product_value(match, "stock") or 0))
+            product.update({"fazercards_category_id": category_id, "fazercards_card_id": card_id, "fazercards_product_id": card_id, "fazercards_product_name": fazercards_product_value(match, "name"), "fazercards_price_usd": price_usd, "fazercards_stock": stock, "fazercards_available": stock > 0, "fazercards_last_seen": now_str(), "fazercards_sync_status": "ok", "fazercards_last_error": ""})
+            seen_products.add(product.get("id"))
+            report["linked"] += 1
+            if str(old_price) != str(price_usd):
+                report["updated_prices"] += 1
+            report["lines"].append(f"✅ {APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region'))} {apple_nominal_text(product)} — card_id {card_id}, закуп ${price_usd:g}")
+        for card in cards:
+            if not any(apple_id_exact_fazercards_match(product, category, card) for product in flat_products):
+                report["new_supplier_positions"] += 1
+                report["lines"].append(f"➕ {html_escape(str(fazercards_product_value(card, 'name') or 'позиция'))} — есть у поставщика, нет в каталоге")
+    for product in flat_products:
+        if product.get("id") not in seen_products:
+            product.update({"fazercards_available": False, "fazercards_sync_status": "not_found", "fazercards_last_error": "exact_match_not_found"})
+            report["not_found"] += 1
+            report["lines"].append(f"⚠️ {APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region'))} {apple_nominal_text(product)} — exact match не найден")
+    save_apple_id_products(catalog)
+    return report
+
+
+def fazercards_bulk_sync_report_text(report: dict) -> str:
+    lines = ["🔗 <b>Синхронизация FazerCards завершена</b>", "", f"Найдено категорий Apple: {report['categories']}", f"Найдено позиций у поставщика: {report['supplier_items']}", f"Привязано товаров: {report['linked']}", f"Обновлено закупочных цен: {report['updated_prices']}", f"Нет exact match: {report['not_found']}", f"Новые позиции у поставщика: {report['new_supplier_positions']}", f"Ошибки: {report['errors']}", ""]
+    lines.extend(report.get("lines", [])[:30])
+    return "\n".join(lines)
+
+
+def recalculate_all_apple_id_prices(apply: bool = False) -> tuple[dict, dict]:
+    catalog = get_apple_id_products()
+    report = {"total": 0, "updated": 0, "skipped": 0, "skipped_lines": []}
+    for products in catalog.values():
+        for product in products:
+            report["total"] += 1
+            rec = calculate_apple_id_supplier_markup_price(product)
+            if rec.get("pricing_error"):
+                report["skipped"] += 1
+                report["skipped_lines"].append(apple_id_display_title_with_nominal(product))
+                continue
+            if apply:
+                product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_price_usd": rec["supplier_price_usd"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
+                report["updated"] += 1
+    if apply:
+        save_apple_id_products(catalog)
+    return report, catalog
+
+
 def summarize_fazercards_products(products_payload: dict) -> tuple[int, list[str]]:
     items = products_payload.get("items") if isinstance(products_payload, dict) else []
     if not isinstance(items, list):
@@ -2353,6 +2474,8 @@ def apple_id_product_plan(product: dict) -> dict:
         "fazercards_mapped": bool(product.get("fazercards_product_id")),
         "fazercards_product_id": product.get("fazercards_product_id", ""),
         "fazercards_product_name": product.get("fazercards_product_name", ""),
+        "fazercards_category_id": product.get("fazercards_category_id", ""),
+        "fazercards_card_id": product.get("fazercards_card_id", ""),
     }
 
 
@@ -2952,16 +3075,18 @@ def order_number_plain(order: dict) -> str:
 
 
 def format_order_button_text(order: dict) -> str:
+    status = order_status_label(order.get("status", "new"))
+    if order.get("price"):
+        price = str(order.get("price"))
+    elif order.get("price_rub"):
+        price = format_rub(order.get("price_rub"))
+    else:
+        price = "—"
     if order.get("product_type") == "apple_id":
-        amount = order.get("amount", "—")
-        currency = order.get("currency", "")
-        nominal = f"${amount}" if currency == "USD" else f"{amount}₺" if currency == "TRY" else f"{amount} {currency}".strip()
-        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
-        return f"{order_number_plain(order)} — 🍎 Apple ID / {region} / {nominal}"
-    return (
-        f"{order_number_plain(order)} — {order.get('country', 'Россия')} "
-        f"{order.get('gb', '—')} — {order.get('price', '—')}"
-    )
+        title = str(order.get("product_title") or order.get("gb") or "Apple ID")
+    else:
+        title = f"eSIM {order.get('country', 'Россия')}"
+    return f"{order_number_plain(order)} · {title} · {price} · {status}"[:64]
 
 
 def build_orders_dashboard() -> str:
@@ -3948,9 +4073,9 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
         [InlineKeyboardButton("👨‍💻 Поддержка",              url=SUPPORT_URL)],
     ]
+    # TMA_URL and Mini App code are preserved, but the open-app button is temporarily hidden.
     tma_url = get_tma_url()
-    if tma_url:
-        rows.append([InlineKeyboardButton("🚀 Открыть приложение", web_app=WebAppInfo(url=tma_url))])
+    _tma_button_hidden = bool(tma_url)
     if has_admin_access(user):
         rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
@@ -3959,7 +4084,7 @@ def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
 def admin_panel_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📊 Бизнес-разделы", callback_data="admin_business_sections")],
-        [InlineKeyboardButton("💳 Оплата и курс", callback_data="admin_payment_sections")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin_payment_sections")],
         [InlineKeyboardButton("🛠 Сервис", callback_data="admin_service_sections")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
     ]
@@ -4216,13 +4341,28 @@ def profile_back_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def user_orders_keyboard(orders: list) -> InlineKeyboardMarkup:
-    latest_orders = sorted(orders, key=order_sort_key, reverse=True)[:10]
+def user_orders_page(orders: list, page: int = 0) -> tuple[list[dict], int, int]:
+    sorted_orders = sorted(orders, key=order_sort_key, reverse=True)
+    total_pages = max(1, math.ceil(len(sorted_orders) / APPLE_ID_ORDER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * APPLE_ID_ORDER_PAGE_SIZE
+    return sorted_orders[start:start + APPLE_ID_ORDER_PAGE_SIZE], page, total_pages
+
+
+def user_orders_keyboard(orders: list, page: int = 0) -> InlineKeyboardMarkup:
+    page_orders, page, total_pages = user_orders_page(orders, page)
     rows = [
         [InlineKeyboardButton(format_order_button_text(order), callback_data=f"user_order:{order.get('id')}")]
-        for order in latest_orders
+        for order in page_orders
         if order.get("id") is not None
     ]
+    nav = []
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("◀️ Предыдущие", callback_data=f"profile_orders:{page + 1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("Следующие ▶️", callback_data=f"profile_orders:{page - 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="profile")])
     return InlineKeyboardMarkup(rows)
 
@@ -4707,56 +4847,27 @@ def format_order_date(order: dict) -> str:
     return created_at[:10] if created_at else "—"
 
 
-def format_user_orders(orders: list) -> str:
+def format_user_orders(orders: list, page: int = 0) -> str:
     total_orders = len(orders)
-    total_spent = round(
-        sum(
-            parse_price(order.get("price", "0"))
-            for order in orders
-            if is_revenue_order(order)
-        ),
-        2,
+    page_orders, current_page, total_pages = user_orders_page(orders, page)
+    if not page_orders:
+        return "📦 <b>У вас пока нет заказов.</b>"
+    return (
+        "📦 <b>Ваши заказы</b>\n\n"
+        f"Показаны последние {len(page_orders)} заказов кнопками. "
+        f"Страница <b>{current_page + 1}</b> из <b>{total_pages}</b>.\n"
+        f"Всего заказов: <b>{total_orders}</b>\n\n"
+        "Нажмите на заказ, чтобы открыть детали."
     )
-    latest_orders = sorted(orders, key=order_sort_key, reverse=True)[:10]
-    lines = [
-        "📦 <b>Ваши заказы</b>",
-        "",
-        f"Всего заказов: <b>{total_orders}</b>",
-        f"Потрачено: <b>{format_usd_cents(total_spent)}</b>",
-        "",
-    ]
-    for index, order in enumerate(latest_orders):
-        if index:
-            lines.append("────────────")
-        if order.get("product_type") == "apple_id":
-            lines.extend([
-                f"🧾 Заказ: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>",
-                f"🍎 Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>",
-                f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>",
-                f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>",
-                f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>",
-                "",
-                "Откройте заказ кнопкой ниже, чтобы посмотреть детали.",
-            ])
-            continue
-        lines.extend([
-            f"🧾 Заказ: <b>{html_escape(str(order.get('number') or order.get('id') or '—'))}</b>",
-            f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>",
-            f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>",
-            f"💵 Сумма: <b>{html_escape(order.get('price', '—'))}</b>",
-            f"📅 Дата: <b>{html_escape(format_order_date(order))}</b>",
-            f"🔖 Статус: <b>{html_escape(order_status_label(order.get('status', 'new')))}</b>",
-            "",
-            "Откройте заказ кнопкой ниже, чтобы повторить покупку.",
-        ])
-    if total_orders > 10:
-        lines.extend(["", "Показаны последние 10 заказов."])
-    return "\n".join(lines)
 
 
 async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    try:
+        page = int(query.data.split(":", 1)[1]) if ":" in query.data else 0
+    except (TypeError, ValueError):
+        page = 0
     orders = get_user_orders(query.from_user.id)
     if not orders:
         await edit_or_send(
@@ -4766,7 +4877,7 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    await edit_or_send(query, context, format_user_orders(orders), user_orders_keyboard(orders))
+    await edit_or_send(query, context, format_user_orders(orders, page), user_orders_keyboard(orders, page))
 
 
 def build_user_order_card_text(order: dict) -> str:
@@ -5543,6 +5654,11 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         if markup < 0 or markup > 300:
             await msg.reply_text("Введите число от 0 до 300, например <code>15</code>.", parse_mode="HTML")
             return
+        if not product_id:
+            save_apple_id_pricing_settings({"supplier_markup_percent": round(markup, 4), "pricing_mode": "supplier_markup"})
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("✅ Глобальная наценка Apple ID обновлена.", parse_mode="HTML", reply_markup=apple_id_catalog_keyboard())
+            return
         product = set_apple_id_product(product_id, {"supplier_markup_percent": round(markup, 4), "pricing_mode": "supplier_markup"})
         context.user_data.pop("client_input", None)
         context.user_data.pop("apple_id_product_id", None)
@@ -6282,7 +6398,7 @@ def admin_panel_text(user) -> str:
         f"Роль: <b>{role}</b>\n\n"
         "Доступные разделы:\n"
         "• 📊 Бизнес-разделы — заказы, аналитика, клиенты, новости\n"
-        "• 💳 Оплата и курс — платёжные способы и USD/RUB\n"
+        "• ⚙️ Настройки — оплата, USD/RUB, Apple ID, FazerCards, уведомления и сервис\n"
         "• 🛠 Сервис — уведомления, проверка системы, бэкапы"
     )
 
@@ -6303,10 +6419,13 @@ def admin_business_sections_text(user) -> str:
 
 def admin_payment_sections_text(user) -> str:
     return (
-        "💳 <b>Оплата и курс</b>\n\n"
+        "⚙️ <b>Настройки</b>\n\n"
+        "Здесь можно управлять оплатой, курсом USD/RUB, Apple ID каталогом, "
+        "глобальной наценкой, FazerCards, чатами уведомлений и сервисными параметрами.\n\n"
         "Выберите раздел:\n"
         "• 💳 Платёжные способы\n"
-        "• 💱 Курс USD/RUB"
+        "• 💱 Курс USD/RUB\n"
+        "• 🍎 Apple ID каталог"
     )
 
 
@@ -6547,6 +6666,9 @@ def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US")],
         [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
+        [InlineKeyboardButton("🔗 Синхронизировать FazerCards", callback_data="admin_apple_id_fazer_sync")],
+        [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_apple_id_recalc_all")],
+        [InlineKeyboardButton("✏️ Изменить глобальную наценку %", callback_data="admin_apple_id_global_markup")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
 
@@ -6634,8 +6756,8 @@ def apple_id_pricing_keyboard(product: dict) -> InlineKeyboardMarkup:
     pid = product['id']
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Изменить наценку %", callback_data=f"admin_apple_id_pricing_markup:{pid}")],
-        [InlineKeyboardButton("📈 Рассчитать цену", callback_data=f"admin_apple_id_pricing:{pid}")],
         [InlineKeyboardButton("✅ Применить рекомендованную цену", callback_data=f"admin_apple_id_pricing_apply:{pid}")],
+        [InlineKeyboardButton("✏️ Изменить цену вручную", callback_data=f"admin_apple_id_price:{pid}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{pid}")],
     ])
 
@@ -7357,6 +7479,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         await edit_or_send(query, context, apple_id_catalog_text(), apple_id_catalog_keyboard())
+    elif data == "admin_apple_id_fazer_sync":
+        await query.answer("Синхронизирую FazerCards...")
+        report = await sync_apple_id_fazercards_bulk()
+        await edit_or_send(query, context, fazercards_bulk_sync_report_text(report), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
+    elif data == "admin_apple_id_global_markup":
+        context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP
+        context.user_data.pop("apple_id_product_id", None)
+        current_markup = get_apple_id_pricing_settings().get("supplier_markup_percent", 20)
+        await edit_or_send(query, context, f"✏️ <b>Глобальная наценка Apple ID</b>\n\nТекущая наценка: <b>{float(current_markup):g}%</b>\nВведите новое значение от 0 до 300.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
+    elif data == "admin_apple_id_recalc_all":
+        report, _catalog = recalculate_all_apple_id_prices(apply=False)
+        await edit_or_send(query, context, f"🔄 <b>Пересчитать все цены</b>\n\nБудет пересчитано {report['total'] - report['skipped']} товаров. Продолжить?\nПропущено без закупочной цены: {report['skipped']}", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Продолжить", callback_data="admin_apple_id_recalc_all_confirm")], [InlineKeyboardButton("❌ Отмена", callback_data="admin_apple_id_catalog")]]))
+    elif data == "admin_apple_id_recalc_all_confirm":
+        report, _catalog = recalculate_all_apple_id_prices(apply=True)
+        await edit_or_send(query, context, f"✅ Цены пересчитаны.\n\nОбновлено: {report['updated']}\nПропущено: {report['skipped']}", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data.startswith("admin_apple_id_region:"):
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
@@ -7969,7 +8106,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_existing_checkout_payment(update, context)
     elif data == "profile":
         await show_profile(update, context)
-    elif data == "profile_orders":
+    elif data == "profile_orders" or data.startswith("profile_orders:"):
         await show_my_orders(update, context)
     elif data.startswith("user_order:"):
         await show_user_order(update, context)
