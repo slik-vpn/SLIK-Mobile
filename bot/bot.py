@@ -1511,25 +1511,70 @@ def apple_id_region_aliases(region: str) -> list[str]:
     return {"US": ["usa", "us", "сша", "united states"], "TR": ["turkey", "tr", "турция", "türkiye", "turkiye"]}.get(str(region).upper(), [str(region).lower()])
 
 
+def apple_id_nominal_text(product: dict) -> str:
+    try:
+        amount = float(product.get("amount") or 0)
+        return f"{amount:g}"
+    except (TypeError, ValueError):
+        return str(product.get("amount") or "").strip()
+
+
 def apple_id_exact_market_match(title: str, product: dict) -> bool:
     text = re.sub(r"\s+", " ", str(title or "").lower())
-    amount = str(product.get("amount") or "").rstrip(".0")
+    amount = apple_id_nominal_text(product)
     currency = str(product.get("currency") or "").lower()
-    if not any(alias in text for alias in apple_id_region_aliases(str(product.get("region") or ""))):
+    if re.search(r"\bот\b|\bfrom\b|пополнение", text):
         return False
-    amount_patterns = [rf"(?<!\d){re.escape(amount)}(?!\d)\s*(?:{currency}|[$₺])", rf"(?:{currency}|[$₺])\s*(?<!\d){re.escape(amount)}(?!\d)"]
-    if not any(re.search(pattern, text, re.I) for pattern in amount_patterns):
+    if not any(re.search(rf"(?<![а-яa-z0-9]){re.escape(alias)}(?![а-яa-z0-9])", text, re.I) for alias in apple_id_region_aliases(str(product.get("region") or ""))):
         return False
-    if currency not in text and not ((currency == "usd" and "$" in text) or (currency == "try" and "₺" in text)):
-        return False
-    if re.search(r"\bот\b|from|пополнение", text):
-        return False
-    return True
+    currency_tokens = [currency]
+    if currency == "usd":
+        currency_tokens.append(r"\$")
+    if currency == "try":
+        currency_tokens.append("₺")
+    currency_group = "|".join(currency_tokens)
+    amount_patterns = [
+        rf"(?<!\d){re.escape(amount)}(?!\d)\s*(?:{currency_group})",
+        rf"(?:{currency_group})\s*(?<!\d){re.escape(amount)}(?!\d)",
+    ]
+    return any(re.search(pattern, text, re.I) for pattern in amount_patterns)
+
+
+def apple_id_market_price_match_cases() -> list[tuple[str, dict, bool]]:
+    """Safety cases used by smoke checks: exact nominal only, no defaults/from-prices."""
+    return [
+        ("Apple Gift Card USA 10 USD — 1090 ₽", {"region": "US", "amount": 10, "currency": "USD"}, True),
+        ("Apple Gift Card USA 5 USD — 590 ₽", {"region": "US", "amount": 10, "currency": "USD"}, False),
+        ("Default Apple Gift Card USA 2 USD — 250 ₽", {"region": "US", "amount": 10, "currency": "USD"}, False),
+        ("Apple Gift Card Turkey 100 TRY — 390 ₽", {"region": "TR", "amount": 250, "currency": "TRY"}, False),
+        ("Apple ID USA от 2 USD — 250 ₽", {"region": "US", "amount": 10, "currency": "USD"}, False),
+        ("Apple ID от 500 рублей", {"region": "US", "amount": 10, "currency": "USD"}, False),
+    ]
+
+
+def split_market_card_fragments(html: str) -> list[str]:
+    fragments = []
+    for pattern in (
+        r"<article\b[^>]*>.*?</article>",
+        r"<li\b[^>]*(?:product|item|card|offer|lot)[^>]*>.*?</li>",
+        r"<div\b[^>]*(?:product|item|card|offer|lot)[^>]*>.*?</div>",
+    ):
+        fragments.extend(match.group(0) for match in re.finditer(pattern, html, re.I | re.S))
+    return fragments[:100]
+
+
+def extract_rub_prices_from_fragment(fragment: str) -> list[int]:
+    return [
+        price for price in (
+            valid_market_price_rub(match.group(1) or match.group(2))
+            for match in re.finditer(r"(?:(?:₽|руб\.?|RUB)\s*(\d[\d\s]{1,8})|(\d[\d\s]{1,8})\s*(?:₽|руб\.?|RUB))", fragment, re.I)
+        ) if price
+    ]
 
 
 async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
     target_region = "США" if product.get("region") == "US" else "Турция" if product.get("region") == "TR" else str(product.get("region") or "")
-    target_nominal = str(product.get("amount") or "")
+    target_nominal = apple_id_nominal_text(product)
     target_currency = str(product.get("currency") or "")
     checked_at = apple_id_market_checked_at()
     try:
@@ -1539,21 +1584,22 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
         html = response.text
     except Exception as exc:
         return {"ok": False, "source": "Ozon/Multitransfer", "error": "error", "details": str(exc)[:160], "checked_at": checked_at}
-    if not apple_id_exact_market_match(html, product):
-        default = re.search(r"(?<!\d)(\d+)\s*(USD|TRY|[$₺])", html, re.I)
-        if default:
-            return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_nominal_not_found", "details": f"Found default {default.group(1)} {default.group(2)}, target is {target_nominal} {target_currency}", "checked_at": checked_at}
+    fragments = split_market_card_fragments(html)
+    if not fragments:
         return {"ok": False, "source": "Ozon/Multitransfer", "error": "dynamic_page_not_supported", "checked_at": checked_at}
-    near = re.search(r"(?:(?:₽|руб\.?|RUB)\s*(\d[\d\s]{1,8})|(\d[\d\s]{1,8})\s*(?:₽|руб\.?|RUB))", html, re.I)
-    price = valid_market_price_rub(near.group(1) or near.group(2)) if near else None
-    if not price:
-        return {"ok": False, "source": "Ozon/Multitransfer", "error": "price_not_found", "checked_at": checked_at}
-    return {"ok": True, "price_rub": price, "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at}
+    exact_fragments = [fragment for fragment in fragments if apple_id_exact_market_match(fragment, product)]
+    if not exact_fragments:
+        return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_nominal_not_found", "details": f"Exact {target_nominal} {target_currency} fragment not found", "checked_at": checked_at}
+    for fragment in exact_fragments:
+        prices = extract_rub_prices_from_fragment(fragment)
+        if prices:
+            return {"ok": True, "price_rub": min(prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at}
+    return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_price_not_found", "details": f"Exact {target_nominal} {target_currency} fragment has no RUB price", "checked_at": checked_at}
 
 
 async def fetch_public_market_prices(product: dict, source: str, url: str) -> dict:
     checked_at = apple_id_market_checked_at()
-    query = f"Apple Gift Card {product.get('region')} {product.get('amount')} {product.get('currency')}"
+    query = f"Apple Gift Card {product.get('region')} {apple_id_nominal_text(product)} {product.get('currency')}"
     try:
         async with httpx.AsyncClient(timeout=APPLE_ID_MARKET_TIMEOUT_SECONDS, follow_redirects=True) as client:
             response = await client.get(url, params={"search": query})
@@ -1561,9 +1607,16 @@ async def fetch_public_market_prices(product: dict, source: str, url: str) -> di
         html = response.text
     except Exception as exc:
         return {"ok": False, "source": source, "error": "unsupported", "details": str(exc)[:160], "checked_at": checked_at, "matched_count": 0}
-    if not apple_id_exact_market_match(html, product):
-        return {"ok": False, "source": source, "error": "price_not_found", "checked_at": checked_at, "matched_count": 0}
-    prices = [p for p in (valid_market_price_rub(m.group(1) or m.group(2)) for m in re.finditer(r"(?:(?:₽|руб\.?|RUB)\s*(\d[\d\s]{1,8})|(\d[\d\s]{1,8})\s*(?:₽|руб\.?|RUB))", html, re.I)) if p]
+    fragments = split_market_card_fragments(html)
+    if not fragments:
+        return {"ok": False, "source": source, "error": "unsupported", "checked_at": checked_at, "matched_count": 0}
+    prices = []
+    for fragment in fragments:
+        if not apple_id_exact_market_match(fragment, product):
+            continue
+        fragment_prices = extract_rub_prices_from_fragment(fragment)
+        if fragment_prices:
+            prices.append(min(fragment_prices))
     if not prices:
         return {"ok": False, "source": source, "error": "price_not_found", "checked_at": checked_at, "matched_count": 0}
     prices = sorted(prices)[:20]
@@ -6077,6 +6130,32 @@ def apple_id_pricing_keyboard(product: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{pid}")],
     ])
 
+def apple_id_pricing_apply_confirm_text(product: dict) -> str:
+    rec = calculate_apple_id_recommended_price(product, get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE)
+    sources = {src.get("source"): src for src in product.get("market_sources", [])}
+    ozon = sources.get("Ozon/Multitransfer", {})
+    plati = sources.get("Plati", {})
+    ggsel = sources.get("GGSEL", {})
+    return (
+        "✅ <b>Подтвердите применение цены</b>\n\n"
+        f"Текущая цена: <b>{html_escape(format_apple_id_client_price(product))}</b>\n"
+        f"Рекомендованная цена: <b>{format_rub(rec['recommended_price_rub'])}</b>\n"
+        f"Ozon exact: {html_escape(str(ozon.get('last_price_rub') or '—'))} ₽\n"
+        f"Plati median: {html_escape(str(plati.get('last_median_price_rub') or '—'))} ₽\n"
+        f"GGSEL median: {html_escape(str(ggsel.get('last_median_price_rub') or '—'))} ₽\n"
+        f"Закуп FazerCards: <b>{html_escape(format_usd(product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
+        f"Себестоимость: <b>{format_rub(rec['supplier_cost_rub'])}</b>\n"
+        f"Маржа: <b>{format_rub(rec['estimated_margin_rub'])}</b>"
+    )
+
+
+def apple_id_pricing_apply_confirm_keyboard(product: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, применить цену", callback_data=f"admin_apple_id_pricing_apply_confirm:{product['id']}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"admin_apple_id_pricing:{product['id']}")],
+    ])
+
+
 def update_apple_id_market_source(product: dict, source_name: str, result: dict) -> dict:
     sources = []
     for src in product.get("market_sources", []):
@@ -6816,7 +6895,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if source_key in ("ggsel", "all"):
             product = update_apple_id_market_source(product, "GGSEL", await fetch_ggsel_market_prices(product))
         await edit_or_send(query, context, apple_id_pricing_text(product), apple_id_pricing_keyboard(product))
-    elif data.startswith("admin_apple_id_pricing_apply:"):
+    elif data.startswith("admin_apple_id_pricing_apply_confirm:"):
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
             return
@@ -6828,6 +6907,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         product = set_apple_id_product(product["id"], {"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "supplier_cost_rub": rec["supplier_cost_rub"], "estimated_margin_rub": rec["estimated_margin_rub"], "market_sources_snapshot": product.get("market_sources", [])})
         await query.answer("Рекомендованная цена применена вручную.")
         await edit_or_send(query, context, apple_id_pricing_text(product), apple_id_pricing_keyboard(product))
+    elif data.startswith("admin_apple_id_pricing_apply:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product = apple_id_product_by_id(data.split(":", 1)[1])
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_pricing_apply_confirm_text(product), apple_id_pricing_apply_confirm_keyboard(product))
     elif data.startswith("admin_apple_id_toggle:"):
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)

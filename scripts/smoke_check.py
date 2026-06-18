@@ -871,6 +871,14 @@ def check_run_mvp_contract(run_mvp_text: str) -> None:
     )
 
 
+def callback_branch_block(text: str, marker: str) -> str:
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    nxt = text.find("\n    elif ", start + len(marker))
+    return text[start:] if nxt < 0 else text[start:nxt]
+
+
 def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     normalize_block = function_block(bot_text, "normalize_apple_id_product")
     plan_block = function_block(bot_text, "apple_id_product_plan")
@@ -894,7 +902,19 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("calculate_apple_id_recommended_price uses market_corridor", "def calculate_apple_id_recommended_price" in bot_text and "market_corridor" in function_block(bot_text, "calculate_apple_id_recommended_price"))
     record("Apple ID user flow shows rubles", "format_apple_id_client_price(product)" in bot_text and "format_rub(price_rub)" in plan_block)
     record("Apple ID order saves market_sources_snapshot", '"market_sources_snapshot"' in plan_block and '"market_sources_snapshot"' in bot_text)
-    record("price_rub is not changed automatically without confirmation", "market_auto_update_price" in normalize_block and "admin_apple_id_pricing_apply" in bot_text and "auto_update_price" not in function_block(bot_text, "calculate_apple_id_recommended_price"))
+    apply_block = callback_branch_block(bot_text, 'elif data.startswith("admin_apple_id_pricing_apply:")')
+    confirm_block = callback_branch_block(bot_text, 'elif data.startswith("admin_apple_id_pricing_apply_confirm:")')
+    ozon_block = function_block(bot_text, "fetch_multitransfer_ozon_exact_price")
+    public_block = function_block(bot_text, "fetch_public_market_prices")
+    calc_block = function_block(bot_text, "calculate_apple_id_recommended_price")
+    record("admin_apple_id_pricing_apply does not change price_rub directly", "set_apple_id_product" not in apply_block and "price_rub" not in apply_block)
+    record("price_rub changes in admin_apple_id_pricing_apply_confirm", '"price_rub": rec["recommended_price_rub"]' in confirm_block and "set_apple_id_product" in confirm_block)
+    record("Ozon helper does not take first RUB price from whole page", "extract_rub_prices_from_fragment(html)" not in ozon_block and "near = re.search" not in ozon_block)
+    record("Ozon exact price is tied to exact nominal fragment", "exact_fragments" in ozon_block and "extract_rub_prices_from_fragment(fragment)" in ozon_block and "exact_price_not_found" in ozon_block)
+    record("Plati/GGSEL do not collect all prices after one page exact match", "apple_id_exact_market_match(html, product)" not in public_block and "for fragment in fragments" in public_block and "extract_rub_prices_from_fragment(fragment)" in public_block)
+    record("unsupported sources do not participate in pricing", 'src.get("status") != "ok"' in calc_block and 'src.get("match_confidence") != "exact"' in calc_block)
+    record("Apple ID exact-match helper cases exist", "apple_id_market_price_match_cases" in bot_text and "USA 5 USD" in bot_text and "Default Apple Gift Card USA 2 USD" in bot_text and "Turkey 100 TRY" in bot_text and "от 2 USD" in bot_text and "Apple ID от 500 рублей" in bot_text)
+    record("price_rub is not changed automatically without confirmation", "market_auto_update_price" in normalize_block and "admin_apple_id_pricing_apply_confirm" in bot_text and "auto_update_price" not in calc_block)
     record("no FazerCards client.post purchase call", "/giftcards/order" not in bot_text and "client.post" not in function_block(bot_text, "check_fazercards_connection"))
     record("eSIM logic remains present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text)
     record("cashback remains disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
