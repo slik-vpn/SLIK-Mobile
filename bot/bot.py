@@ -10,7 +10,7 @@ import asyncio
 import zipfile
 import math
 import re
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from html import escape, unescape as html_unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1462,6 +1462,9 @@ def default_market_source_diagnostics() -> dict:
         "scripts_found": 0,
         "json_scripts_found": 0,
         "api_url_candidates": [],
+        "js_chunk_candidates": [],
+        "next_data_candidates": [],
+        "static_skipped_count": 0,
         "currency_mentions": 0,
         "rub_mentions": 0,
         "nominal_mentions": 0,
@@ -1478,8 +1481,14 @@ def normalize_market_source_diagnostics(value) -> dict:
         diagnostics["candidate_titles"] = []
     if not isinstance(diagnostics.get("api_url_candidates"), list):
         diagnostics["api_url_candidates"] = []
+    if not isinstance(diagnostics.get("js_chunk_candidates"), list):
+        diagnostics["js_chunk_candidates"] = []
+    if not isinstance(diagnostics.get("next_data_candidates"), list):
+        diagnostics["next_data_candidates"] = []
     diagnostics["candidate_titles"] = [str(title)[:160] for title in diagnostics["candidate_titles"][:5]]
     diagnostics["api_url_candidates"] = [str(url)[:240] for url in diagnostics["api_url_candidates"][:10]]
+    diagnostics["js_chunk_candidates"] = [str(url)[:240] for url in diagnostics["js_chunk_candidates"][:10]]
+    diagnostics["next_data_candidates"] = [str(url)[:240] for url in diagnostics["next_data_candidates"][:10]]
     return diagnostics
 
 
@@ -1666,8 +1675,9 @@ def market_candidate_titles(fragments: list[str]) -> list[str]:
 
 
 
-MULTITRANSFER_API_KEYWORDS = ("api", "products", "price", "calculate", "order", "nominal", "amount", "apple", "multitransfer", "ozon")
+MULTITRANSFER_API_KEYWORDS = ("api", "products", "price", "calculate", "nominal", "amount", "apple", "multitransfer", "ozon")
 MULTITRANSFER_UNSAFE_API_KEYWORDS = ("purchase", "payment", "create", "checkout", "pay")
+MULTITRANSFER_STATIC_EXTENSIONS = (".woff", ".woff2", ".otf", ".ttf", ".eot", ".svg", ".png", ".jpg", ".jpeg", ".webp", ".ico", ".css", ".map")
 MULTITRANSFER_PRICE_FIELDS = {"price", "amountrub", "rub", "sum", "total", "value", "cost", "pricerub", "finalprice"}
 
 
@@ -1683,8 +1693,14 @@ def multitransfer_html_diagnostics(html: str, product: dict) -> dict:
     }
 
 
-def extract_multitransfer_api_candidates(html: str) -> list[str]:
+def multitransfer_url_is_static_asset(url: str) -> bool:
+    low = str(url or "").lower().split("?", 1)[0].split("#", 1)[0]
+    return "/_next/static/media/" in low or "/ozon/_next/static/media/" in low or low.endswith(MULTITRANSFER_STATIC_EXTENSIONS)
+
+
+def extract_multitransfer_api_candidates(html: str, include_skipped_count: bool = False):
     candidates = []
+    static_skipped_count = 0
     patterns = [
         r"\bfetch\(\s*[`'\"]([^`'\"]+)[`'\"]",
         r"\baxios(?:\.get)?\(\s*[`'\"]([^`'\"]+)[`'\"]",
@@ -1695,20 +1711,70 @@ def extract_multitransfer_api_candidates(html: str) -> list[str]:
         for match in re.finditer(pattern, html, re.I):
             url = html_unescape(match.group(1).replace("\\/", "/")).strip()
             low = url.lower()
+            if multitransfer_url_is_static_asset(url):
+                static_skipped_count += 1
+                continue
             if any(keyword in low for keyword in MULTITRANSFER_API_KEYWORDS) and url not in candidates:
                 candidates.append(url)
             if len(candidates) >= 10:
-                return candidates
+                return (candidates, static_skipped_count) if include_skipped_count else candidates
+    return (candidates[:10], static_skipped_count) if include_skipped_count else candidates[:10]
+
+
+def extract_nextjs_chunk_candidates(html: str) -> list[str]:
+    candidates = []
+    for match in re.finditer(r'<script\b[^>]*\bsrc=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', html, re.I):
+        url = html_unescape(match.group(1).replace("\\/", "/")).strip()
+        if url not in candidates:
+            candidates.append(url)
+        if len(candidates) >= 10:
+            return candidates
+    for match in re.finditer(r'["\']((?:(?:https?:)?//[^"\']+|/[^"\']*?)(?:/ozon)?/_next/static/chunks/[^"\']+?\.js(?:\?[^"\']*)?)["\']', html, re.I):
+        url = html_unescape(match.group(1).replace("\\/", "/")).strip()
+        if url not in candidates:
+            candidates.append(url)
+        if len(candidates) >= 10:
+            break
     return candidates[:10]
 
 
+def extract_nextjs_build_id(html: str) -> str:
+    for match in re.finditer(r'<script\b[^>]*(?:id=["\']__NEXT_DATA__["\']|application/json)[^>]*>(.*?)</script>', html, re.I | re.S):
+        try:
+            data = json.loads(html_unescape(match.group(1).strip()))
+        except (TypeError, ValueError):
+            continue
+        build_id = str(data.get("buildId") or "").strip() if isinstance(data, dict) else ""
+        if re.fullmatch(r"[-_a-zA-Z0-9]+", build_id):
+            return build_id
+    match = re.search(r"/(?:ozon/)?_next/static/([-_a-zA-Z0-9]{8,})/", html)
+    return match.group(1) if match else ""
+
+
+def multitransfer_next_data_candidates(build_id: str) -> list[str]:
+    if not build_id:
+        return []
+    product_path = quote("APPLE ID")
+    return [
+        f"/ozon/_next/data/{build_id}/products/business/{product_path}.json",
+        f"/_next/data/{build_id}/ozon/products/business/{product_path}.json",
+        f"/ozon/_next/data/{build_id}/ozon/products/business/{product_path}.json",
+    ][:10]
+
+
 def multitransfer_url_is_safe_get(url: str) -> bool:
+    # Unsafe GET endpoints include purchase/payment/create/checkout/pay/order/giftcards.
     low = str(url or "").lower()
     if not low or low.startswith(("javascript:", "data:", "mailto:")):
         return False
+    if multitransfer_url_is_static_asset(low):
+        return False
     if any(keyword in low for keyword in MULTITRANSFER_UNSAFE_API_KEYWORDS):
         return False
-    return not re.search(r"/(?:giftcards/)?order(?:/|$)", low)
+    if re.search(r"/(?:giftcards/)?order(?:/|$)", low):
+        return False
+    path = urlparse(low).path if low.startswith(("http://", "https://", "//")) else low.split("?", 1)[0]
+    return path.startswith(("/api/", "/ozon/api/", "/_next/data/", "/ozon/_next/data/"))
 
 
 def find_multitransfer_json_exact_price(value, product: dict) -> int | None:
@@ -1782,6 +1848,53 @@ async def try_multitransfer_api_candidates(product: dict, candidates: list[str],
                     return {"ok": True, "price_rub": price, "diagnostics": diagnostics}
             except Exception as exc:
                 diagnostics["api_checked"].append(f"GET {url} -> {str(exc)[:80]}"[:200])
+    return {"ok": False, "diagnostics": diagnostics}
+
+
+def extract_json_like_multitransfer_objects(text: str, product: dict, limit: int = 20) -> list[str]:
+    fragments = []
+    for token_match in re.finditer(r"\b(?:price|amount|nominal|USD|TRY|RUB|apple|products)\b", text, re.I):
+        start = max(0, token_match.start() - 1500)
+        end = min(len(text), token_match.end() + 1500)
+        fragment = text[start:end]
+        if apple_id_exact_market_match(fragment, product):
+            fragments.append(fragment)
+        if len(fragments) >= limit:
+            break
+    return fragments
+
+
+async def scan_multitransfer_js_chunks_for_price_sources(product: dict, chunk_urls: list[str], base_url: str = MULTITRANSFER_OZON_APPLE_ID_URL) -> dict:
+    diagnostics = {"api_url_candidates": [], "js_chunk_checked": []}
+    checked = 0
+    async with httpx.AsyncClient(timeout=APPLE_ID_MARKET_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        for raw_url in chunk_urls[:10]:
+            if checked >= 5:
+                break
+            url = urljoin(base_url, raw_url)
+            if multitransfer_url_is_static_asset(url) or not urlparse(url).path.lower().endswith(".js"):
+                continue
+            checked += 1
+            try:
+                response = await client.get(url)
+                diagnostics["js_chunk_checked"].append(f"GET {url} -> {response.status_code}"[:200])
+                if response.status_code >= 400:
+                    continue
+                text = response.text[:800000]
+            except Exception as exc:
+                diagnostics["js_chunk_checked"].append(f"GET {url} -> {str(exc)[:80]}"[:200])
+                continue
+            found_candidates, skipped = extract_multitransfer_api_candidates(text, include_skipped_count=True)
+            diagnostics["static_skipped_count"] = diagnostics.get("static_skipped_count", 0) + skipped
+            for candidate in found_candidates:
+                if multitransfer_url_is_safe_get(candidate) and candidate not in diagnostics["api_url_candidates"]:
+                    diagnostics["api_url_candidates"].append(candidate)
+                if len(diagnostics["api_url_candidates"]) >= 10:
+                    break
+            for fragment in extract_json_like_multitransfer_objects(text, product):
+                prices = extract_rub_prices_from_fragment(fragment)
+                if prices:
+                    return {"ok": True, "price_rub": min(prices), "diagnostics": diagnostics}
     return {"ok": False, "diagnostics": diagnostics}
 
 def extract_rub_prices_from_fragment(fragment: str) -> list[int]:
@@ -1882,7 +1995,11 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
         return {"ok": False, "source": "Ozon/Multitransfer", "error": "error", "details": str(exc)[:160], "checked_at": checked_at, "diagnostics": diagnostics}
     diagnostics["html_length"] = len(html)
     diagnostics.update(multitransfer_html_diagnostics(html, product))
-    diagnostics["api_url_candidates"] = extract_multitransfer_api_candidates(html)
+    api_candidates, static_skipped_count = extract_multitransfer_api_candidates(html, include_skipped_count=True)
+    diagnostics["api_url_candidates"] = api_candidates[:10]
+    diagnostics["static_skipped_count"] = static_skipped_count
+    diagnostics["js_chunk_candidates"] = extract_nextjs_chunk_candidates(html)
+    diagnostics["next_data_candidates"] = multitransfer_next_data_candidates(extract_nextjs_build_id(html))
     fragments = split_market_card_fragments(html)
     script_fragments = script_market_fragments(html)
     all_fragments = fragments + script_fragments
@@ -1905,6 +2022,23 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
     diagnostics["prices_found"] += len(script_json_prices)
     if script_json_prices:
         return {"ok": True, "price_rub": min(script_json_prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
+    if diagnostics.get("next_data_candidates"):
+        next_data_result = await try_multitransfer_api_candidates(product, diagnostics.get("next_data_candidates") or [], str(response.url))
+        diagnostics.update(next_data_result.get("diagnostics") or {})
+        if next_data_result.get("ok"):
+            diagnostics["prices_found"] += 1
+            return {"ok": True, "price_rub": next_data_result.get("price_rub"), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
+    js_result = await scan_multitransfer_js_chunks_for_price_sources(product, diagnostics.get("js_chunk_candidates") or [], str(response.url))
+    js_diag = js_result.get("diagnostics") or {}
+    for candidate in js_diag.get("api_url_candidates") or []:
+        if candidate not in diagnostics["api_url_candidates"]:
+            diagnostics["api_url_candidates"].append(candidate)
+    diagnostics["api_url_candidates"] = diagnostics["api_url_candidates"][:10]
+    diagnostics["static_skipped_count"] += js_diag.get("static_skipped_count", 0)
+    diagnostics["js_chunk_checked"] = js_diag.get("js_chunk_checked", [])
+    if js_result.get("ok"):
+        diagnostics["prices_found"] += 1
+        return {"ok": True, "price_rub": js_result.get("price_rub"), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
     api_result = await try_multitransfer_api_candidates(product, diagnostics.get("api_url_candidates") or [], str(response.url))
     diagnostics.update(api_result.get("diagnostics") or {})
     if api_result.get("ok"):
@@ -1912,7 +2046,10 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
         return {"ok": True, "price_rub": api_result.get("price_rub"), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
     diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} fragment has no RUB price"
     error = "exact_price_not_found" if diagnostics.get("api_checked") else "dynamic_price_api_not_found"
-    if error == "dynamic_price_api_not_found":
+    if exact_fragments and diagnostics.get("rub_mentions", 0) <= 1 and not diagnostics.get("api_url_candidates") and not diagnostics.get("next_data_candidates"):
+        error = "dynamic_price_source_not_found"
+        diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} appears dynamic; safe price source not found"
+    elif error == "dynamic_price_api_not_found":
         diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} appears dynamic; safe GET API not found"
     return {"ok": False, "source": "Ozon/Multitransfer", "error": error, "details": diagnostics["last_error_details"], "checked_at": checked_at, "diagnostics": diagnostics}
 
@@ -6550,6 +6687,8 @@ def apple_id_market_debug_text(product: dict, source_name: str, result: dict) ->
     titles = diagnostics.get("candidate_titles") or []
     title_lines = "\n".join(f"• {html_escape(str(title))}" for title in titles) or "—"
     api_lines = "\n".join(f"• {html_escape(str(url))}" for url in (diagnostics.get("api_url_candidates") or [])[:10]) or "—"
+    next_data_lines = "\n".join(f"• {html_escape(str(url))}" for url in (diagnostics.get("next_data_candidates") or [])[:10]) or "—"
+    js_chunk_lines = "\n".join(f"• {html_escape(str(url))}" for url in (diagnostics.get("js_chunk_candidates") or [])[:10]) or "—"
     return (
         f"🧪 <b>Диагностика источника: {html_escape(source_name)}</b>\n\n"
         f"Товар: {html_escape(apple_id_display_title_with_nominal(product))}\n"
@@ -6565,6 +6704,9 @@ def apple_id_market_debug_text(product: dict, source_name: str, result: dict) ->
         f"Цен найдено: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
         f"Детали: {html_escape(str(diagnostics.get('last_error_details') or result.get('details') or '—'))}\n\n"
         f"API candidates:\n{api_lines}\n\n"
+        f"Next data candidates:\n{next_data_lines}\n\n"
+        f"JS chunks:\n{js_chunk_lines}\n\n"
+        f"Static skipped: {html_escape(str(diagnostics.get('static_skipped_count') or 0))}\n\n"
         f"Кандидаты:\n{title_lines}\n\n"
         "Цена товара не изменялась."
     )
