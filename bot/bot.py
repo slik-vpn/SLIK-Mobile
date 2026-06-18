@@ -67,8 +67,8 @@ FAZERCARDS_TIMEOUT_SECONDS = 8.0
 FAZERCARDS_BALANCE_ENDPOINT = "/balance"
 FAZERCARDS_PRODUCTS_ENDPOINT = "/giftcards?limit=100"
 FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT = "/giftcards/cards"
-FAZERCARDS_TELEGRAM_STARS_ENDPOINT = "/api/v2/telegram/stars"
-FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/api/v2/telegram/premium"
+FAZERCARDS_TELEGRAM_STARS_ENDPOINT = "/telegram/stars"
+FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/telegram/premium"
 MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/products/business/APPLE%20ID"
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
@@ -2513,6 +2513,7 @@ async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> di
 
 
 async def fetch_fazercards_telegram_endpoint_readonly(endpoint: str, label: str) -> dict:
+    logger.debug("FazerCards Telegram %s endpoint path: %s", label, endpoint)
     api_key = get_fazercards_api_key()
     if not api_key:
         return {"ok": False, "items": [], "raw": None, "error": "API key не указан"}
@@ -3249,6 +3250,8 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         "",
         f"Stars endpoint: {'OK' if report.get('telegram_stars_endpoint_ok') else 'ERROR'}",
         f"Premium endpoint: {'OK' if report.get('telegram_premium_endpoint_ok') else 'ERROR'}",
+        f"Stars endpoint path: {html_escape(FAZERCARDS_TELEGRAM_STARS_ENDPOINT)}",
+        f"Premium endpoint path: {html_escape(FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT)}",
         f"Stars items checked: {report.get('stars_items_scanned', 0)}",
         f"Premium items checked: {report.get('premium_items_scanned', 0)}",
         f"Stars found: {report.get('stars_candidates_found', 0)}",
