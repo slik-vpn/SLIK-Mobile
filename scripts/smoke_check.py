@@ -925,6 +925,25 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("exact matching prevents region and nominal mismatch", "apple_id_exact_fazercards_match" in bot_text and "fazercards_name_has_region" in function_block(bot_text, "apple_id_exact_fazercards_match") and "fazercards_name_has_amount" in function_block(bot_text, "apple_id_exact_fazercards_match"))
     record("global recalc all prices uses global markup and confirmation", "admin_apple_id_recalc_all" in bot_text and "admin_apple_id_recalc_all_confirm" in bot_text and "recalculate_all_apple_id_prices(apply=False)" in bot_text)
     record("personal account orders show paginated 5-button list", "APPLE_ID_ORDER_PAGE_SIZE = 5" in bot_text and "profile_orders:{page + 1}" in bot_text and "profile_orders:{page - 1}" in bot_text)
+    fazer_sync_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_fazer_sync":')
+    global_markup_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_global_markup":')
+    recalc_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all":')
+    recalc_confirm_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all_confirm":')
+
+    def access_before_call(branch: str, call: str) -> bool:
+        access_index = branch.find("has_catalog_admin_access(query.from_user)")
+        call_index = branch.find(call)
+        return access_index >= 0 and call_index >= 0 and access_index < call_index
+
+    record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
+    record("admin_apple_id_global_markup branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in global_markup_branch)
+    record("admin_apple_id_recalc_all branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_branch)
+    record("admin_apple_id_recalc_all_confirm branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_confirm_branch)
+    record("sync_apple_id_fazercards_bulk is not called before access check", access_before_call(fazer_sync_branch, "sync_apple_id_fazercards_bulk()"))
+    record("global markup input state is not set before access check", access_before_call(global_markup_branch, 'context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP'))
+    record("recalculate_all_apple_id_prices(apply=False) is not called before access check", access_before_call(recalc_branch, "recalculate_all_apple_id_prices(apply=False)"))
+    record("recalculate_all_apple_id_prices(apply=True) is not called before access check", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)"))
+    record("bulk recalc price_rub is protected by admin access", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)") and '"price_rub": rec["recommended_price_rub"]' in function_block(bot_text, "recalculate_all_apple_id_prices"))
     record("CryptoBot Apple ID amount uses price_rub helper", "apple_id_payment_amount_rub(plan)" in cryptobot_branch and "amount <= 0" in cryptobot_branch)
     record("card payment amount uses Apple ID RUB helper", 'plan.get("product_type") == "apple_id"' in card_lock_block and "apple_id_payment_amount_rub(plan)" in card_lock_block)
     record("auto refresh logs and keeps last successful rate on failure", "logger.warning" in auto_loop_block and "keeping last successful rate" in auto_loop_block)

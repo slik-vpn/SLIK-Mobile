@@ -7480,18 +7480,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await edit_or_send(query, context, apple_id_catalog_text(), apple_id_catalog_keyboard())
     elif data == "admin_apple_id_fazer_sync":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
         await query.answer("Синхронизирую FazerCards...")
         report = await sync_apple_id_fazercards_bulk()
         await edit_or_send(query, context, fazercards_bulk_sync_report_text(report), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data == "admin_apple_id_global_markup":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
         context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP
         context.user_data.pop("apple_id_product_id", None)
         current_markup = get_apple_id_pricing_settings().get("supplier_markup_percent", 20)
         await edit_or_send(query, context, f"✏️ <b>Глобальная наценка Apple ID</b>\n\nТекущая наценка: <b>{float(current_markup):g}%</b>\nВведите новое значение от 0 до 300.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data == "admin_apple_id_recalc_all":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
         report, _catalog = recalculate_all_apple_id_prices(apply=False)
         await edit_or_send(query, context, f"🔄 <b>Пересчитать все цены</b>\n\nБудет пересчитано {report['total'] - report['skipped']} товаров. Продолжить?\nПропущено без закупочной цены: {report['skipped']}", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Продолжить", callback_data="admin_apple_id_recalc_all_confirm")], [InlineKeyboardButton("❌ Отмена", callback_data="admin_apple_id_catalog")]]))
     elif data == "admin_apple_id_recalc_all_confirm":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
         report, _catalog = recalculate_all_apple_id_prices(apply=True)
         await edit_or_send(query, context, f"✅ Цены пересчитаны.\n\nОбновлено: {report['updated']}\nПропущено: {report['skipped']}", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data.startswith("admin_apple_id_region:"):
