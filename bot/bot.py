@@ -11,7 +11,7 @@ import zipfile
 import math
 import re
 from urllib.parse import quote, urljoin
-from html import escape
+from html import escape, unescape as html_unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -1459,6 +1459,13 @@ def default_market_source_diagnostics() -> dict:
         "exact_fragments_found": 0,
         "prices_found": 0,
         "candidate_titles": [],
+        "scripts_found": 0,
+        "json_scripts_found": 0,
+        "api_url_candidates": [],
+        "currency_mentions": 0,
+        "rub_mentions": 0,
+        "nominal_mentions": 0,
+        "region_mentions": 0,
         "last_error_details": "",
     }
 
@@ -1469,7 +1476,10 @@ def normalize_market_source_diagnostics(value) -> dict:
         diagnostics.update({key: value.get(key, diagnostics[key]) for key in diagnostics})
     if not isinstance(diagnostics.get("candidate_titles"), list):
         diagnostics["candidate_titles"] = []
+    if not isinstance(diagnostics.get("api_url_candidates"), list):
+        diagnostics["api_url_candidates"] = []
     diagnostics["candidate_titles"] = [str(title)[:160] for title in diagnostics["candidate_titles"][:5]]
+    diagnostics["api_url_candidates"] = [str(url)[:240] for url in diagnostics["api_url_candidates"][:10]]
     return diagnostics
 
 
@@ -1655,6 +1665,125 @@ def market_candidate_titles(fragments: list[str]) -> list[str]:
     return titles
 
 
+
+MULTITRANSFER_API_KEYWORDS = ("api", "products", "price", "calculate", "order", "nominal", "amount", "apple", "multitransfer", "ozon")
+MULTITRANSFER_UNSAFE_API_KEYWORDS = ("purchase", "payment", "create", "checkout", "pay")
+MULTITRANSFER_PRICE_FIELDS = {"price", "amountrub", "rub", "sum", "total", "value", "cost", "pricerub", "finalprice"}
+
+
+def multitransfer_html_diagnostics(html: str, product: dict) -> dict:
+    nominal = apple_id_nominal_text(product)
+    return {
+        "scripts_found": len(re.findall(r"<script\b", html, re.I)),
+        "json_scripts_found": len(re.findall(r'<script\b[^>]*(?:application/json|__NEXT_DATA__)[^>]*>', html, re.I)),
+        "currency_mentions": len(re.findall(rf"\b{re.escape(str(product.get('currency') or ''))}\b", html, re.I)) if product.get("currency") else 0,
+        "rub_mentions": len(re.findall(r"₽|\bруб\.?\b|\bRUB\b", html, re.I)),
+        "nominal_mentions": len(re.findall(rf"(?<!\d){re.escape(nominal)}(?!\d)", html)) if nominal else 0,
+        "region_mentions": sum(len(re.findall(rf"(?<![а-яa-z0-9]){re.escape(alias)}(?![а-яa-z0-9])", html, re.I)) for alias in apple_id_region_aliases(str(product.get("region") or ""))),
+    }
+
+
+def extract_multitransfer_api_candidates(html: str) -> list[str]:
+    candidates = []
+    patterns = [
+        r"\bfetch\(\s*[`'\"]([^`'\"]+)[`'\"]",
+        r"\baxios(?:\.get)?\(\s*[`'\"]([^`'\"]+)[`'\"]",
+        r"XMLHttpRequest[\s\S]{0,500}?(?:open\(\s*[`'\"]GET[`'\"]\s*,\s*)?[`'\"]([^`'\"]+)[`'\"]",
+        r"[`'\"]((?:https?:)?//[^`'\"]+|/[^`'\"]+)[`'\"]",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, re.I):
+            url = html_unescape(match.group(1).replace("\\/", "/")).strip()
+            low = url.lower()
+            if any(keyword in low for keyword in MULTITRANSFER_API_KEYWORDS) and url not in candidates:
+                candidates.append(url)
+            if len(candidates) >= 10:
+                return candidates
+    return candidates[:10]
+
+
+def multitransfer_url_is_safe_get(url: str) -> bool:
+    low = str(url or "").lower()
+    if not low or low.startswith(("javascript:", "data:", "mailto:")):
+        return False
+    if any(keyword in low for keyword in MULTITRANSFER_UNSAFE_API_KEYWORDS):
+        return False
+    return not re.search(r"/(?:giftcards/)?order(?:/|$)", low)
+
+
+def find_multitransfer_json_exact_price(value, product: dict) -> int | None:
+    def node_text(node) -> str:
+        try:
+            return json.dumps(node, ensure_ascii=False)
+        except TypeError:
+            return str(node)
+
+    def walk(node):
+        if isinstance(node, dict):
+            text = node_text(node)
+            if apple_id_exact_market_match(text, product):
+                for key, value in node.items():
+                    if re.sub(r"[^a-z]", "", str(key).lower()) in MULTITRANSFER_PRICE_FIELDS:
+                        price = valid_market_price_rub(value)
+                        if price:
+                            return price
+            for child in node.values():
+                found = walk(child)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for child in node:
+                found = walk(child)
+                if found:
+                    return found
+        return None
+
+    return walk(value)
+
+
+def extract_multitransfer_script_json_prices(html: str, product: dict) -> list[int]:
+    prices = []
+    for match in re.finditer(r'<script\b[^>]*>(?P<body>.*?)</script>', html, re.I | re.S):
+        body = html_unescape((match.group("body") or "").strip())
+        candidates = [body]
+        candidates.append(re.sub(r"^\s*window\.[\w$]+\s*=\s*", "", body).rstrip(";"))
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            price = find_multitransfer_json_exact_price(parsed, product)
+            if price:
+                prices.append(price)
+                break
+    return prices
+
+
+async def try_multitransfer_api_candidates(product: dict, candidates: list[str], base_url: str = MULTITRANSFER_OZON_APPLE_ID_URL) -> dict:
+    diagnostics = {"api_checked": [], "api_skipped": []}
+    checked = 0
+    async with httpx.AsyncClient(timeout=APPLE_ID_MARKET_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        for raw_url in candidates[:10]:
+            if checked >= 5:
+                break
+            if not multitransfer_url_is_safe_get(raw_url):
+                diagnostics["api_skipped"].append(str(raw_url)[:160])
+                continue
+            url = urljoin(base_url, raw_url)
+            checked += 1
+            try:
+                response = await client.get(url)
+                diagnostics["api_checked"].append(f"GET {url} -> {response.status_code}"[:200])
+                ctype = response.headers.get("content-type", "")
+                if "json" not in ctype.lower():
+                    continue
+                price = find_multitransfer_json_exact_price(response.json(), product)
+                if price:
+                    return {"ok": True, "price_rub": price, "diagnostics": diagnostics}
+            except Exception as exc:
+                diagnostics["api_checked"].append(f"GET {url} -> {str(exc)[:80]}"[:200])
+    return {"ok": False, "diagnostics": diagnostics}
+
 def extract_rub_prices_from_fragment(fragment: str) -> list[int]:
     return [
         price for price in (
@@ -1752,6 +1881,8 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
         diagnostics["last_error_details"] = str(exc)[:160]
         return {"ok": False, "source": "Ozon/Multitransfer", "error": "error", "details": str(exc)[:160], "checked_at": checked_at, "diagnostics": diagnostics}
     diagnostics["html_length"] = len(html)
+    diagnostics.update(multitransfer_html_diagnostics(html, product))
+    diagnostics["api_url_candidates"] = extract_multitransfer_api_candidates(html)
     fragments = split_market_card_fragments(html)
     script_fragments = script_market_fragments(html)
     all_fragments = fragments + script_fragments
@@ -1770,8 +1901,20 @@ async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
         diagnostics["prices_found"] += len(prices)
         if prices:
             return {"ok": True, "price_rub": min(prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
+    script_json_prices = extract_multitransfer_script_json_prices(html, product)
+    diagnostics["prices_found"] += len(script_json_prices)
+    if script_json_prices:
+        return {"ok": True, "price_rub": min(script_json_prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
+    api_result = await try_multitransfer_api_candidates(product, diagnostics.get("api_url_candidates") or [], str(response.url))
+    diagnostics.update(api_result.get("diagnostics") or {})
+    if api_result.get("ok"):
+        diagnostics["prices_found"] += 1
+        return {"ok": True, "price_rub": api_result.get("price_rub"), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
     diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} fragment has no RUB price"
-    return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_price_not_found", "details": diagnostics["last_error_details"], "checked_at": checked_at, "diagnostics": diagnostics}
+    error = "exact_price_not_found" if diagnostics.get("api_checked") else "dynamic_price_api_not_found"
+    if error == "dynamic_price_api_not_found":
+        diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} appears dynamic; safe GET API not found"
+    return {"ok": False, "source": "Ozon/Multitransfer", "error": error, "details": diagnostics["last_error_details"], "checked_at": checked_at, "diagnostics": diagnostics}
 
 
 def apple_id_public_market_queries(product: dict) -> list[str]:
@@ -6238,6 +6381,18 @@ def apple_nominal_text(product: dict) -> str:
     return f"${product.get('amount'):g}" if product.get("currency") == "USD" else f"{product.get('amount'):g}₺"
 
 
+def apple_id_display_title_with_nominal(product: dict) -> str:
+    title = str(product.get("title") or "Apple Gift Card").strip()
+    nominal = apple_nominal_text(product)
+    if nominal and not re.search(rf"(?<!\w){re.escape(nominal)}(?!\w)", title, re.I):
+        amount = apple_id_nominal_text(product)
+        currency = str(product.get("currency") or "").upper()
+        title_has_nominal = bool(amount and re.search(rf"(?<!\d){re.escape(amount)}(?!\d)\s*(?:{re.escape(currency)}|[$₺])", title, re.I))
+        if not title_has_nominal:
+            title = f"{title} {nominal}"
+    return title
+
+
 def apple_id_catalog_text() -> str:
     return (
         "🍎 <b>Apple ID каталог</b>\n\n"
@@ -6329,13 +6484,15 @@ def apple_id_pricing_text(product: dict) -> str:
             f"HTTP: {html_escape(str(diagnostics.get('http_status') or '—'))}\n"
             f"HTML: {html_escape(str(diagnostics.get('html_length') or 0))} символов\n"
             f"Фрагментов: {html_escape(str(diagnostics.get('fragments_found') or 0))}\n"
+            f"Scripts: {html_escape(str(diagnostics.get('scripts_found') or 0))}, JSON scripts: {html_escape(str(diagnostics.get('json_scripts_found') or 0))}\n"
+            f"API candidates: {html_escape(str(len(diagnostics.get('api_url_candidates') or [])))}\n"
             f"{exact_label}: {html_escape(str(diagnostics.get('exact_fragments_found') or 0))}\n"
             f"{prices_label}: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
             f"Детали: {html_escape(str(details))}"
         )
     return (
         f"💰 <b>Ценообразование</b>\n\n"
-        f"{html_escape(product.get('title', 'Apple Gift Card'))} {html_escape(nominal)}\n\n"
+        f"{html_escape(apple_id_display_title_with_nominal(product))}\n\n"
         f"Цена клиента: <b>{html_escape(format_apple_id_client_price(product))}</b>\n"
         f"Валюта продажи: <b>RUB</b>\n\n"
         f"Закуп FazerCards: <b>{html_escape(format_usd(product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
@@ -6392,17 +6549,22 @@ def apple_id_market_debug_text(product: dict, source_name: str, result: dict) ->
     diagnostics = normalize_market_source_diagnostics(result.get("diagnostics"))
     titles = diagnostics.get("candidate_titles") or []
     title_lines = "\n".join(f"• {html_escape(str(title))}" for title in titles) or "—"
+    api_lines = "\n".join(f"• {html_escape(str(url))}" for url in (diagnostics.get("api_url_candidates") or [])[:10]) or "—"
     return (
         f"🧪 <b>Диагностика источника: {html_escape(source_name)}</b>\n\n"
-        f"Товар: {html_escape(product.get('title', 'Apple Gift Card'))} {html_escape(apple_nominal_text(product))}\n"
+        f"Товар: {html_escape(apple_id_display_title_with_nominal(product))}\n"
         f"Результат: {html_escape('ok' if result.get('ok') else str(result.get('error') or 'error'))}\n"
         f"HTTP: {html_escape(str(diagnostics.get('http_status') or '—'))}\n"
         f"URL: {html_escape(str(diagnostics.get('final_url') or '—'))}\n"
         f"HTML: {html_escape(str(diagnostics.get('html_length') or 0))} символов\n"
         f"Фрагментов: {html_escape(str(diagnostics.get('fragments_found') or 0))}\n"
         f"Exact фрагментов: {html_escape(str(diagnostics.get('exact_fragments_found') or 0))}\n"
+        f"Scripts: {html_escape(str(diagnostics.get('scripts_found') or 0))}\n"
+        f"JSON scripts: {html_escape(str(diagnostics.get('json_scripts_found') or 0))}\n"
+        f"Currency/RUB/Nominal/Region mentions: {html_escape(str(diagnostics.get('currency_mentions') or 0))}/{html_escape(str(diagnostics.get('rub_mentions') or 0))}/{html_escape(str(diagnostics.get('nominal_mentions') or 0))}/{html_escape(str(diagnostics.get('region_mentions') or 0))}\n"
         f"Цен найдено: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
         f"Детали: {html_escape(str(diagnostics.get('last_error_details') or result.get('details') or '—'))}\n\n"
+        f"API candidates:\n{api_lines}\n\n"
         f"Кандидаты:\n{title_lines}\n\n"
         "Цена товара не изменялась."
     )
