@@ -1620,6 +1620,10 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("fazercards_available", None)
     item.setdefault("fazercards_price_usd", None)
     item.setdefault("fazercards_stock", None)
+    item.setdefault("supplier_available", item.get("fazercards_available"))
+    item.setdefault("supplier_stock", item.get("fazercards_stock"))
+    item.setdefault("supplier_status", "unknown")
+    item.setdefault("supplier_last_seen", item.get("fazercards_last_seen", ""))
     item["market_sources"] = [src for src in item.get("market_sources", []) if isinstance(src, dict)]
     return item
 
@@ -1684,8 +1688,13 @@ def sort_apple_id_products(products: list[dict]) -> list[dict]:
 def is_visible_apple_id_product(product: dict, enabled_only: bool = False) -> bool:
     if not isinstance(product, dict):
         return False
-    if enabled_only and not product.get("enabled", True):
-        return False
+    if enabled_only:
+        if not product.get("enabled", True):
+            return False
+        if product.get("supplier_available") is not True:
+            return False
+        if apple_id_price_rub_value(product) <= 0:
+            return False
     return is_valid_apple_id_nominal(product.get("region"), product.get("currency"), product.get("amount"))
 
 
@@ -1754,6 +1763,18 @@ def apple_id_products_by_region(region: str, enabled_only: bool = False, valid_o
         products = [p for p in products if p.get("enabled", True)]
     return sort_apple_id_products(products)
 
+
+
+def apple_id_unavailable_message(product: dict | None) -> str:
+    if not product or not is_valid_apple_id_nominal(product.get("region"), product.get("currency"), product.get("amount")):
+        return "Товар недоступен."
+    if product.get("enabled") is False:
+        return "Товар временно отключён."
+    if product.get("supplier_available") is not True:
+        return "Товар временно недоступен у поставщика."
+    if apple_id_price_rub_value(product) <= 0:
+        return "Товар временно недоступен. Напишите менеджеру или попробуйте позже."
+    return "Товар недоступен."
 
 def apple_id_product_by_id(product_id: str) -> dict | None:
     for products in get_apple_id_products().values():
@@ -2616,6 +2637,10 @@ def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
         "fazercards_price_usd": price_usd,
         "fazercards_stock": stock,
         "fazercards_available": stock > 0,
+        "supplier_stock": stock,
+        "supplier_available": stock > 0,
+        "supplier_status": "found" if stock > 0 else "out_of_stock",
+        "supplier_last_seen": now_str(),
     }
 
 
@@ -2678,7 +2703,12 @@ async def sync_apple_id_fazercards_bulk() -> dict:
             card_id = fazercards_product_value(match, "card_id")
             price_usd = float(fazercards_product_value(match, "price_usd") or 0)
             stock = int(float(fazercards_product_value(match, "stock") or 0))
-            product.update({"fazercards_category_id": category_id, "fazercards_card_id": card_id, "fazercards_product_id": card_id, "fazercards_product_name": fazercards_product_value(match, "name"), "fazercards_price_usd": price_usd, "fazercards_stock": stock, "fazercards_available": stock > 0, "fazercards_last_seen": now_str(), "fazercards_sync_status": "ok", "fazercards_last_error": ""})
+            last_seen = now_str()
+            updates = {"fazercards_category_id": category_id, "fazercards_card_id": card_id, "fazercards_product_id": card_id, "fazercards_product_name": fazercards_product_value(match, "name"), "fazercards_price_usd": price_usd, "supplier_price_usd": price_usd, "fazercards_stock": stock, "stock": stock, "fazercards_available": stock > 0, "supplier_available": stock > 0, "supplier_stock": stock, "supplier_status": "found" if stock > 0 else "out_of_stock", "supplier_last_seen": last_seen, "fazercards_last_seen": last_seen, "fazercards_sync_status": "ok", "fazercards_last_error": ""}
+            product.update(updates)
+            if price_usd > 0:
+                rec = calculate_apple_id_supplier_markup_price(product)
+                product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
             seen_products.add(product.get("id"))
             report["linked"] += 1
             if str(old_price) != str(price_usd):
@@ -2711,7 +2741,7 @@ async def sync_apple_id_fazercards_bulk() -> dict:
         return report
     for product in flat_products:
         if product.get("id") not in seen_products and product.get("region") in successful_regions:
-            product.update({"fazercards_available": False, "fazercards_sync_status": "not_found", "fazercards_last_error": "exact_match_not_found"})
+            product.update({"fazercards_available": False, "supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str(), "fazercards_sync_status": "not_found", "fazercards_last_error": "exact_match_not_found"})
             report["not_found"] += 1
             report["lines"].append(f"⚠️ {APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region'))} {apple_nominal_text(product)} — exact match не найден")
     save_apple_id_products(catalog)
@@ -2798,6 +2828,11 @@ def add_apple_id_pending_supplier_positions() -> dict:
             "fazercards_price_usd": item.get("fazercards_price_usd"),
             "fazercards_stock": item.get("fazercards_stock"),
             "fazercards_available": bool(item.get("fazercards_available")),
+            "stock": item.get("supplier_stock") or item.get("fazercards_stock"),
+            "supplier_available": bool(item.get("supplier_available")),
+            "supplier_status": item.get("supplier_status") or ("found" if item.get("supplier_available") else "out_of_stock"),
+            "supplier_stock": item.get("supplier_stock") or item.get("fazercards_stock"),
+            "supplier_last_seen": now_str(),
             "fazercards_last_seen": now_str(),
             "fazercards_sync_status": "ok",
         })
@@ -4938,7 +4973,7 @@ async def show_apple_id_product(update: Update, context: ContextTypes.DEFAULT_TY
     product_id = query.data.split(":", 1)[1]
     product = apple_id_product_by_id(product_id)
     if not is_visible_apple_id_product(product, enabled_only=True):
-        await query.answer("Товар недоступен.", show_alert=True)
+        await query.answer(apple_id_unavailable_message(product), show_alert=True)
         return
     region = product["region"]
     region_title = APPLE_ID_REGION_TITLES.get(region, region)
@@ -5495,7 +5530,7 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
     product_id = query.data.split(":", 1)[1]
     product = apple_id_product_by_id(product_id)
     if not is_visible_apple_id_product(product, enabled_only=True):
-        await query.answer("Товар недоступен.", show_alert=True)
+        await query.answer(apple_id_unavailable_message(product), show_alert=True)
         return ConversationHandler.END
     plan = apple_id_product_plan(product)
     if apple_id_payment_amount_rub(plan) <= 0:
@@ -7141,6 +7176,40 @@ def apple_id_display_title_with_nominal(product: dict) -> str:
     return title
 
 
+
+def apple_id_supplier_status_label(status: str) -> str:
+    return {"found": "найден", "not_found": "не найден", "out_of_stock": "нет остатка", "unknown": "неизвестно"}.get(str(status or "unknown"), "неизвестно")
+
+
+def apple_id_supplier_found_disabled_products() -> list[dict]:
+    return sort_apple_id_products([
+        product
+        for products in get_apple_id_products().values()
+        for product in products
+        if product.get("enabled") is False and product.get("supplier_available") is True
+    ])
+
+
+def apple_id_supplier_found_disabled_text() -> str:
+    products = apple_id_supplier_found_disabled_products()
+    if not products:
+        return "🔎 <b>Найдены у поставщика, но выключены</b>\n\nНет товаров, которые найдены у поставщика, но выключены вручную."
+    lines = ["🔎 <b>Найдены у поставщика, но выключены</b>", ""]
+    for product in products:
+        lines.append(
+            f"• {html_escape(APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region')))} "
+            f"{html_escape(apple_nominal_text(product))} — продажа {html_escape(format_apple_id_client_price(product))}, "
+            f"закуп {html_escape(format_usd(product.get('supplier_price_usd') or product.get('fazercards_price_usd')))}, "
+            f"stock {html_escape(str(product.get('supplier_stock') if product.get('supplier_stock') is not None else product.get('stock') or '—'))}"
+        )
+    return "\n".join(lines)
+
+
+def apple_id_supplier_found_disabled_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"✅ Включить {compact_apple_id_product_label(product)}", callback_data=f"admin_apple_id_enable:{product['id']}")] for product in apple_id_supplier_found_disabled_products()]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
+    return InlineKeyboardMarkup(rows)
+
 def apple_id_catalog_text() -> str:
     return (
         "🍎 <b>Apple ID каталог</b>\n\n"
@@ -7155,6 +7224,7 @@ def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
         [InlineKeyboardButton("🇷🇺 Russia", callback_data="admin_apple_id_region:RU")],
         [InlineKeyboardButton("🔗 Синхронизировать FazerCards", callback_data="admin_apple_id_fazer_sync")],
+        [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_apple_id_supplier_found_disabled")],
         [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_apple_id_recalc_all")],
         [InlineKeyboardButton("✏️ Изменить глобальную наценку %", callback_data="admin_apple_id_global_markup")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
@@ -7186,6 +7256,14 @@ def apple_id_admin_region_keyboard(region: str) -> InlineKeyboardMarkup:
 
 def apple_id_admin_product_text(product: dict) -> str:
     region = product.get("region", "")
+    supplier_text = (
+        "Поставщик:\n"
+        f"Статус: {html_escape(apple_id_supplier_status_label(product.get('supplier_status')))}\n"
+        f"Остаток: {html_escape(str(product.get('supplier_stock') if product.get('supplier_stock') is not None else '—'))}\n"
+        f"FazerCards card_id: <code>{html_escape(str(product.get('fazercards_card_id') or '—'))}</code>\n"
+        f"Последняя синхронизация: {html_escape(str(product.get('supplier_last_seen') or product.get('fazercards_last_seen') or '—'))}"
+    )
+    manual_disabled_note = "\n\n✅ Товар найден у поставщика, но выключен вручную." if product.get("enabled") is False and product.get("supplier_available") is True else ""
     if product.get("fazercards_product_id"):
         mapping_text = (
             "FazerCards:\n"
@@ -7203,7 +7281,9 @@ def apple_id_admin_product_text(product: dict) -> str:
         f"Валюта номинала: {html_escape(str(product.get('currency', '')))}\n"
         f"Цена продажи: {html_escape(format_apple_id_client_price(product))}\n"
         f"Статус: {'включён' if product.get('enabled', True) else 'выключен'}\n\n"
-        f"{mapping_text}"
+        f"{mapping_text}\n\n"
+        f"{supplier_text}"
+        f"{manual_disabled_note}"
     )
 
 
@@ -7215,6 +7295,7 @@ def apple_id_admin_product_keyboard(product: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔗 Привязать FazerCards товар", callback_data=f"admin_apple_id_fazer_link:{product['id']}")],
         [InlineKeyboardButton("❌ Отвязать FazerCards товар", callback_data=f"admin_apple_id_fazer_unlink:{product['id']}")],
         [InlineKeyboardButton(toggle, callback_data=f"admin_apple_id_toggle:{product['id']}")],
+        *([[InlineKeyboardButton("✅ Включить товар", callback_data=f"admin_apple_id_enable:{product['id']}")]] if product.get("enabled") is False and product.get("supplier_available") is True else []),
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_apple_id_delete:{product['id']}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_region:{product['region']}")],
     ])
@@ -7977,6 +8058,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Синхронизирую FazerCards...")
         report = await sync_apple_id_fazercards_bulk()
         await edit_or_send(query, context, fazercards_bulk_sync_report_text(report), fazercards_bulk_sync_report_keyboard(report))
+    elif data == "admin_apple_id_supplier_found_disabled":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_supplier_found_disabled_text(), apple_id_supplier_found_disabled_keyboard())
     elif data == "admin_apple_id_add_supplier_positions":
         if not has_catalog_admin_access(query.from_user):
             await query.answer("Недостаточно прав", show_alert=True)
@@ -8151,6 +8238,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         product = set_apple_id_product(product["id"], {"enabled": not product.get("enabled", True)})
         await query.answer("Настройки сохранены.")
+        await edit_or_send(query, context, apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
+    elif data.startswith("admin_apple_id_enable:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product = apple_id_product_by_id(data.split(":", 1)[1])
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        product = set_apple_id_product(product["id"], {"enabled": True})
+        await query.answer("Товар включён.")
         await edit_or_send(query, context, apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
     elif data.startswith("admin_apple_id_add:"):
         if not has_catalog_admin_access(query.from_user):
