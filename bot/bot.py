@@ -10,6 +10,7 @@ import asyncio
 import zipfile
 import math
 import re
+from urllib.parse import quote, urljoin
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1449,11 +1450,34 @@ def create_checkout_order(user, plan_key: str, plan: dict) -> dict:
     })
 
 
+def default_market_source_diagnostics() -> dict:
+    return {
+        "http_status": "",
+        "final_url": "",
+        "html_length": 0,
+        "fragments_found": 0,
+        "exact_fragments_found": 0,
+        "prices_found": 0,
+        "candidate_titles": [],
+        "last_error_details": "",
+    }
+
+
+def normalize_market_source_diagnostics(value) -> dict:
+    diagnostics = default_market_source_diagnostics()
+    if isinstance(value, dict):
+        diagnostics.update({key: value.get(key, diagnostics[key]) for key in diagnostics})
+    if not isinstance(diagnostics.get("candidate_titles"), list):
+        diagnostics["candidate_titles"] = []
+    diagnostics["candidate_titles"] = [str(title)[:160] for title in diagnostics["candidate_titles"][:5]]
+    return diagnostics
+
+
 def default_apple_id_market_sources() -> list[dict]:
     return [
-        {"source": "Ozon/Multitransfer", "enabled": True, "priority": 1, "source_type": "multitransfer_ozon", "product_url": MULTITRANSFER_OZON_APPLE_ID_URL, "target_region": "", "target_nominal": "", "target_currency": "", "last_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_region": "", "matched_nominal": "", "matched_currency": "", "match_confidence": ""},
-        {"source": "Plati", "enabled": True, "priority": 2, "source_type": "public_search", "search_url": "", "search_query": "", "last_min_price_rub": "", "last_median_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_count": 0, "match_confidence": ""},
-        {"source": "GGSEL", "enabled": True, "priority": 3, "source_type": "public_search", "search_url": "", "search_query": "", "last_min_price_rub": "", "last_median_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_count": 0, "match_confidence": ""},
+        {"source": "Ozon/Multitransfer", "enabled": True, "priority": 1, "source_type": "multitransfer_ozon", "product_url": MULTITRANSFER_OZON_APPLE_ID_URL, "target_region": "", "target_nominal": "", "target_currency": "", "last_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_region": "", "matched_nominal": "", "matched_currency": "", "match_confidence": "", "diagnostics": default_market_source_diagnostics()},
+        {"source": "Plati", "enabled": True, "priority": 2, "source_type": "public_search", "search_url": "", "search_url_template": "https://plati.market/search/{query}", "search_query": "", "last_min_price_rub": "", "last_median_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_count": 0, "match_confidence": "", "diagnostics": default_market_source_diagnostics()},
+        {"source": "GGSEL", "enabled": True, "priority": 3, "source_type": "public_search", "search_url": "", "search_url_template": "https://ggsel.net/search/{query}", "search_query": "", "last_min_price_rub": "", "last_median_price_rub": "", "last_checked_at": "", "status": "", "error": "", "matched_count": 0, "match_confidence": "", "diagnostics": default_market_source_diagnostics()},
     ]
 
 
@@ -1484,6 +1508,7 @@ def normalize_apple_id_product(product: dict) -> dict:
     for default_src in default_apple_id_market_sources():
         src = dict(default_src)
         src.update(existing.get(default_src["source"], {}))
+        src["diagnostics"] = normalize_market_source_diagnostics(src.get("diagnostics"))
         merged_sources.append(src)
     item["market_sources"] = merged_sources
     return item
@@ -1614,6 +1639,22 @@ def split_market_card_fragments(html: str) -> list[str]:
     return fragments[:100]
 
 
+def html_to_text(fragment: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(fragment or ""))).strip()
+
+
+def market_candidate_titles(fragments: list[str]) -> list[str]:
+    titles = []
+    for fragment in fragments:
+        title_match = re.search(r"<(?:h1|h2|h3|a)\b[^>]*>(.*?)</(?:h1|h2|h3|a)>", fragment, re.I | re.S)
+        title = html_to_text(title_match.group(1) if title_match else fragment)
+        if title:
+            titles.append(title[:160])
+        if len(titles) >= 5:
+            break
+    return titles
+
+
 def extract_rub_prices_from_fragment(fragment: str) -> list[int]:
     return [
         price for price in (
@@ -1623,64 +1664,175 @@ def extract_rub_prices_from_fragment(fragment: str) -> list[int]:
     ]
 
 
+def json_market_object_fragments(value, limit: int = 80) -> list[str]:
+    fragments = []
+
+    def walk(node) -> None:
+        if len(fragments) >= limit:
+            return
+        if isinstance(node, dict):
+            compact = json.dumps(node, ensure_ascii=False)[:3000]
+            if re.search(r"\b(?:USD|TRY|price|amount|nominal|region)\b", compact, re.I):
+                fragments.append(compact)
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return fragments[:limit]
+
+
+def script_market_fragments(html: str) -> list[str]:
+    fragments = []
+    for match in re.finditer(r'<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script>', html, re.I | re.S):
+        attrs = match.group("attrs") or ""
+        body = match.group("body") or ""
+        if not (
+            "__NEXT_DATA__" in attrs
+            or "application/json" in attrs.lower()
+            or "__INITIAL_STATE__" in body
+            or re.search(r"\b(?:USD|TRY|price|amount)\b", body, re.I)
+        ):
+            continue
+        stripped = body.strip()
+        parsed = None
+        for candidate in (stripped, re.sub(r"^\s*window\.__INITIAL_STATE__\s*=\s*", "", stripped).rstrip(";")):
+            try:
+                parsed = json.loads(candidate)
+                break
+            except (TypeError, ValueError):
+                parsed = None
+        if parsed is not None:
+            fragments.extend(json_market_object_fragments(parsed))
+            continue
+        for token_match in re.finditer(r"\b(?:USD|TRY|price|amount)\b", body, re.I):
+            start = max(0, token_match.start() - 600)
+            end = min(len(body), token_match.end() + 600)
+            fragments.append(body[start:end])
+            if len(fragments) >= 50:
+                break
+    return fragments[:50]
+
+
+def extract_public_market_items(fragments: list[str], product: dict, base_url: str) -> list[dict]:
+    items = []
+    for fragment in fragments:
+        text = html_to_text(fragment)
+        if not apple_id_exact_market_match(text, product):
+            continue
+        prices = extract_rub_prices_from_fragment(fragment)
+        if not prices:
+            continue
+        link = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\']', fragment, re.I)
+        items.append({
+            "title": text[:160],
+            "price_rub": min(prices),
+            "url": urljoin(base_url, link.group(1)) if link else "",
+            "match_confidence": "exact",
+        })
+    return items
+
+
 async def fetch_multitransfer_ozon_exact_price(product: dict) -> dict:
     target_region = "США" if product.get("region") == "US" else "Турция" if product.get("region") == "TR" else str(product.get("region") or "")
     target_nominal = apple_id_nominal_text(product)
     target_currency = str(product.get("currency") or "")
     checked_at = apple_id_market_checked_at()
+    diagnostics = default_market_source_diagnostics()
     try:
         async with httpx.AsyncClient(timeout=APPLE_ID_MARKET_TIMEOUT_SECONDS, follow_redirects=True) as client:
             response = await client.get(MULTITRANSFER_OZON_APPLE_ID_URL)
-            response.raise_for_status()
+        diagnostics["http_status"] = str(response.status_code)
+        diagnostics["final_url"] = str(response.url)
+        response.raise_for_status()
         html = response.text
     except Exception as exc:
-        return {"ok": False, "source": "Ozon/Multitransfer", "error": "error", "details": str(exc)[:160], "checked_at": checked_at}
+        diagnostics["last_error_details"] = str(exc)[:160]
+        return {"ok": False, "source": "Ozon/Multitransfer", "error": "error", "details": str(exc)[:160], "checked_at": checked_at, "diagnostics": diagnostics}
+    diagnostics["html_length"] = len(html)
     fragments = split_market_card_fragments(html)
+    script_fragments = script_market_fragments(html)
+    all_fragments = fragments + script_fragments
+    diagnostics["fragments_found"] = len(all_fragments)
+    diagnostics["candidate_titles"] = market_candidate_titles(all_fragments)
     if not fragments:
-        return {"ok": False, "source": "Ozon/Multitransfer", "error": "dynamic_page_not_supported", "checked_at": checked_at}
-    exact_fragments = [fragment for fragment in fragments if apple_id_exact_market_match(fragment, product)]
+        if not script_fragments:
+            return {"ok": False, "source": "Ozon/Multitransfer", "error": "dynamic_page_not_supported", "checked_at": checked_at, "diagnostics": diagnostics}
+    exact_fragments = [fragment for fragment in all_fragments if apple_id_exact_market_match(fragment, product)]
+    diagnostics["exact_fragments_found"] = len(exact_fragments)
     if not exact_fragments:
-        return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_nominal_not_found", "details": f"Exact {target_nominal} {target_currency} fragment not found", "checked_at": checked_at}
+        diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} fragment not found"
+        return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_nominal_not_found", "details": diagnostics["last_error_details"], "checked_at": checked_at, "diagnostics": diagnostics}
     for fragment in exact_fragments:
         prices = extract_rub_prices_from_fragment(fragment)
+        diagnostics["prices_found"] += len(prices)
         if prices:
-            return {"ok": True, "price_rub": min(prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at}
-    return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_price_not_found", "details": f"Exact {target_nominal} {target_currency} fragment has no RUB price", "checked_at": checked_at}
+            return {"ok": True, "price_rub": min(prices), "source": "Ozon/Multitransfer", "matched_region": target_region, "matched_nominal": target_nominal, "matched_currency": target_currency, "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
+    diagnostics["last_error_details"] = f"Exact {target_nominal} {target_currency} fragment has no RUB price"
+    return {"ok": False, "source": "Ozon/Multitransfer", "error": "exact_price_not_found", "details": diagnostics["last_error_details"], "checked_at": checked_at, "diagnostics": diagnostics}
 
 
-async def fetch_public_market_prices(product: dict, source: str, url: str) -> dict:
+def apple_id_public_market_queries(product: dict) -> list[str]:
+    region = "USA" if product.get("region") == "US" else "Turkey" if product.get("region") == "TR" else str(product.get("region") or "")
+    nominal = apple_id_nominal_text(product)
+    currency = str(product.get("currency") or "")
+    return [
+        f"Apple ID {region} {nominal} {currency}",
+        f"Apple Gift Card {region} {nominal} {currency}",
+        f"App Store iTunes {region} {nominal} {currency}",
+    ]
+
+
+async def fetch_public_market_prices(product: dict, source: str, search_url_template: str) -> dict:
     checked_at = apple_id_market_checked_at()
-    query = f"Apple Gift Card {product.get('region')} {apple_id_nominal_text(product)} {product.get('currency')}"
+    diagnostics = default_market_source_diagnostics()
+    all_items = []
     try:
         async with httpx.AsyncClient(timeout=APPLE_ID_MARKET_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            response = await client.get(url, params={"search": query})
-            response.raise_for_status()
-        html = response.text
+            for query in apple_id_public_market_queries(product)[:3]:
+                url = search_url_template.replace("{query}", quote(query))
+                response = await client.get(url)
+                diagnostics["http_status"] = str(response.status_code)
+                diagnostics["final_url"] = str(response.url)
+                response.raise_for_status()
+                html = response.text
+                diagnostics["html_length"] = max(int(diagnostics["html_length"] or 0), len(html))
+                fragments = split_market_card_fragments(html)
+                diagnostics["fragments_found"] += len(fragments)
+                diagnostics["candidate_titles"].extend(market_candidate_titles(fragments))
+                if not fragments:
+                    continue
+                items = extract_public_market_items(fragments, product, str(response.url))
+                diagnostics["exact_fragments_found"] += len(items)
+                diagnostics["prices_found"] += len(items)
+                all_items.extend(items)
+                if all_items:
+                    break
     except Exception as exc:
-        return {"ok": False, "source": source, "error": "unsupported", "details": str(exc)[:160], "checked_at": checked_at, "matched_count": 0}
-    fragments = split_market_card_fragments(html)
-    if not fragments:
-        return {"ok": False, "source": source, "error": "unsupported", "checked_at": checked_at, "matched_count": 0}
-    prices = []
-    for fragment in fragments:
-        if not apple_id_exact_market_match(fragment, product):
-            continue
-        fragment_prices = extract_rub_prices_from_fragment(fragment)
-        if fragment_prices:
-            prices.append(min(fragment_prices))
+        diagnostics["last_error_details"] = str(exc)[:160]
+        return {"ok": False, "source": source, "error": "unsupported", "details": str(exc)[:160], "checked_at": checked_at, "matched_count": 0, "diagnostics": normalize_market_source_diagnostics(diagnostics)}
+    diagnostics = normalize_market_source_diagnostics(diagnostics)
+    if not diagnostics["fragments_found"]:
+        diagnostics["last_error_details"] = "product cards not found"
+        return {"ok": False, "source": source, "error": "unsupported", "checked_at": checked_at, "matched_count": 0, "diagnostics": diagnostics}
+    prices = [item["price_rub"] for item in all_items]
     if not prices:
-        return {"ok": False, "source": source, "error": "price_not_found", "checked_at": checked_at, "matched_count": 0}
+        return {"ok": False, "source": source, "error": "price_not_found", "checked_at": checked_at, "matched_count": 0, "diagnostics": diagnostics}
     prices = sorted(prices)[:20]
     median = prices[len(prices)//2] if len(prices) % 2 else round((prices[len(prices)//2 - 1] + prices[len(prices)//2]) / 2)
-    return {"ok": True, "source": source, "matched_count": len(prices), "min_price_rub": min(prices), "median_price_rub": median, "items": prices[:5], "match_confidence": "exact", "checked_at": checked_at}
+    return {"ok": True, "source": source, "matched_count": len(prices), "min_price_rub": min(prices), "median_price_rub": median, "items": all_items[:5], "match_confidence": "exact", "checked_at": checked_at, "diagnostics": diagnostics}
 
 
 async def fetch_plati_market_prices(product: dict) -> dict:
-    return await fetch_public_market_prices(product, "Plati", "https://plati.market/search")
+    template = next((s.get("search_url_template") for s in product.get("market_sources", []) if s.get("source") == "Plati"), "") or "https://plati.market/search/{query}"
+    return await fetch_public_market_prices(product, "Plati", template)
 
 
 async def fetch_ggsel_market_prices(product: dict) -> dict:
-    return await fetch_public_market_prices(product, "GGSEL", "https://ggsel.net/search")
+    template = next((s.get("search_url_template") for s in product.get("market_sources", []) if s.get("source") == "GGSEL"), "") or "https://ggsel.net/search/{query}"
+    return await fetch_public_market_prices(product, "GGSEL", template)
 
 
 def round_apple_id_market_price(value: float, mode: str) -> int:
@@ -1703,7 +1855,7 @@ def calculate_apple_id_recommended_price(product: dict, usd_rub_rate) -> dict:
     for src in product.get("market_sources", []):
         if not src.get("enabled", True) or src.get("status") != "ok" or src.get("match_confidence") != "exact":
             continue
-        if src.get("source") == "Ozon/Multitransfer" and str(src.get("matched_nominal")) == str(product.get("amount")) and str(src.get("matched_currency")) == str(product.get("currency")):
+        if src.get("source") == "Ozon/Multitransfer" and str(src.get("matched_nominal")) == apple_id_nominal_text(product) and str(src.get("matched_currency")) == str(product.get("currency")):
             ozon_price = valid_market_price_rub(src.get("last_price_rub"))
         if src.get("source") in ("Plati", "GGSEL"):
             median = valid_market_price_rub(src.get("last_median_price_rub"))
@@ -6167,6 +6319,20 @@ def apple_id_pricing_text(product: dict) -> str:
     plati = sources.get("Plati", {})
     ggsel = sources.get("GGSEL", {})
     nominal = apple_nominal_text(product)
+    def diag_lines(src: dict, labels: tuple[str, str, str]) -> str:
+        diagnostics = normalize_market_source_diagnostics(src.get("diagnostics"))
+        status_label, exact_label, prices_label = labels
+        details = diagnostics.get("last_error_details") or src.get("error") or "—"
+        return (
+            f"{status_label}: {html_escape(str(src.get('status') or ''))}\n"
+            f"Ошибка: {html_escape(str(src.get('error') or '—'))}\n"
+            f"HTTP: {html_escape(str(diagnostics.get('http_status') or '—'))}\n"
+            f"HTML: {html_escape(str(diagnostics.get('html_length') or 0))} символов\n"
+            f"Фрагментов: {html_escape(str(diagnostics.get('fragments_found') or 0))}\n"
+            f"{exact_label}: {html_escape(str(diagnostics.get('exact_fragments_found') or 0))}\n"
+            f"{prices_label}: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
+            f"Детали: {html_escape(str(details))}"
+        )
     return (
         f"💰 <b>Ценообразование</b>\n\n"
         f"{html_escape(product.get('title', 'Apple Gift Card'))} {html_escape(nominal)}\n\n"
@@ -6175,9 +6341,9 @@ def apple_id_pricing_text(product: dict) -> str:
         f"Закуп FazerCards: <b>{html_escape(format_usd(product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
         f"Курс USD/RUB: <b>{float(rec['usd_rub_rate_used']):g}</b>\n"
         f"Себестоимость: <b>{format_rub(rec['supplier_cost_rub'])}</b>\n\n"
-        f"Ozon/Multitransfer:\nСтатус: {html_escape(str(ozon.get('status') or ''))}\nЦена exact: {html_escape(str(ozon.get('last_price_rub') or '—'))} ₽\nOzon + {html_escape(str(product.get('ozon_markup_percent', 3)))}%: {format_rub(rec['ozon_target_rub']) if rec.get('ozon_target_rub') else '—'}\nСовпадение: {html_escape(str(ozon.get('match_confidence') or 'none'))}\nОшибка: {html_escape(str(ozon.get('error') or '—'))}\n\n"
-        f"Plati:\nСтатус: {html_escape(str(plati.get('status') or ''))}\nНайдено exact: {html_escape(str(plati.get('matched_count') or 0))}\nМин: {html_escape(str(plati.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(plati.get('last_median_price_rub') or '—'))} ₽\n\n"
-        f"GGSEL:\nСтатус: {html_escape(str(ggsel.get('status') or ''))}\nНайдено exact: {html_escape(str(ggsel.get('matched_count') or 0))}\nМин: {html_escape(str(ggsel.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(ggsel.get('last_median_price_rub') or '—'))} ₽\n\n"
+        f"Ozon/Multitransfer:\n{diag_lines(ozon, ('Статус', 'Exact фрагментов', 'Цен найдено'))}\nЦена exact: {html_escape(str(ozon.get('last_price_rub') or '—'))} ₽\nOzon + {html_escape(str(product.get('ozon_markup_percent', 3)))}%: {format_rub(rec['ozon_target_rub']) if rec.get('ozon_target_rub') else '—'}\nСовпадение: {html_escape(str(ozon.get('match_confidence') or 'none'))}\n\n"
+        f"Plati:\n{diag_lines(plati, ('Статус', 'Exact', 'Цен'))}\nНайдено exact: {html_escape(str(plati.get('matched_count') or 0))}\nМин: {html_escape(str(plati.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(plati.get('last_median_price_rub') or '—'))} ₽\n\n"
+        f"GGSEL:\n{diag_lines(ggsel, ('Статус', 'Exact', 'Цен'))}\nНайдено exact: {html_escape(str(ggsel.get('matched_count') or 0))}\nМин: {html_escape(str(ggsel.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(ggsel.get('last_median_price_rub') or '—'))} ₽\n\n"
         f"Рыночный коридор:\nНижняя граница: {format_rub(rec['min_safe_price_rub'])}\nВерхняя граница: {format_rub(rec['market_cap_rub']) if rec.get('market_cap_rub') else '—'}\nРекомендованная цена: <b>{format_rub(rec['recommended_price_rub'])}</b>\nМаржа: {format_rub(rec['estimated_margin_rub'])}"
     )
 
@@ -6188,6 +6354,8 @@ def apple_id_pricing_keyboard(product: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"Режим: {product.get('pricing_mode', 'manual')}", callback_data=f"admin_apple_id_pricing_mode:{pid}")],
         [InlineKeyboardButton("🔄 Обновить Ozon", callback_data=f"admin_apple_id_pricing_refresh:ozon:{pid}"), InlineKeyboardButton("🔄 Обновить Plati", callback_data=f"admin_apple_id_pricing_refresh:plati:{pid}")],
         [InlineKeyboardButton("🔄 Обновить GGSEL", callback_data=f"admin_apple_id_pricing_refresh:ggsel:{pid}"), InlineKeyboardButton("🔄 Обновить все источники", callback_data=f"admin_apple_id_pricing_refresh:all:{pid}")],
+        [InlineKeyboardButton("🧪 Диагностика Ozon", callback_data=f"admin_apple_id_pricing_debug:ozon:{pid}"), InlineKeyboardButton("🧪 Диагностика Plati", callback_data=f"admin_apple_id_pricing_debug:plati:{pid}")],
+        [InlineKeyboardButton("🧪 Диагностика GGSEL", callback_data=f"admin_apple_id_pricing_debug:ggsel:{pid}")],
         [InlineKeyboardButton("📈 Рассчитать цену", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("✅ Применить рекомендованную цену", callback_data=f"admin_apple_id_pricing_apply:{pid}")],
         [InlineKeyboardButton("Изменить Ozon +%", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("Изменить мин. маржу ₽", callback_data=f"admin_apple_id_pricing:{pid}")],
         [InlineKeyboardButton("Изменить наценку %", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("Округление", callback_data=f"admin_apple_id_pricing_round:{pid}")],
@@ -6220,6 +6388,26 @@ def apple_id_pricing_apply_confirm_keyboard(product: dict) -> InlineKeyboardMark
     ])
 
 
+def apple_id_market_debug_text(product: dict, source_name: str, result: dict) -> str:
+    diagnostics = normalize_market_source_diagnostics(result.get("diagnostics"))
+    titles = diagnostics.get("candidate_titles") or []
+    title_lines = "\n".join(f"• {html_escape(str(title))}" for title in titles) or "—"
+    return (
+        f"🧪 <b>Диагностика источника: {html_escape(source_name)}</b>\n\n"
+        f"Товар: {html_escape(product.get('title', 'Apple Gift Card'))} {html_escape(apple_nominal_text(product))}\n"
+        f"Результат: {html_escape('ok' if result.get('ok') else str(result.get('error') or 'error'))}\n"
+        f"HTTP: {html_escape(str(diagnostics.get('http_status') or '—'))}\n"
+        f"URL: {html_escape(str(diagnostics.get('final_url') or '—'))}\n"
+        f"HTML: {html_escape(str(diagnostics.get('html_length') or 0))} символов\n"
+        f"Фрагментов: {html_escape(str(diagnostics.get('fragments_found') or 0))}\n"
+        f"Exact фрагментов: {html_escape(str(diagnostics.get('exact_fragments_found') or 0))}\n"
+        f"Цен найдено: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
+        f"Детали: {html_escape(str(diagnostics.get('last_error_details') or result.get('details') or '—'))}\n\n"
+        f"Кандидаты:\n{title_lines}\n\n"
+        "Цена товара не изменялась."
+    )
+
+
 def update_apple_id_market_source(product: dict, source_name: str, result: dict) -> dict:
     sources = []
     for src in product.get("market_sources", []):
@@ -6229,10 +6417,13 @@ def update_apple_id_market_source(product: dict, source_name: str, result: dict)
             src["error"] = "" if result.get("ok") else str(result.get("error") or "error")
             src["last_checked_at"] = result.get("checked_at", apple_id_market_checked_at())
             src["match_confidence"] = result.get("match_confidence", "") if result.get("ok") else ""
+            src["diagnostics"] = normalize_market_source_diagnostics(result.get("diagnostics"))
             if source_name == "Ozon/Multitransfer" and result.get("ok"):
                 src.update({"last_price_rub": result.get("price_rub", ""), "matched_region": result.get("matched_region", ""), "matched_nominal": result.get("matched_nominal", ""), "matched_currency": result.get("matched_currency", "")})
             if source_name in ("Plati", "GGSEL") and result.get("ok"):
                 src.update({"last_min_price_rub": result.get("min_price_rub", ""), "last_median_price_rub": result.get("median_price_rub", ""), "matched_count": result.get("matched_count", 0)})
+            if source_name in ("Plati", "GGSEL") and not result.get("ok"):
+                src["matched_count"] = 0
         sources.append(src)
     return set_apple_id_product(product["id"], {"market_sources": sources}) or product
 
@@ -6942,6 +7133,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         product = set_apple_id_product(product["id"], {"market_rounding_mode": modes[(modes.index(current) + 1) % len(modes)] if current in modes else "up_to_9"}) if product else None
         await query.answer("Округление сохранено.")
         await edit_or_send(query, context, apple_id_pricing_text(product), apple_id_pricing_keyboard(product))
+    elif data.startswith("admin_apple_id_pricing_debug:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        _, source_key, product_id = data.split(":", 2)
+        product = apple_id_product_by_id(product_id)
+        if not product:
+            await query.answer("Товар не найден.", show_alert=True)
+            return
+        await query.answer("Запускаю диагностику...")
+        if source_key == "ozon":
+            source_name, result = "Ozon/Multitransfer", await fetch_multitransfer_ozon_exact_price(product)
+        elif source_key == "plati":
+            source_name, result = "Plati", await fetch_plati_market_prices(product)
+        else:
+            source_name, result = "GGSEL", await fetch_ggsel_market_prices(product)
+        await edit_or_send(query, context, apple_id_market_debug_text(product, source_name, result), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_pricing:{product_id}")]]))
     elif data.startswith("admin_apple_id_pricing_refresh:"):
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
