@@ -871,6 +871,35 @@ def check_run_mvp_contract(run_mvp_text: str) -> None:
     )
 
 
+def check_apple_id_rub_market_pricing(bot_text: str) -> None:
+    normalize_block = function_block(bot_text, "normalize_apple_id_product")
+    plan_block = function_block(bot_text, "apple_id_product_plan")
+    order_block = function_block(bot_text, "create_or_update_order") or bot_text
+    record("Apple ID supports price_rub", '"price_rub"' in normalize_block)
+    record("Apple ID pricing_currency = RUB", '"pricing_currency", "RUB"' in normalize_block or '"pricing_currency": "RUB"' in bot_text)
+    record("Apple ID has pricing_mode", '"pricing_mode"' in normalize_block)
+    record("Apple ID has market_corridor", "market_corridor" in bot_text)
+    record("Apple ID has ozon_plus", "ozon_plus" in bot_text)
+    record("Apple ID has supplier_markup", "supplier_markup" in bot_text)
+    record("Apple ID has multitransfer_ozon source type", '"source_type": "multitransfer_ozon"' in bot_text)
+    record("Apple ID has Plati market source", '"source": "Plati"' in bot_text)
+    record("Apple ID has GGSEL market source", '"source": "GGSEL"' in bot_text)
+    record("Telegram competitors are not used for Apple ID pricing", "telegram competitors" not in bot_text.lower() and "competitor" not in function_block(bot_text, "calculate_apple_id_recommended_price").lower())
+    record("fetch_multitransfer_ozon_exact_price exists", "async def fetch_multitransfer_ozon_exact_price" in bot_text)
+    record("fetch_plati_market_prices exists", "async def fetch_plati_market_prices" in bot_text)
+    record("fetch_ggsel_market_prices exists", "async def fetch_ggsel_market_prices" in bot_text)
+    record("exact_nominal_not_found is handled as error", "exact_nominal_not_found" in bot_text)
+    record("different nominal prices are not reused", "Нельзя умножать" not in bot_text and " * int(product.get(\"amount\"" not in bot_text)
+    record("partial/default price is not used", "dynamic_page_not_supported" in bot_text and "partial/default" not in bot_text.lower())
+    record("calculate_apple_id_recommended_price uses market_corridor", "def calculate_apple_id_recommended_price" in bot_text and "market_corridor" in function_block(bot_text, "calculate_apple_id_recommended_price"))
+    record("Apple ID user flow shows rubles", "format_apple_id_client_price(product)" in bot_text and "format_rub(price_rub)" in plan_block)
+    record("Apple ID order saves market_sources_snapshot", '"market_sources_snapshot"' in plan_block and '"market_sources_snapshot"' in bot_text)
+    record("price_rub is not changed automatically without confirmation", "market_auto_update_price" in normalize_block and "admin_apple_id_pricing_apply" in bot_text and "auto_update_price" not in function_block(bot_text, "calculate_apple_id_recommended_price"))
+    record("no FazerCards client.post purchase call", "/giftcards/order" not in bot_text and "client.post" not in function_block(bot_text, "check_fazercards_connection"))
+    record("eSIM logic remains present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text)
+    record("cashback remains disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
+
+
 def main() -> int:
     check_syntax("bot/bot.py")
     check_syntax("bot/run_mvp.py")
@@ -898,6 +927,7 @@ def main() -> int:
         readme_text,
     )
     check_bot_contract(bot_text, env_example_text)
+    check_apple_id_rub_market_pricing(bot_text)
     check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',
