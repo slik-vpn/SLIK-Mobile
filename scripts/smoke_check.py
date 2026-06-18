@@ -194,7 +194,8 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "Apple ID user flow uses runtime catalog and hides disabled products",
         "apple_id_products_by_region(region, enabled_only=True)" in bot_text
         and "Сейчас товары этого региона временно недоступны" in bot_text
-        and "for product in apple_id_products_by_region(region, enabled_only=True)" in bot_text,
+        and "products = apple_id_products_by_region(region, enabled_only=True)" in bot_text
+        and "for product in products" in function_block(bot_text, "apple_id_products_keyboard"),
     )
     record(
         "Apple ID admin catalog handlers can edit toggle add and delete",
@@ -952,6 +953,16 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     parse_supplier_block = function_block(bot_text, "parse_apple_id_supplier_position")
     extract_nominal_block = function_block(bot_text, "extract_exact_apple_nominal_from_text")
     add_pending_block = function_block(bot_text, "add_apple_id_pending_supplier_positions")
+    nominal_valid_block = function_block(bot_text, "is_valid_apple_id_nominal")
+    visible_product_block = function_block(bot_text, "is_visible_apple_id_product")
+    sort_products_block = function_block(bot_text, "sort_apple_id_products")
+    products_by_region_block = function_block(bot_text, "apple_id_products_by_region")
+    product_by_id_block = function_block(bot_text, "apple_id_product_by_id")
+    save_products_block = function_block(bot_text, "save_apple_id_products")
+    user_products_keyboard_block = function_block(bot_text, "apple_id_products_keyboard")
+    admin_region_keyboard_block = function_block(bot_text, "apple_id_admin_region_keyboard")
+    show_product_block = function_block(bot_text, "show_apple_id_product")
+    start_apple_purchase_block = function_block(bot_text, "start_apple_id_purchase")
 
     def access_before_call(branch: str, call: str) -> bool:
         access_index = branch.find("has_catalog_admin_access(query.from_user)")
@@ -961,6 +972,12 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
     record("parse_apple_id_supplier_position exists", "def parse_apple_id_supplier_position" in bot_text and "return None" in parse_supplier_block)
     record("extract_exact_apple_nominal_from_text exists", "def extract_exact_apple_nominal_from_text" in bot_text and "return int(amount)" in extract_nominal_block)
+    record("is_valid_apple_id_nominal helper exists", "def is_valid_apple_id_nominal" in bot_text)
+    record("is_visible_apple_id_product helper exists", "def is_visible_apple_id_product" in bot_text and "is_valid_apple_id_nominal" in visible_product_block)
+    record("apple_id_products_by_region supports valid_only default", "valid_only: bool = True" in products_by_region_block and "is_visible_apple_id_product" in products_by_region_block)
+    record("US/USD nominal range is 1..200", 'region == "US" and currency == "USD"' in nominal_valid_block and "1 <= nominal <= 200" in nominal_valid_block)
+    record("TR/TRY nominal range is 100..2000", 'region == "TR" and currency == "TRY"' in nominal_valid_block and "100 <= nominal <= 2000" in nominal_valid_block)
+    record("nominal helper rejects non-positive and non-integer values", "nominal <= 0" in nominal_valid_block and "not isinstance(amount, int)" in nominal_valid_block and "return False" in nominal_valid_block)
     for label, needle in (
         ("supports $2", r"\$\s*(\d+(?:[.,]\d+)?)"),
         ("supports 4$", r"(\d+(?:[.,]\d+)?)\s*\$"),
@@ -976,16 +993,30 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
         record(f"nominal extractor {label}", needle in extract_nominal_block)
     record("nominal extractor rejects from/ot and ranges", "from|от" in extract_nominal_block and r"\bto\b|\bдо\b" in extract_nominal_block and "-|–|—" in extract_nominal_block)
     record("new supplier positions are structured and saved", '"new_supplier_positions_list": []' in bulk_sync_block and "new_supplier_positions.append(parsed)" in bulk_sync_block and "save_apple_id_pending_supplier_positions" in bulk_sync_block)
+    record("invalid supplier nominals do not enter pending", "parse_apple_id_supplier_position(category, card)" in bulk_sync_block and "not is_valid_apple_id_nominal" in parse_supplier_block and "new_supplier_positions.append(parsed)" in bulk_sync_block)
+    record("invalid supplier nominals are reported as out of range", "вне допустимого диапазона" in bulk_sync_block)
+    record("user Apple ID product details reject hidden invalid products", "is_visible_apple_id_product(product, enabled_only=True)" in show_product_block and "is_visible_apple_id_product(product, enabled_only=True)" in start_apple_purchase_block)
+    record("old Apple ID product lookup does not use active visibility filter", "is_visible_apple_id_product" not in product_by_id_block and "get_apple_id_products().values()" in product_by_id_block)
     record("pending supplier list exists in config", '"apple_id_pending_supplier_positions"' in bot_text and "get_apple_id_pending_supplier_positions" in bot_text)
     record("add supplier positions callback exists", 'admin_apple_id_add_supplier_positions' in bot_text)
     record("add supplier positions confirm callback exists", 'admin_apple_id_add_supplier_positions_confirm' in bot_text)
     record("add supplier callbacks are protected by catalog admin access", "has_catalog_admin_access(query.from_user)" in add_supplier_branch and "has_catalog_admin_access(query.from_user)" in add_supplier_confirm_branch)
     record("new supplier products require confirmation before creation", "add_apple_id_pending_supplier_positions()" not in add_supplier_branch and "add_apple_id_pending_supplier_positions()" in add_supplier_confirm_branch)
     record("stable Apple ID supplier ids are generated", 'f"apple_{region.lower()}_{amount}"' in add_pending_block)
+    record("stable Apple ID ids support edge ranges", 'f"apple_{region.lower()}_{amount}"' in add_pending_block and "1 <= nominal <= 200" in nominal_valid_block and "100 <= nominal <= 2000" in nominal_valid_block)
+    record("invalid pending supplier nominals are skipped before product creation", "not is_valid_apple_id_nominal(region, currency, amount)" in add_pending_block and "continue" in add_pending_block and '"id": f"apple_{region.lower()}_{amount}"' in add_pending_block)
     record("supplier add avoids duplicate region amount currency", "apple_id_catalog_has_nominal" in add_pending_block and "continue" in add_pending_block)
     record("new supplier product price_rub is calculated immediately", 'calculate_apple_id_supplier_markup_price(product)' in add_pending_block and '"price_rub": rec["recommended_price_rub"]' in add_pending_block)
     record("new supplier add supports apple_us_2/apple_us_3/apple_us_4 stable ids", 'f"apple_{region.lower()}_{amount}"' in add_pending_block and '"US"' in parse_supplier_block and '"USD"' in parse_supplier_block)
     record("supplier sync uses only GET giftcards endpoints", "client.post" not in bulk_sync_block and "/giftcards/order" not in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bulk_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bulk_sync_block)
+    record("sort_apple_id_products sorts by amount then title/id", "def sort_apple_id_products" in bot_text and "apple_id_sort_key" in sort_products_block and "amount" in function_block(bot_text, "apple_id_sort_key") and "title_or_id" in function_block(bot_text, "apple_id_sort_key"))
+    record("apple_id_products_by_region filters before sorting", "is_visible_apple_id_product" in products_by_region_block and "return sort_apple_id_products(products)" in products_by_region_block)
+    record("apple_id_products_by_region returns sorted products", "sort_apple_id_products" in products_by_region_block)
+    record("new and saved Apple ID products are sorted", "sort_apple_id_products" in save_products_block and "save_apple_id_products(catalog)" in add_pending_block)
+    record("USA > 200 and invalid Turkey nominals are hidden by visible helper", "1 <= nominal <= 200" in nominal_valid_block and "100 <= nominal <= 2000" in nominal_valid_block and "is_valid_apple_id_nominal" in visible_product_block)
+    record("grid keyboard helper exists", "def build_grid_keyboard" in bot_text and "buttons[i:i + safe_columns]" in function_block(bot_text, "build_grid_keyboard"))
+    record("user Apple ID keyboard uses multi-column grid and visible products", "apple_id_products_by_region(region, enabled_only=True)" in user_products_keyboard_block and "build_grid_keyboard" in user_products_keyboard_block and "apple_id_grid_columns" in user_products_keyboard_block)
+    record("admin Apple ID keyboard uses multi-column grid and visible products", "apple_id_products_by_region(region)" in admin_region_keyboard_block and "build_grid_keyboard" in admin_region_keyboard_block and "apple_id_grid_columns" in admin_region_keyboard_block)
     record("calculate supplier markup fallback is 40", 'global_pricing.get("supplier_markup_percent", 40)' in calc_block and "markup_percent = 40.0" in calc_block)
     record("admin_apple_id_global_markup branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in global_markup_branch)
     record("admin_apple_id_recalc_all branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_branch)
