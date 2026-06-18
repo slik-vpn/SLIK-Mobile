@@ -529,7 +529,7 @@ sudo systemctl enable --now slik-mobile-healthcheck.timer
 Приоритет выбора чата:
 
 1. Значение из админки в `bot/config.json` → секция `notification_chats`.
-2. Fallback из `.env`: `ORDERS_CHAT_ID`, `CLIENT_ACTIVITY_CHAT_ID`, `NEW_CLIENTS_CHAT_ID`, `PAYMENTS_CHAT_ID`, `TECH_ALERTS_CHAT_ID`.
+2. Fallback из `.env`: `ORDERS_CHAT_ID`, `CLIENT_ACTIVITY_CHAT_ID`, `NEW_CLIENTS_CHAT_ID`, `PAYMENTS_CHAT_ID`, `TECH_ALERTS_CHAT_ID`, `RATE_CHAT_ID`.
 3. Если отдельный чат не задан, используется `ADMIN_CHAT_ID`, как раньше.
 
 Пустое значение в админке не отключает уведомления: после очистки снова используется env fallback или `ADMIN_CHAT_ID`.
