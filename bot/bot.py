@@ -2328,19 +2328,36 @@ def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -
 
 async def sync_apple_id_fazercards_bulk() -> dict:
     products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
+    report = {"categories": 0, "supplier_items": 0, "linked": 0, "updated_prices": 0, "not_found": 0, "new_supplier_positions": 0, "errors": 0, "lines": [], "sync_failed": False, "error": ""}
+    if not products_payload.get("ok"):
+        report.update({"errors": 1, "sync_failed": True, "error": products_payload.get("error") or "giftcards_fetch_failed"})
+        return report
+
     categories = [item for item in fazercards_items_from_payload(products_payload) if is_apple_fazercards_category(item)]
-    report = {"categories": len(categories), "supplier_items": 0, "linked": 0, "updated_prices": 0, "not_found": 0, "new_supplier_positions": 0, "errors": 0, "lines": []}
+    report["categories"] = len(categories)
+    if not categories:
+        report.update({"errors": 1, "sync_failed": True, "error": "apple_categories_not_found"})
+        return report
+
     catalog = get_apple_id_products()
     flat_products = [p for items in catalog.values() for p in items]
     seen_products: set[str] = set()
+    successful_regions: set[str] = set()
     for category in categories:
         category_id = fazercards_category_id_value(category)
         payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
         if not payload.get("ok"):
             report["errors"] += 1
+            report["lines"].append(f"⚠️ {html_escape(str(category.get('name') or category_id or 'Apple category'))} — cards fetch failed")
             continue
         cards = fazercards_cards_from_payload(payload)
+        if not cards:
+            continue
         report["supplier_items"] += len(cards)
+        category_names = " ".join(str(category.get(field) or "") for field in ("name", "title"))
+        for region in APPLE_REGION_PATTERNS:
+            if fazercards_name_has_region(category_names, region) or any(fazercards_name_has_region(fazercards_product_value(card, "name"), region) for card in cards):
+                successful_regions.add(region)
         for product in flat_products:
             match = next((card for card in cards if apple_id_exact_fazercards_match(product, category, card)), None)
             if not match:
@@ -2359,8 +2376,11 @@ async def sync_apple_id_fazercards_bulk() -> dict:
             if not any(apple_id_exact_fazercards_match(product, category, card) for product in flat_products):
                 report["new_supplier_positions"] += 1
                 report["lines"].append(f"➕ {html_escape(str(fazercards_product_value(card, 'name') or 'позиция'))} — есть у поставщика, нет в каталоге")
+    if report["supplier_items"] <= 0:
+        report.update({"sync_failed": True, "error": "supplier_cards_not_found"})
+        return report
     for product in flat_products:
-        if product.get("id") not in seen_products:
+        if product.get("id") not in seen_products and product.get("region") in successful_regions:
             product.update({"fazercards_available": False, "fazercards_sync_status": "not_found", "fazercards_last_error": "exact_match_not_found"})
             report["not_found"] += 1
             report["lines"].append(f"⚠️ {APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region'))} {apple_nominal_text(product)} — exact match не найден")
@@ -2369,6 +2389,15 @@ async def sync_apple_id_fazercards_bulk() -> dict:
 
 
 def fazercards_bulk_sync_report_text(report: dict) -> str:
+    if report.get("sync_failed"):
+        error = html_escape(str(report.get("error") or "giftcards_fetch_failed"))
+        return (
+            "⚠️ <b>Синхронизация FazerCards не выполнена</b>\n\n"
+            "Не удалось получить список категорий /giftcards или Apple-карты поставщика.\n"
+            "Каталог Apple ID не изменён.\n"
+            "Проверьте API-ключ FazerCards или повторите позже.\n\n"
+            f"Ошибка: <code>{error}</code>"
+        )
     lines = ["🔗 <b>Синхронизация FazerCards завершена</b>", "", f"Найдено категорий Apple: {report['categories']}", f"Найдено позиций у поставщика: {report['supplier_items']}", f"Привязано товаров: {report['linked']}", f"Обновлено закупочных цен: {report['updated_prices']}", f"Нет exact match: {report['not_found']}", f"Новые позиции у поставщика: {report['new_supplier_positions']}", f"Ошибки: {report['errors']}", ""]
     lines.extend(report.get("lines", [])[:30])
     return "\n".join(lines)

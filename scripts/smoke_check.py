@@ -922,6 +922,24 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("TMA/open app button hidden but TMA config remains", "def get_tma_url" in bot_text and "web_app=WebAppInfo" not in function_block(bot_text, "main_menu_keyboard"))
     record("FazerCards bulk sync button exists", "🔗 Синхронизировать FazerCards" in bot_text and "admin_apple_id_fazer_sync" in bot_text)
     record("bulk sync uses GET giftcards cards and not POST", "sync_apple_id_fazercards_bulk" in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bot_text and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bot_text and "client.post" not in function_block(bot_text, "sync_apple_id_fazercards_bulk"))
+    bulk_sync_block = function_block(bot_text, "sync_apple_id_fazercards_bulk")
+
+    def ordered_tokens(block: str, *tokens: str) -> bool:
+        cursor = -1
+        for token in tokens:
+            cursor = block.find(token, cursor + 1)
+            if cursor < 0:
+                return False
+        return True
+
+    ok_false_guard = 'if not products_payload.get("ok"):'
+    categories_empty_guard = "if not categories:"
+    supplier_empty_guard = 'if report["supplier_items"] <= 0:'
+    record("sync bulk checks products_payload ok before processing", ordered_tokens(bulk_sync_block, "products_payload = await fetch_fazercards_products_readonly()", ok_false_guard, "return report", "categories ="))
+    record("products_payload ok=false returns before catalog save", ordered_tokens(bulk_sync_block, ok_false_guard, "return report", "save_apple_id_products(catalog)"))
+    record("empty Apple categories do not mark all catalog unavailable", ordered_tokens(bulk_sync_block, categories_empty_guard, "return report", 'fazercards_sync_status": "not_found"'))
+    record("failed cards endpoint does not mark products unavailable before continuing", ordered_tokens(bulk_sync_block, 'if not payload.get("ok"):', "continue", 'fazercards_sync_status": "not_found"'))
+    record("not_found marking happens only after successful supplier data retrieval", ordered_tokens(bulk_sync_block, 'report["supplier_items"] += len(cards)', supplier_empty_guard, "return report", 'fazercards_sync_status": "not_found"'))
     record("exact matching prevents region and nominal mismatch", "apple_id_exact_fazercards_match" in bot_text and "fazercards_name_has_region" in function_block(bot_text, "apple_id_exact_fazercards_match") and "fazercards_name_has_amount" in function_block(bot_text, "apple_id_exact_fazercards_match"))
     record("global recalc all prices uses global markup and confirmation", "admin_apple_id_recalc_all" in bot_text and "admin_apple_id_recalc_all_confirm" in bot_text and "recalculate_all_apple_id_prices(apply=False)" in bot_text)
     record("personal account orders show paginated 5-button list", "APPLE_ID_ORDER_PAGE_SIZE = 5" in bot_text and "profile_orders:{page + 1}" in bot_text and "profile_orders:{page - 1}" in bot_text)
