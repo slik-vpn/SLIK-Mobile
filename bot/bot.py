@@ -5771,6 +5771,8 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def build_user_order_card_text(order: dict) -> str:
     if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        payment_provider = order.get("payment_provider") or ""
+        payment_method = order.get("payment_method") or (payment_provider_label(payment_provider) if payment_provider else "—")
         is_stars = order.get("product_type") == "telegram_stars"
         title = "⭐ <b>Заказ Telegram Stars</b>" if is_stars else "💎 <b>Заказ Telegram Premium</b>"
         qty_line = f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>" if is_stars else f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>"
@@ -6367,7 +6369,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "duration_months": plan.get("duration_months"),
             "currency": plan.get("currency"),
             "telegram_recipient_username": context.user_data.get("telegram_recipient_username"),
-            "payment_status": "pending",
+            "payment_status": "paid",
             "price_rub": plan.get("price_rub"),
             "supplier_price_usd": plan.get("supplier_price_usd"),
             "usd_rub_rate_used": plan.get("usd_rub_rate_used"),
@@ -6534,26 +6536,32 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
             f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
         )
     if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
-        is_stars = order.get("product_type") == "telegram_stars"
-        title = "⭐ <b>Заказ Telegram Stars</b>" if is_stars else "💎 <b>Заказ Telegram Premium</b>"
-        qty_line = f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>" if is_stars else f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>"
-        return (
-            f"{title}\n\n"
-            f"Номер: <b>{html_escape(order_number_plain(order))}</b>\n"
-            f"Клиент: <b>{html_escape(order.get('name', '—'))}</b> / <code>{html_escape(order.get('user_id', '—'))}</code>\n"
-            f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
-            f"{qty_line}\n"
-            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
-            f"Оплата: <b>{html_escape(payment_method)}</b>\n"
-            f"Поставщик:\n- статус: <b>{html_escape(order.get('supplier_status', order.get('status', '—')))}</b>\n- stock: <b>{html_escape(order.get('supplier_stock', '—'))}</b>\n- card_id: <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n- закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
-            f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
-            f"Статус: нужна ручная выдача / <b>{html_escape(order_status_with_icon(order.get('status')))}</b>"
-        )
-    if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
         if order.get("product_type") == "telegram_stars":
-            text = ("⭐ <b>Новый заказ Telegram Stars</b>\n\n" f"Номер заказа: <b>{html_escape(order_number)}</b>\n" f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>\n" f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n" f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n" f"Статус: ожидает оплаты\n" f"{payment_line}{payment_details_line}\n⭐ Telegram Stars оплачен — нужна ручная выдача")
+            text = (
+                "⭐ <b>Новый заказ Telegram Stars</b>\n\n"
+                f"Номер заказа: <b>{html_escape(order_number)}</b>\n"
+                f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>\n"
+                f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+                f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+                f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Статус: ожидает оплаты / нужна ручная выдача\n"
+                f"{payment_line}{payment_details_line}"
+                f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+                f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+            )
         else:
-            text = ("💎 <b>Новый заказ Telegram Premium</b>\n\n" f"Номер заказа: <b>{html_escape(order_number)}</b>\n" f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>\n" f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n" f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n" f"Статус: ожидает оплаты\n" f"{payment_line}{payment_details_line}\n💎 Telegram Premium оплачен — нужна ручная выдача")
+            text = (
+                "💎 <b>Новый заказ Telegram Premium</b>\n\n"
+                f"Номер заказа: <b>{html_escape(order_number)}</b>\n"
+                f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>\n"
+                f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+                f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+                f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Статус: ожидает оплаты / нужна ручная выдача\n"
+                f"{payment_line}{payment_details_line}"
+                f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+                f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+            )
     elif order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")

@@ -1129,6 +1129,22 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("Telegram recipient username collected and saved", "normalize_telegram_recipient_username" in bot_text and "telegram_recipient_username" in bot_text and "👤 Получатель — мой аккаунт" in bot_text)
     record("CRM supports Telegram Stars and Premium", "Заказ Telegram Stars" in bot_text and "Заказ Telegram Premium" in bot_text)
     record("notifications include Telegram Stars and Premium", "Новый заказ Telegram Stars" in bot_text and "Новый заказ Telegram Premium" in bot_text)
+    user_order_block = function_block(bot_text, "build_user_order_card_text")
+    notify_block = function_block(bot_text, "notify_admin")
+    notify_telegram_block = notify_block.split('if order.get("product_type") in {"telegram_stars", "telegram_premium"}:', 1)[1].split('elif order.get("product_type") == "apple_id":', 1)[0] if 'if order.get("product_type") in {"telegram_stars", "telegram_premium"}:' in notify_block else ""
+    begin_tg_block = function_block(bot_text, "begin_telegram_payment")
+    get_telegram_block = function_block(bot_text, "get_telegram")
+    build_order_card_block = function_block(bot_text, "build_order_card_text")
+    record("build_user_order_card_text Telegram payment_method is defined", "payment_method =" in user_order_block and "Оплата:" in user_order_block)
+    record("notify_admin Telegram block has no early return", "return (" not in notify_telegram_block and "return" not in notify_telegram_block)
+    record("notify_admin forms text for telegram_stars", "Новый заказ Telegram Stars" in notify_telegram_block and "text =" in notify_telegram_block)
+    record("notify_admin forms text for telegram_premium", "Новый заказ Telegram Premium" in notify_telegram_block and "text =" in notify_telegram_block)
+    record("Telegram order is initially created once in begin payment", begin_tg_block.count("create_telegram_checkout_order") == 1 and function_block(bot_text, "create_telegram_checkout_order").count("append_order") == 1)
+    record("checkout_order_id update prevents Telegram duplicate order", "checkout_order_id" in get_telegram_block and "update_checkout_order(checkout_order_id" in get_telegram_block and "or append_order(order_payload)" in get_telegram_block)
+    record("CRM card supports Telegram Stars without crashing", "telegram_stars" in build_order_card_block and "Заказ Telegram Stars" in build_order_card_block and "payment_method" in build_order_card_block)
+    record("CRM card supports Telegram Premium without crashing", "telegram_premium" in build_order_card_block and "Заказ Telegram Premium" in build_order_card_block and "payment_method" in build_order_card_block)
+    record("personal account order card supports Telegram Stars", "telegram_stars" in user_order_block and "Заказ Telegram Stars" in user_order_block)
+    record("personal account order card supports Telegram Premium", "telegram_premium" in user_order_block and "Заказ Telegram Premium" in user_order_block)
 
 
 def main() -> int:
