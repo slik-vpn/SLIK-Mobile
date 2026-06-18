@@ -694,6 +694,8 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "türkiye" in bot_text.lower()
         and "fazercards_name_has_region(name, region)" in apple_candidates_text,
     )
+    category_match_text = function_block(bot_text, "is_apple_fazercards_category")
+    exact_match_text = function_block(bot_text, "apple_id_exact_fazercards_match")
     record(
         "FazerCards Apple/iTunes candidates are not rejected when amount is missing",
         "if not fazercards_name_has_amount" not in apple_candidates_text
@@ -705,6 +707,18 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         '("gift" not in text and "card" not in text)' not in apple_candidates_text
         and '("gift" not in text or "card" not in text)' not in apple_candidates_text
         and "if not is_apple_itunes_fazercards_name(name):" in apple_candidates_text,
+    )
+    record(
+        "RU sync requires Apple/iTunes/App Store/Apple ID branding",
+        "has_apple_fazercards_branding" in bot_text
+        and "return has_apple_fazercards_branding(name)" in category_match_text
+        and "if not has_apple_fazercards_branding(names):" in exact_match_text,
+    )
+    record(
+        "generic RU voucher and Steam voucher cannot match Apple category",
+        "ru_voucher_named" not in bot_text
+        and '"voucher" in text and fazercards_name_has_region(name, "RU")' not in bot_text
+        and "return apple_named or ru_voucher_named" not in bot_text,
     )
     record(
         "FazerCards Apple/iTunes mapping has no client.post",
@@ -928,6 +942,9 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("price_rub changes only after apply confirm", "set_apple_id_product" not in apply_block and '"price_rub": rec["recommended_price_rub"]' in confirm_block)
     record("manual price edit still works in RUB", "Введите новую цену продажи в RUB" in bot_text and '"pricing_currency": "RUB"' in bot_text)
     record("Apple ID user flow shows RUB", "format_apple_id_client_price(product)" in bot_text and "format_rub(price_rub)" in plan_block)
+    record("apple_id_product_plan avoids direct product price_usd indexing", 'product["price_usd"]' not in plan_block and 'product.get("price_usd") or product.get("fazercards_price_usd")' in plan_block)
+    record("RU default product without price_usd does not break checkout flow", "apple_ru_100" in bot_text and '"price_usd"' not in bot_text[bot_text.find('"apple_ru_100"'):bot_text.find('"apple_ru_250"')] and 'product.get("price_usd")' in plan_block)
+    record("RU without price_rub/fazercards_price_usd does not create zero payment", "Товар временно недоступен" in function_block(bot_text, "start_apple_id_purchase") and "apple_id_payment_amount_rub(plan) <= 0" in function_block(bot_text, "start_apple_id_purchase"))
     record("Apple ID payment amount uses price_rub and not parse_price", 'plan.get("price_rub")' in payment_amount_block and "parse_price" not in payment_amount_block)
     record("Apple ID payment amount cannot be 0 if price_rub > 0", "if amount > 0:" in payment_amount_block and "return amount" in payment_amount_block)
     record("no client.post in FazerCards connection", "client.post" not in function_block(bot_text, "check_fazercards_connection"))
@@ -996,6 +1013,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("APPLE_ID_REGION_TITLES contains RU / Russia", '"RU": "Russia"' in bot_text and '"RU": "🇷🇺"' in bot_text)
     record("user Apple ID menu contains Russia", "🇷🇺 Apple ID Russia" in bot_text and "apple_id_region:RU" in bot_text)
     record("admin Apple ID catalog contains Russia region", "APPLE_ID_REGION_FLAGS" in bot_text and "🇷🇺" in bot_text and "Russia" in bot_text)
+    record("admin catalog has admin_apple_id_region RU", "🇷🇺 Russia" in function_block(bot_text, "apple_id_catalog_keyboard") and "admin_apple_id_region:RU" in function_block(bot_text, "apple_id_catalog_keyboard"))
     record("RUB format displays amount ruble sign", "RUB" in function_block(bot_text, "apple_id_product_nominal_label") and "{amount}₽" in function_block(bot_text, "apple_id_product_nominal_label") and "{amount_text}₽" in function_block(bot_text, "apple_nominal_text"))
     record("RU default products include stable edge ids", "apple_ru_100" in bot_text and "apple_ru_15000" in bot_text)
     record("nominal helper rejects non-positive and non-integer values", "nominal <= 0" in nominal_valid_block and "not isinstance(amount, int)" in nominal_valid_block and "return False" in nominal_valid_block)
@@ -1026,7 +1044,8 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
         ("supports 100 RUB", r"\b(\d+(?:[.,]\d+)?)\s*RUB\b"),
         ("supports RUR 100", r"\bRUR\s*(\d+(?:[.,]\d+)?)\b"),
         ("supports 100 RUR", r"\b(\d+(?:[.,]\d+)?)\s*RUR\b"),
-        ("supports 100 руб", r"\b(\d+(?:[.,]\d+)?)\s*(?:руб|рублей|р\.)\b"),
+        ("supports 100 руб", r"\b(\d+(?:[.,]\d+)?)\s*(?:руб|рублей)\b"),
+        ("supports 100 р.", r"\b(\d+(?:[.,]\d+)?)\s*р\.?(?=\s|$)"),
     ):
         record(f"nominal extractor {label}", needle in extract_nominal_block)
     record("nominal extractor rejects from/ot and ranges", "from|от" in extract_nominal_block and r"\bto\b|\bдо\b" in extract_nominal_block and "-|–|—" in extract_nominal_block)

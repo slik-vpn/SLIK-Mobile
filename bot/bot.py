@@ -2486,14 +2486,13 @@ def fazercards_items_from_payload(payload: dict) -> list[dict]:
     return fazercards_cards_from_payload(payload)
 
 
+def has_apple_fazercards_branding(name: str) -> bool:
+    return is_apple_itunes_fazercards_name(name)
+
+
 def is_apple_fazercards_category(item: dict) -> bool:
     name = str(item.get("name") or item.get("title") or "")
-    text = name.lower()
-    apple_named = is_apple_itunes_fazercards_name(name) and (
-        "app store" in text or "itunes" in text or "apple id" in text or "apple gift card" in text
-    )
-    ru_voucher_named = "voucher" in text and fazercards_name_has_region(name, "RU")
-    return apple_named or ru_voucher_named
+    return has_apple_fazercards_branding(name)
 
 
 def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -> bool:
@@ -2501,6 +2500,8 @@ def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -
     currency = str(product.get("currency") or "").upper()
     amount = float(product.get("amount") or 0)
     names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
+    if not has_apple_fazercards_branding(names):
+        return False
     if not fazercards_name_has_region(names, region):
         return False
     if currency == "USD" and not re.search(r"(?:\$|\busd\b)", names, re.I):
@@ -2544,7 +2545,8 @@ def extract_exact_apple_nominal_from_text(text: str, currency: str) -> int | Non
             r"\b(\d+(?:[.,]\d+)?)\s*RUB\b",
             r"\bRUR\s*(\d+(?:[.,]\d+)?)\b",
             r"\b(\d+(?:[.,]\d+)?)\s*RUR\b",
-            r"\b(\d+(?:[.,]\d+)?)\s*(?:руб|рублей|р\.)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*(?:руб|рублей)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*р\.?(?=\s|$)",
         )
     else:
         return None
@@ -2896,7 +2898,7 @@ def apple_id_product_plan(product: dict) -> dict:
         "region": product["region"],
         "amount": product["amount"],
         "currency": product["currency"],
-        "price_usd": product["price_usd"],
+        "price_usd": product.get("price_usd") or product.get("fazercards_price_usd") or product.get("supplier_price_usd"),
         "pricing_currency": "RUB",
         "price_rub": price_rub,
         "supplier_price_usd": product.get("fazercards_price_usd") or product.get("price_usd"),
@@ -5497,7 +5499,7 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     plan = apple_id_product_plan(product)
     if apple_id_payment_amount_rub(plan) <= 0:
-        await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
+        await query.message.reply_text("⚠️ Товар временно недоступен. Напишите менеджеру или попробуйте позже.", parse_mode="HTML")
         return ConversationHandler.END
     context.user_data["plan_key"] = product_id
     context.user_data["plan"] = plan
@@ -7143,7 +7145,7 @@ def apple_id_catalog_text() -> str:
     return (
         "🍎 <b>Apple ID каталог</b>\n\n"
         "Здесь можно управлять товарами Apple Gift Card.\n\n"
-        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n\nВыберите регион:"
+        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n🇷🇺 Russia\n\nВыберите регион:"
     )
 
 
@@ -7151,6 +7153,7 @@ def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US")],
         [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
+        [InlineKeyboardButton("🇷🇺 Russia", callback_data="admin_apple_id_region:RU")],
         [InlineKeyboardButton("🔗 Синхронизировать FazerCards", callback_data="admin_apple_id_fazer_sync")],
         [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_apple_id_recalc_all")],
         [InlineKeyboardButton("✏️ Изменить глобальную наценку %", callback_data="admin_apple_id_global_markup")],
