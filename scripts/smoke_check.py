@@ -218,7 +218,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "Apple ID payments reuse existing payment flow",
         "start_apple_id_purchase" in bot_text and "enabled_payment_methods()" in function_block(bot_text, "start_apple_id_purchase")
-        and "create_card_payment_lock(plan)" in function_block(bot_text, "start_apple_id_purchase")
+        and ("create_card_payment_lock(plan)" in function_block(bot_text, "start_apple_id_purchase") or "create_card_payment_lock_or_notify(query, plan)" in function_block(bot_text, "start_apple_id_purchase"))
         and "payment_keyboard(product_id)" in function_block(bot_text, "start_apple_id_purchase"),
     )
     record(
@@ -871,6 +871,64 @@ def check_run_mvp_contract(run_mvp_text: str) -> None:
     )
 
 
+def callback_branch_block(text: str, marker: str) -> str:
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    nxt = text.find("\n    elif ", start + len(marker))
+    return text[start:] if nxt < 0 else text[start:nxt]
+
+
+def check_apple_id_rub_market_pricing(bot_text: str) -> None:
+    normalize_block = function_block(bot_text, "normalize_apple_id_product")
+    plan_block = function_block(bot_text, "apple_id_product_plan")
+    order_block = function_block(bot_text, "create_or_update_order") or bot_text
+    record("Apple ID supports price_rub", '"price_rub"' in normalize_block)
+    record("Apple ID pricing_currency = RUB", '"pricing_currency", "RUB"' in normalize_block or '"pricing_currency": "RUB"' in bot_text)
+    record("Apple ID has pricing_mode", '"pricing_mode"' in normalize_block)
+    record("Apple ID has market_corridor", "market_corridor" in bot_text)
+    record("Apple ID has ozon_plus", "ozon_plus" in bot_text)
+    record("Apple ID has supplier_markup", "supplier_markup" in bot_text)
+    record("Apple ID has multitransfer_ozon source type", '"source_type": "multitransfer_ozon"' in bot_text)
+    record("Apple ID has Plati market source", '"source": "Plati"' in bot_text)
+    record("Apple ID has GGSEL market source", '"source": "GGSEL"' in bot_text)
+    record("Telegram competitors are not used for Apple ID pricing", "telegram competitors" not in bot_text.lower() and "competitor" not in function_block(bot_text, "calculate_apple_id_recommended_price").lower())
+    record("fetch_multitransfer_ozon_exact_price exists", "async def fetch_multitransfer_ozon_exact_price" in bot_text)
+    record("fetch_plati_market_prices exists", "async def fetch_plati_market_prices" in bot_text)
+    record("fetch_ggsel_market_prices exists", "async def fetch_ggsel_market_prices" in bot_text)
+    record("exact_nominal_not_found is handled as error", "exact_nominal_not_found" in bot_text)
+    record("different nominal prices are not reused", "Нельзя умножать" not in bot_text and " * int(product.get(\"amount\"" not in bot_text)
+    record("partial/default price is not used", "dynamic_page_not_supported" in bot_text and "partial/default" not in bot_text.lower())
+    record("calculate_apple_id_recommended_price uses market_corridor", "def calculate_apple_id_recommended_price" in bot_text and "market_corridor" in function_block(bot_text, "calculate_apple_id_recommended_price"))
+    record("Apple ID user flow shows rubles", "format_apple_id_client_price(product)" in bot_text and "format_rub(price_rub)" in plan_block)
+    record("Apple ID order saves market_sources_snapshot", '"market_sources_snapshot"' in plan_block and '"market_sources_snapshot"' in bot_text)
+    apply_block = callback_branch_block(bot_text, 'elif data.startswith("admin_apple_id_pricing_apply:")')
+    confirm_block = callback_branch_block(bot_text, 'elif data.startswith("admin_apple_id_pricing_apply_confirm:")')
+    ozon_block = function_block(bot_text, "fetch_multitransfer_ozon_exact_price")
+    public_block = function_block(bot_text, "fetch_public_market_prices")
+    calc_block = function_block(bot_text, "calculate_apple_id_recommended_price")
+    record("admin_apple_id_pricing_apply does not change price_rub directly", "set_apple_id_product" not in apply_block and "price_rub" not in apply_block)
+    record("price_rub changes in admin_apple_id_pricing_apply_confirm", '"price_rub": rec["recommended_price_rub"]' in confirm_block and "set_apple_id_product" in confirm_block)
+    record("Ozon helper does not take first RUB price from whole page", "extract_rub_prices_from_fragment(html)" not in ozon_block and "near = re.search" not in ozon_block)
+    record("Ozon exact price is tied to exact nominal fragment", "exact_fragments" in ozon_block and "extract_rub_prices_from_fragment(fragment)" in ozon_block and "exact_price_not_found" in ozon_block)
+    record("Plati/GGSEL do not collect all prices after one page exact match", "apple_id_exact_market_match(html, product)" not in public_block and "for fragment in fragments" in public_block and "extract_rub_prices_from_fragment(fragment)" in public_block)
+    record("unsupported sources do not participate in pricing", 'src.get("status") != "ok"' in calc_block and 'src.get("match_confidence") != "exact"' in calc_block)
+    amount_format_block = function_block(bot_text, "format_apple_id_amount_for_match")
+    payment_amount_block = function_block(bot_text, "apple_id_payment_amount_rub")
+    card_lock_block = function_block(bot_text, "create_card_payment_lock")
+    cryptobot_branch = callback_branch_block(bot_text, 'if data == "pay_cryptobot":')
+    record("Apple ID exact-match helper cases exist", "apple_id_market_price_match_cases" in bot_text and "USA 5 USD" in bot_text and "Default Apple Gift Card USA 2 USD" in bot_text and "Turkey 100 TRY" in bot_text and "от 2 USD" in bot_text and "Apple ID от 500 рублей" in bot_text)
+    record("format_apple_id_amount_for_match preserves zero-ending nominals", "def format_apple_id_amount_for_match" in bot_text and 'f"{numeric:g}"' in amount_format_block and '.rstrip(".0")' not in bot_text)
+    record("Apple ID payment amount uses price_rub before parsing price string", 'plan.get("price_rub")' in payment_amount_block and 'parse_price' not in payment_amount_block)
+    record("Apple ID payment amount cannot be zero when price_rub is positive", "if amount > 0:" in payment_amount_block and "return amount" in payment_amount_block)
+    record("Card payment lock uses Apple ID RUB amount", 'plan.get("product_type") == "apple_id"' in card_lock_block and "apple_id_payment_amount_rub(plan)" in card_lock_block and "raise ValueError" in card_lock_block)
+    record("CryptoBot Apple ID amount uses price_rub helper", "apple_id_payment_amount_rub(plan)" in cryptobot_branch and "amount <= 0" in cryptobot_branch and "payment_amount_error_text(plan)" in cryptobot_branch)
+    record("price_rub is not changed automatically without confirmation", "market_auto_update_price" in normalize_block and "admin_apple_id_pricing_apply_confirm" in bot_text and "auto_update_price" not in calc_block)
+    record("no FazerCards client.post purchase call", "/giftcards/order" not in bot_text and "client.post" not in function_block(bot_text, "check_fazercards_connection"))
+    record("eSIM logic remains present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text)
+    record("cashback remains disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
+
+
 def main() -> int:
     check_syntax("bot/bot.py")
     check_syntax("bot/run_mvp.py")
@@ -898,6 +956,7 @@ def main() -> int:
         readme_text,
     )
     check_bot_contract(bot_text, env_example_text)
+    check_apple_id_rub_market_pricing(bot_text)
     check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',
