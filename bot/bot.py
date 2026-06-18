@@ -323,6 +323,7 @@ DEFAULT_CONFIG = {
         "tech_alerts": "",
     },
     "apple_id_products": {},
+    "apple_id_pending_supplier_positions": [],
     "apple_id_pricing": DEFAULT_APPLE_ID_PRICING.copy(),
     "fazercards": {
         "api_key": "",
@@ -480,6 +481,8 @@ def load_config() -> dict:
         usd_rub.setdefault(key, value)
     if not isinstance(data.get("apple_id_products"), dict):
         data["apple_id_products"] = {}
+    if not isinstance(data.get("apple_id_pending_supplier_positions"), list):
+        data["apple_id_pending_supplier_positions"] = []
     apple_id_pricing = data.get("apple_id_pricing")
     if not isinstance(apple_id_pricing, dict):
         apple_id_pricing = {}
@@ -1565,6 +1568,17 @@ def save_apple_id_products(products: dict) -> None:
     save_config(cfg)
 
 
+def get_apple_id_pending_supplier_positions() -> list[dict]:
+    pending = load_config().get("apple_id_pending_supplier_positions")
+    return [item for item in pending if isinstance(item, dict)][:100] if isinstance(pending, list) else []
+
+
+def save_apple_id_pending_supplier_positions(positions: list[dict]) -> None:
+    cfg = load_config()
+    cfg["apple_id_pending_supplier_positions"] = [item for item in positions if isinstance(item, dict)][:100]
+    save_config(cfg)
+
+
 def apple_id_products_by_region(region: str, enabled_only: bool = False) -> list[dict]:
     products = get_apple_id_products().get(region, [])
     if enabled_only:
@@ -2326,21 +2340,94 @@ def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -
     return fazercards_name_has_amount(names, amount_text)
 
 
+def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
+    names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title"), card.get("product_name"), card.get("productName")))
+    region = None
+    if re.search(r"\b(?:us|usa|united\s+states|сша)\b", names, re.I):
+        region = "US"
+    elif re.search(r"\b(?:tr|turkey|турция|türkiye|turkiye)\b", names, re.I):
+        region = "TR"
+    currency = None
+    if re.search(r"(?:\$|\busd\b)", names, re.I):
+        currency = "USD"
+    elif re.search(r"(?:₺|\btry\b|\btl\b)", names, re.I):
+        currency = "TRY"
+    if not region or not currency:
+        return None
+    # Do not import vague "from 2 USD" or ranges like 2-5 USD / 2 to 5 USD.
+    if re.search(r"\b(?:from|от)\s*\d+(?:[.,]\d+)?\s*(?:\$|usd|try|tl|₺)?", names, re.I):
+        return None
+    if re.search(r"\d+(?:[.,]\d+)?\s*(?:-|–|—|\bto\b|\bдо\b)\s*\d+(?:[.,]\d+)?", names, re.I):
+        return None
+    currency_pattern = r"(?:\$|USD)" if currency == "USD" else r"(?:₺|TRY|TL)"
+    matches = re.findall(rf"(?:{currency_pattern}\s*)?(\d+(?:[.,]\d+)?)(?:\s*{currency_pattern})", names, re.I)
+    exact_amounts = {float(value.replace(",", ".")) for value in matches}
+    if len(exact_amounts) != 1:
+        return None
+    amount = exact_amounts.pop()
+    if amount <= 0 or not amount.is_integer():
+        return None
+    amount = int(amount)
+    category_id = fazercards_category_id_value(category)
+    card_id = fazercards_product_value(card, "card_id")
+    try:
+        price_usd = float(fazercards_product_value(card, "price_usd") or 0)
+    except (TypeError, ValueError):
+        price_usd = 0.0
+    try:
+        stock = int(float(fazercards_product_value(card, "stock") or 0))
+    except (TypeError, ValueError):
+        stock = 0
+    title = f"Apple Gift Card USA ${amount}" if region == "US" else f"Apple Gift Card Turkey {amount}₺"
+    return {
+        "region": region,
+        "currency": currency,
+        "amount": amount,
+        "title": title,
+        "fazercards_category_id": category_id,
+        "fazercards_card_id": card_id,
+        "fazercards_product_id": card_id,
+        "fazercards_product_name": fazercards_product_value(card, "name"),
+        "fazercards_price_usd": price_usd,
+        "fazercards_stock": stock,
+        "fazercards_available": stock > 0,
+    }
+
+
+def apple_id_catalog_has_nominal(catalog: dict, region: str, amount, currency: str) -> bool:
+    try:
+        target_amount = float(amount)
+    except (TypeError, ValueError):
+        return False
+    for product in catalog.get(region, []):
+        try:
+            product_amount = float(product.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if product_amount == target_amount and str(product.get("currency") or "").upper() == str(currency or "").upper():
+            return True
+    return False
+
+
 async def sync_apple_id_fazercards_bulk() -> dict:
     products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
-    report = {"categories": 0, "supplier_items": 0, "linked": 0, "updated_prices": 0, "not_found": 0, "new_supplier_positions": 0, "errors": 0, "lines": [], "sync_failed": False, "error": ""}
+    report = {"categories": 0, "supplier_items": 0, "linked": 0, "updated_prices": 0, "not_found": 0, "new_supplier_positions": 0, "new_supplier_positions_list": [], "errors": 0, "lines": [], "sync_failed": False, "error": ""}
     if not products_payload.get("ok"):
+        save_apple_id_pending_supplier_positions([])
         report.update({"errors": 1, "sync_failed": True, "error": products_payload.get("error") or "giftcards_fetch_failed"})
         return report
 
     categories = [item for item in fazercards_items_from_payload(products_payload) if is_apple_fazercards_category(item)]
     report["categories"] = len(categories)
     if not categories:
+        save_apple_id_pending_supplier_positions([])
         report.update({"errors": 1, "sync_failed": True, "error": "apple_categories_not_found"})
         return report
 
     catalog = get_apple_id_products()
     flat_products = [p for items in catalog.values() for p in items]
+    new_supplier_positions: list[dict] = []
+    pending_keys: set[tuple[str, int, str]] = set()
     seen_products: set[str] = set()
     successful_regions: set[str] = set()
     for category in categories:
@@ -2376,7 +2463,18 @@ async def sync_apple_id_fazercards_bulk() -> dict:
             if not any(apple_id_exact_fazercards_match(product, category, card) for product in flat_products):
                 report["new_supplier_positions"] += 1
                 report["lines"].append(f"➕ {html_escape(str(fazercards_product_value(card, 'name') or 'позиция'))} — есть у поставщика, нет в каталоге")
+                parsed = parse_apple_id_supplier_position(category, card)
+                if not parsed:
+                    continue
+                key = (parsed["region"], int(parsed["amount"]), parsed["currency"])
+                if key in pending_keys or apple_id_catalog_has_nominal(catalog, parsed["region"], parsed["amount"], parsed["currency"]):
+                    continue
+                pending_keys.add(key)
+                new_supplier_positions.append(parsed)
+                if len(new_supplier_positions) >= 100:
+                    break
     if report["supplier_items"] <= 0:
+        save_apple_id_pending_supplier_positions([])
         report.update({"sync_failed": True, "error": "supplier_cards_not_found"})
         return report
     for product in flat_products:
@@ -2385,6 +2483,8 @@ async def sync_apple_id_fazercards_bulk() -> dict:
             report["not_found"] += 1
             report["lines"].append(f"⚠️ {APPLE_ID_REGION_TITLES.get(product.get('region'), product.get('region'))} {apple_nominal_text(product)} — exact match не найден")
     save_apple_id_products(catalog)
+    report["new_supplier_positions_list"] = new_supplier_positions[:100]
+    save_apple_id_pending_supplier_positions(report["new_supplier_positions_list"])
     return report
 
 
@@ -2401,6 +2501,78 @@ def fazercards_bulk_sync_report_text(report: dict) -> str:
     lines = ["🔗 <b>Синхронизация FazerCards завершена</b>", "", f"Найдено категорий Apple: {report['categories']}", f"Найдено позиций у поставщика: {report['supplier_items']}", f"Привязано товаров: {report['linked']}", f"Обновлено закупочных цен: {report['updated_prices']}", f"Нет exact match: {report['not_found']}", f"Новые позиции у поставщика: {report['new_supplier_positions']}", f"Ошибки: {report['errors']}", ""]
     lines.extend(report.get("lines", [])[:30])
     return "\n".join(lines)
+
+
+def fazercards_bulk_sync_report_keyboard(report: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if report.get("new_supplier_positions_list"):
+        rows.append([InlineKeyboardButton("➕ Добавить новые позиции", callback_data="admin_apple_id_add_supplier_positions")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
+    return InlineKeyboardMarkup(rows)
+
+
+def apple_id_pending_supplier_positions_text(positions: list[dict]) -> str:
+    grouped: dict[str, list[dict]] = {}
+    for item in positions:
+        grouped.setdefault(str(item.get("region") or ""), []).append(item)
+    lines = ["➕ <b>Будут добавлены новые Apple ID позиции:</b>", ""]
+    for region, items in grouped.items():
+        lines.append(f"<b>{APPLE_ID_REGION_TITLES.get(region, region)}:</b>")
+        for item in sorted(items, key=lambda x: float(x.get("amount") or 0)):
+            amount = int(item.get("amount") or 0)
+            nominal = f"${amount}" if item.get("currency") == "USD" else f"{amount} TRY"
+            lines.append(f"{html_escape(nominal)} — закуп {html_escape(format_usd(item.get('fazercards_price_usd')))}")
+        lines.append("")
+    lines.append(f"Добавить {len(positions)} позиций?")
+    return "\n".join(lines)
+
+
+def add_apple_id_pending_supplier_positions() -> dict:
+    pending = get_apple_id_pending_supplier_positions()
+    catalog = get_apple_id_products()
+    report = {"added": 0, "skipped": 0, "lines": []}
+    for item in pending:
+        region = str(item.get("region") or "").upper()
+        currency = str(item.get("currency") or "").upper()
+        try:
+            amount = int(item.get("amount"))
+        except (TypeError, ValueError):
+            report["skipped"] += 1
+            report["lines"].append(f"⚠️ {html_escape(str(item.get('title') or 'позиция'))} — пропущено: не удалось определить amount")
+            continue
+        if apple_id_catalog_has_nominal(catalog, region, amount, currency):
+            report["skipped"] += 1
+            report["lines"].append(f"⚠️ {APPLE_ID_REGION_TITLES.get(region, region)} {currency} {amount} — пропущено: уже есть в каталоге")
+            continue
+        product = normalize_apple_id_product({
+            "id": f"apple_{region.lower()}_{amount}",
+            "title": item.get("title") or (f"Apple Gift Card USA ${amount}" if region == "US" else f"Apple Gift Card Turkey {amount}₺"),
+            "region": region,
+            "amount": amount,
+            "currency": currency,
+            "enabled": True,
+            "pricing_currency": "RUB",
+            "pricing_mode": "supplier_markup",
+            "price_usd": item.get("fazercards_price_usd"),
+            "supplier_price_usd": item.get("fazercards_price_usd"),
+            "fazercards_category_id": item.get("fazercards_category_id", ""),
+            "fazercards_card_id": item.get("fazercards_card_id", ""),
+            "fazercards_product_id": item.get("fazercards_product_id") or item.get("fazercards_card_id", ""),
+            "fazercards_product_name": item.get("fazercards_product_name", ""),
+            "fazercards_price_usd": item.get("fazercards_price_usd"),
+            "fazercards_stock": item.get("fazercards_stock"),
+            "fazercards_available": bool(item.get("fazercards_available")),
+            "fazercards_last_seen": now_str(),
+            "fazercards_sync_status": "ok",
+        })
+        rec = calculate_apple_id_supplier_markup_price(product)
+        product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_price_usd": rec["supplier_price_usd"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
+        catalog.setdefault(region, []).append(product)
+        report["added"] += 1
+        report["lines"].append(f"✅ {APPLE_ID_REGION_TITLES.get(region, region)} {('$' + str(amount)) if currency == 'USD' else (str(amount) + ' TRY')} — цена {format_rub(product.get('price_rub'))}")
+    save_apple_id_products(catalog)
+    save_apple_id_pending_supplier_positions([])
+    return report
 
 
 def recalculate_all_apple_id_prices(apply: bool = False) -> tuple[dict, dict]:
@@ -7514,7 +7686,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer("Синхронизирую FazerCards...")
         report = await sync_apple_id_fazercards_bulk()
-        await edit_or_send(query, context, fazercards_bulk_sync_report_text(report), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
+        await edit_or_send(query, context, fazercards_bulk_sync_report_text(report), fazercards_bulk_sync_report_keyboard(report))
+    elif data == "admin_apple_id_add_supplier_positions":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return
+        positions = get_apple_id_pending_supplier_positions()
+        if not positions:
+            await query.answer("Нет новых позиций для добавления.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, apple_id_pending_supplier_positions_text(positions), InlineKeyboardMarkup([[InlineKeyboardButton("✅ Да, добавить", callback_data="admin_apple_id_add_supplier_positions_confirm")], [InlineKeyboardButton("❌ Отмена", callback_data="admin_apple_id_catalog")]]))
+    elif data == "admin_apple_id_add_supplier_positions_confirm":
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return
+        await query.answer("Добавляю позиции...")
+        add_report = add_apple_id_pending_supplier_positions()
+        lines = ["✅ <b>Новые позиции добавлены</b>", "", f"Добавлено: {add_report['added']}", f"Пропущено: {add_report['skipped']}", ""]
+        lines.extend(add_report.get("lines", []))
+        await edit_or_send(query, context, "\n".join(lines), InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data == "admin_apple_id_global_markup":
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)

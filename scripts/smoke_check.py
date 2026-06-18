@@ -944,9 +944,13 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("global recalc all prices uses global markup and confirmation", "admin_apple_id_recalc_all" in bot_text and "admin_apple_id_recalc_all_confirm" in bot_text and "recalculate_all_apple_id_prices(apply=False)" in bot_text)
     record("personal account orders show paginated 5-button list", "APPLE_ID_ORDER_PAGE_SIZE = 5" in bot_text and "profile_orders:{page + 1}" in bot_text and "profile_orders:{page - 1}" in bot_text)
     fazer_sync_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_fazer_sync":')
+    add_supplier_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_add_supplier_positions":')
+    add_supplier_confirm_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_add_supplier_positions_confirm":')
     global_markup_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_global_markup":')
     recalc_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all":')
     recalc_confirm_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all_confirm":')
+    parse_supplier_block = function_block(bot_text, "parse_apple_id_supplier_position")
+    add_pending_block = function_block(bot_text, "add_apple_id_pending_supplier_positions")
 
     def access_before_call(branch: str, call: str) -> bool:
         access_index = branch.find("has_catalog_admin_access(query.from_user)")
@@ -954,6 +958,18 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
         return access_index >= 0 and call_index >= 0 and access_index < call_index
 
     record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
+    record("parse_apple_id_supplier_position exists", "def parse_apple_id_supplier_position" in bot_text and "return None" in parse_supplier_block)
+    record("new supplier positions are structured and saved", '"new_supplier_positions_list": []' in bulk_sync_block and "new_supplier_positions.append(parsed)" in bulk_sync_block and "save_apple_id_pending_supplier_positions" in bulk_sync_block)
+    record("pending supplier list exists in config", '"apple_id_pending_supplier_positions"' in bot_text and "get_apple_id_pending_supplier_positions" in bot_text)
+    record("add supplier positions callback exists", 'admin_apple_id_add_supplier_positions' in bot_text)
+    record("add supplier positions confirm callback exists", 'admin_apple_id_add_supplier_positions_confirm' in bot_text)
+    record("add supplier callbacks are protected by catalog admin access", "has_catalog_admin_access(query.from_user)" in add_supplier_branch and "has_catalog_admin_access(query.from_user)" in add_supplier_confirm_branch)
+    record("new supplier products require confirmation before creation", "add_apple_id_pending_supplier_positions()" not in add_supplier_branch and "add_apple_id_pending_supplier_positions()" in add_supplier_confirm_branch)
+    record("stable Apple ID supplier ids are generated", 'f"apple_{region.lower()}_{amount}"' in add_pending_block)
+    record("supplier add avoids duplicate region amount currency", "apple_id_catalog_has_nominal" in add_pending_block and "continue" in add_pending_block)
+    record("new supplier product price_rub is calculated immediately", 'calculate_apple_id_supplier_markup_price(product)' in add_pending_block and '"price_rub": rec["recommended_price_rub"]' in add_pending_block)
+    record("new supplier add supports apple_us_2/apple_us_3/apple_us_4 stable ids", 'f"apple_{region.lower()}_{amount}"' in add_pending_block and '"US"' in parse_supplier_block and '"USD"' in parse_supplier_block)
+    record("supplier sync uses only GET giftcards endpoints", "client.post" not in bulk_sync_block and "/giftcards/order" not in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bulk_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bulk_sync_block)
     record("admin_apple_id_global_markup branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in global_markup_branch)
     record("admin_apple_id_recalc_all branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_branch)
     record("admin_apple_id_recalc_all_confirm branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_confirm_branch)
