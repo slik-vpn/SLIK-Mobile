@@ -48,6 +48,17 @@ def function_block(text: str, name: str) -> str:
     match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
     return match.group(0) if match else ""
 
+def extract_smoke_callable(text: str, name: str, arg: str):
+    block = function_block(text, name)
+    if not block:
+        return None
+    ns = {"re": re}
+    try:
+        exec(block, ns)
+        return ns[name](arg)
+    except Exception:
+        return None
+
 
 def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> None:
     uses_slik_user = any(
@@ -1132,7 +1143,13 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("Telegram category filter accepts Telegram звёзды и премиум", "is_telegram_fazercards_category" in bot_text and "телеграм" in telegram_category_block and "telegram" in telegram_category_block and r"\btg\b" in telegram_category_block)
     record("Stars branding requires telegram and stars groups", "def is_telegram_stars_branding" in bot_text and "has_telegram and has_stars" in function_block(bot_text, "is_telegram_stars_branding"))
     record("Premium branding requires telegram and premium groups", "def is_telegram_premium_branding" in bot_text and "has_telegram and has_premium" in function_block(bot_text, "is_telegram_premium_branding"))
-    record("Stars nominal parser supports RU, emoji, XTR and Stars samples", all(x in stars_parser_block for x in ("звезд", "⭐", "xtr", "stars")) and "50 <= nominal <= 10000" in stars_parser_block)
+    record("Stars nominal parser supports RU, emoji, XTR and Stars samples", all(x in stars_parser_block for x in ("звезд", "зв\\.", "⭐", "☆", "★", "xtr", "stars")) and "50 <= nominal <= 10000" in stars_parser_block)
+    record("Stars branding supports FazerCards star and зв abbreviations", "☆" in function_block(bot_text, "is_telegram_stars_branding") and r"зв\." in function_block(bot_text, "is_telegram_stars_branding"))
+    record("Stars parser handles FazerCards samples", extract_smoke_callable(bot_text, "extract_telegram_stars_nominal_from_text", "50 ☆") == 50 and extract_smoke_callable(bot_text, "extract_telegram_stars_nominal_from_text", "50 зв.") == 50 and extract_smoke_callable(bot_text, "extract_telegram_stars_nominal_from_text", "☆ 100") == 100 and extract_smoke_callable(bot_text, "extract_telegram_stars_nominal_from_text", "100★") == 100)
+    record("Telegram sync reads cards without category filter continue", "if not is_telegram_fazercards_category(category_text):\n            continue" not in telegram_sync_block and "category_id = fazercards_category_id_value(category)" in telegram_sync_block and "await fetch_fazercards_giftcards_cards_readonly(category_id)" in telegram_sync_block)
+    record("Telegram sync uses combined category and card text", 'combined_text = f"{category_text} {card_text}"' in telegram_sync_block and "category_text = fazercards_text_blob(category)" in telegram_sync_block and "card_text = fazercards_text_blob(card)" in telegram_sync_block)
+    record("Telegram sync report shows category and card samples", all(x in telegram_report_block for x in ("Samples категорий", "Samples cards", "category_id", "card_id", "price_usd", "stock")))
+    record("Telegram sync report includes categories_without_id", "categories_without_id" in telegram_sync_block and "categories_without_id" in telegram_report_block)
     record("Premium duration parser supports months and m samples", all(x in premium_parser_block for x in ("месяц", "months", "m\\b")) and "TELEGRAM_PREMIUM_SUPPORTED_DURATIONS = {1, 3, 6, 12}" in bot_text)
     record("Telegram sync report has diagnostic fields", all(x in telegram_sync_block and x in telegram_report_block for x in ("categories_scanned", "telegram_categories_found", "cards_scanned", "stars_candidates_found", "premium_candidates_found", "pending_stars_count", "pending_premium_count")))
     record("Telegram pending Stars and Premium are saved by sync", '"telegram_stars_pending_supplier_positions"] = pending[:100]' in telegram_sync_block and '"telegram_premium_pending_supplier_positions"] = pending[:100]' in telegram_sync_block)
