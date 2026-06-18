@@ -1576,6 +1576,28 @@ def sort_apple_id_products(products: list[dict]) -> list[dict]:
     return sorted([p for p in products if isinstance(p, dict)], key=apple_id_sort_key)
 
 
+def is_visible_apple_id_product(product: dict, enabled_only: bool = False) -> bool:
+    if not isinstance(product, dict):
+        return False
+    if enabled_only and not product.get("enabled", True):
+        return False
+    return is_valid_apple_id_nominal(product.get("region"), product.get("currency"), product.get("amount"))
+
+
+def build_grid_keyboard(buttons: list, columns: int = 3) -> list[list]:
+    columns = max(1, int(columns or 1))
+    return [buttons[i:i + columns] for i in range(0, len(buttons), columns)]
+
+
+def apple_id_grid_columns(region: str, count: int = 0) -> int:
+    region = str(region or "").upper()
+    if region == "US":
+        return 3
+    if region == "TR":
+        return 3 if count > 4 else 2
+    return 2
+
+
 def default_apple_id_products() -> dict:
     return {region: sort_apple_id_products([normalize_apple_id_product(p) for p in products]) for region, products in APPLE_ID_PRODUCTS.items()}
 
@@ -1607,9 +1629,11 @@ def save_apple_id_pending_supplier_positions(positions: list[dict]) -> None:
     save_config(cfg)
 
 
-def apple_id_products_by_region(region: str, enabled_only: bool = False) -> list[dict]:
+def apple_id_products_by_region(region: str, enabled_only: bool = False, valid_only: bool = True) -> list[dict]:
     products = sort_apple_id_products(get_apple_id_products().get(region, []))
-    if enabled_only:
+    if valid_only:
+        products = [p for p in products if is_visible_apple_id_product(p, enabled_only=enabled_only)]
+    elif enabled_only:
         products = [p for p in products if p.get("enabled", True)]
     return sort_apple_id_products(products)
 
@@ -4523,11 +4547,25 @@ def apple_id_start_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def apple_id_product_nominal_label(product: dict) -> str:
+    return f"${product['amount']}" if product.get("currency") == "USD" else f"{product.get('amount')}₺"
+
+
+def compact_apple_id_product_label(product: dict, include_price: bool = False) -> str:
+    nominal = apple_id_product_nominal_label(product)
+    if not include_price:
+        return nominal
+    label = f"{nominal} — {format_apple_id_client_price(product)}"
+    return label if len(label) <= 18 else nominal
+
+
 def apple_id_products_keyboard(region: str) -> InlineKeyboardMarkup:
-    rows = []
-    for product in apple_id_products_by_region(region, enabled_only=True):
-        amount = f"${product['amount']}" if product["currency"] == "USD" else f"{product['amount']}₺"
-        rows.append([InlineKeyboardButton(amount, callback_data=f"apple_id_product:{product['id']}")])
+    products = apple_id_products_by_region(region, enabled_only=True, valid_only=True)
+    buttons = [
+        InlineKeyboardButton(compact_apple_id_product_label(product, include_price=True), callback_data=f"apple_id_product:{product['id']}")
+        for product in products
+    ]
+    rows = build_grid_keyboard(buttons, apple_id_grid_columns(region, len(products)))
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="buy_apple_id")])
     return InlineKeyboardMarkup(rows)
 
@@ -4746,8 +4784,8 @@ async def show_apple_id_product(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     product_id = query.data.split(":", 1)[1]
     product = apple_id_product_by_id(product_id)
-    if not product:
-        await query.answer("Товар не найден.", show_alert=True)
+    if not is_visible_apple_id_product(product, enabled_only=True):
+        await query.answer("Товар недоступен.", show_alert=True)
         return
     region = product["region"]
     region_title = APPLE_ID_REGION_TITLES.get(region, region)
@@ -5303,8 +5341,8 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     product_id = query.data.split(":", 1)[1]
     product = apple_id_product_by_id(product_id)
-    if not product:
-        await query.answer("Товар не найден.", show_alert=True)
+    if not is_visible_apple_id_product(product, enabled_only=True):
+        await query.answer("Товар недоступен.", show_alert=True)
         return ConversationHandler.END
     plan = apple_id_product_plan(product)
     if apple_id_payment_amount_rub(plan) <= 0:
@@ -6964,7 +7002,9 @@ def apple_id_admin_region_text(region: str) -> str:
 
 
 def apple_id_admin_region_keyboard(region: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(apple_nominal_text(p), callback_data=f"admin_apple_id_product:{p['id']}")] for p in apple_id_products_by_region(region)]
+    products = apple_id_products_by_region(region, valid_only=True)
+    buttons = [InlineKeyboardButton(compact_apple_id_product_label(p), callback_data=f"admin_apple_id_product:{p['id']}") for p in products]
+    rows = build_grid_keyboard(buttons, apple_id_grid_columns(region, len(products)))
     rows.append([InlineKeyboardButton("➕ Добавить номинал", callback_data=f"admin_apple_id_add:{region}")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
     return InlineKeyboardMarkup(rows)
