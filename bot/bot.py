@@ -1548,8 +1548,36 @@ def save_apple_id_pricing_settings(updates: dict) -> None:
     save_config(cfg)
 
 
+def is_valid_apple_id_nominal(region: str, currency: str, amount) -> bool:
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return False
+    nominal = amount
+    if nominal <= 0:
+        return False
+    region = str(region or "").upper()
+    currency = str(currency or "").upper()
+    if region == "US" and currency == "USD":
+        return 1 <= nominal <= 200
+    if region == "TR" and currency == "TRY":
+        return 100 <= nominal <= 2000
+    return False
+
+
+def apple_id_sort_key(product: dict) -> tuple[float, str]:
+    try:
+        amount = float(product.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    title_or_id = str(product.get("title") or product.get("id") or "").lower()
+    return amount, title_or_id
+
+
+def sort_apple_id_products(products: list[dict]) -> list[dict]:
+    return sorted([p for p in products if isinstance(p, dict)], key=apple_id_sort_key)
+
+
 def default_apple_id_products() -> dict:
-    return {region: [normalize_apple_id_product(p) for p in products] for region, products in APPLE_ID_PRODUCTS.items()}
+    return {region: sort_apple_id_products([normalize_apple_id_product(p) for p in products]) for region, products in APPLE_ID_PRODUCTS.items()}
 
 
 def get_apple_id_products() -> dict:
@@ -1564,7 +1592,7 @@ def get_apple_id_products() -> dict:
 
 def save_apple_id_products(products: dict) -> None:
     cfg = load_config()
-    cfg["apple_id_products"] = {region: [normalize_apple_id_product(p) for p in items] for region, items in products.items()}
+    cfg["apple_id_products"] = {region: sort_apple_id_products([normalize_apple_id_product(p) for p in items]) for region, items in products.items()}
     save_config(cfg)
 
 
@@ -1580,10 +1608,10 @@ def save_apple_id_pending_supplier_positions(positions: list[dict]) -> None:
 
 
 def apple_id_products_by_region(region: str, enabled_only: bool = False) -> list[dict]:
-    products = get_apple_id_products().get(region, [])
+    products = sort_apple_id_products(get_apple_id_products().get(region, []))
     if enabled_only:
         products = [p for p in products if p.get("enabled", True)]
-    return products
+    return sort_apple_id_products(products)
 
 
 def apple_id_product_by_id(product_id: str) -> dict | None:
@@ -2397,6 +2425,8 @@ def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
     amount = extract_exact_apple_nominal_from_text(names, currency)
     if amount is None:
         return None
+    if not is_valid_apple_id_nominal(region, currency, amount):
+        return None
     category_id = fazercards_category_id_value(category)
     card_id = fazercards_product_value(card, "card_id")
     try:
@@ -2494,6 +2524,13 @@ async def sync_apple_id_fazercards_bulk() -> dict:
                 report["lines"].append(f"➕ {html_escape(str(fazercards_product_value(card, 'name') or 'позиция'))} — есть у поставщика, нет в каталоге")
                 parsed = parse_apple_id_supplier_position(category, card)
                 if not parsed:
+                    raw_names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
+                    for candidate_region, candidate_currency in (("US", "USD"), ("TR", "TRY")):
+                        candidate_amount = extract_exact_apple_nominal_from_text(raw_names, candidate_currency)
+                        if candidate_amount is not None and not is_valid_apple_id_nominal(candidate_region, candidate_currency, candidate_amount):
+                            label = f"{APPLE_ID_REGION_TITLES.get(candidate_region, candidate_region)} ${candidate_amount}" if candidate_currency == "USD" else f"{APPLE_ID_REGION_TITLES.get(candidate_region, candidate_region)} {candidate_amount} TRY"
+                            report["lines"].append(f"⚠️ {label} — вне допустимого диапазона")
+                            break
                     continue
                 key = (parsed["region"], int(parsed["amount"]), parsed["currency"])
                 if key in pending_keys or apple_id_catalog_has_nominal(catalog, parsed["region"], parsed["amount"], parsed["currency"]):
@@ -2563,11 +2600,15 @@ def add_apple_id_pending_supplier_positions() -> dict:
     for item in pending:
         region = str(item.get("region") or "").upper()
         currency = str(item.get("currency") or "").upper()
-        try:
-            amount = int(item.get("amount"))
-        except (TypeError, ValueError):
+        amount = item.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, int):
             report["skipped"] += 1
             report["lines"].append(f"⚠️ {html_escape(str(item.get('title') or 'позиция'))} — пропущено: не удалось определить amount")
+            continue
+        if not is_valid_apple_id_nominal(region, currency, amount):
+            report["skipped"] += 1
+            label = f"{APPLE_ID_REGION_TITLES.get(region, region)} ${amount}" if currency == "USD" else f"{APPLE_ID_REGION_TITLES.get(region, region)} {amount} TRY"
+            report["lines"].append(f"⚠️ {label} — пропущено: вне допустимого диапазона")
             continue
         if apple_id_catalog_has_nominal(catalog, region, amount, currency):
             report["skipped"] += 1
@@ -5929,10 +5970,12 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             amount = float(msg.text.strip().replace(",", "."))
         except ValueError:
             amount = 0
-        if amount <= 0:
-            await msg.reply_text("Введите номинал числом больше 0.", parse_mode="HTML")
+        region = str(context.user_data.get("apple_id_add_region") or "")
+        currency = "USD" if region == "US" else "TRY"
+        if amount <= 0 or not amount.is_integer() or not is_valid_apple_id_nominal(region, currency, int(amount)):
+            await msg.reply_text("Введите целый номинал в допустимом диапазоне: USA $1–$200 или Turkey 100–2000₺.", parse_mode="HTML")
             return
-        context.user_data["apple_id_add_amount"] = int(amount) if amount.is_integer() else amount
+        context.user_data["apple_id_add_amount"] = int(amount)
         context.user_data["client_input"] = APPLE_ID_INPUT_ADD_PRICE
         await msg.reply_text("Введите цену продажи в USD.\n\nПример: <code>9.5</code>", parse_mode="HTML")
         return
@@ -5960,6 +6003,9 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         currency = "USD" if region == "US" else "TRY"
         title = f"Apple Gift Card USA ${amount:g}" if region == "US" else f"Apple Gift Card Turkey {amount:g}₺"
         catalog = get_apple_id_products()
+        if not is_valid_apple_id_nominal(region, currency, amount):
+            await msg.reply_text("Номинал вне допустимого диапазона: USA $1–$200 или Turkey 100–2000₺.", parse_mode="HTML")
+            return
         catalog.setdefault(region, []).append({"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "price_usd": round(price, 2), "enabled": True})
         save_apple_id_products(catalog)
         context.user_data.pop("client_input", None)
