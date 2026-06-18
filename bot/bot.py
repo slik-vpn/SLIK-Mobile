@@ -102,6 +102,7 @@ ABANDONED_CHECKOUT_MAX_AGE_HOURS = 24
 ESIM_EXPIRY_REMINDER_DAYS_BEFORE = env_int("ESIM_EXPIRY_REMINDER_DAYS_BEFORE", 1)
 ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS = env_int("ESIM_EXPIRY_REMINDER_MAX_AGE_DAYS", 60)
 ESIM_EXPIRY_REMINDER_INTERVAL_SECONDS = 60 * 60
+USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS = env_int("USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS", 3600)
 
 
 def is_cashback_enabled() -> bool:
@@ -395,6 +396,7 @@ USD_RUB_INPUT_MARKUP = "usd_rub_markup"
 APPLE_ID_INPUT_PRICE = "apple_id_price"
 APPLE_ID_INPUT_ADD_AMOUNT = "apple_id_add_amount"
 APPLE_ID_INPUT_ADD_PRICE = "apple_id_add_price"
+APPLE_ID_INPUT_MARKUP = "apple_id_markup"
 FAZERCARDS_INPUT_API_KEY = "fazercards_api_key"
 ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
 ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
@@ -929,13 +931,7 @@ def calculate_usd_rub_market_rate(source_results: list[dict]) -> tuple[float, st
 
 
 async def get_usd_rub_rate() -> tuple[float, str]:
-    manual_rate = get_manual_usd_rub_rate()
-    if manual_rate:
-        return round(manual_rate, 4), "manual"
-    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
-        source_results = await collect_usd_rub_source_rates(client)
-    rate, method, _ = calculate_usd_rub_market_rate(source_results)
-    return rate, method
+    return get_final_usd_rub_rate()
 
 
 async def check_market_usd_rub_rate() -> tuple[float, str]:
@@ -1505,15 +1501,12 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("enabled", True)
     item.setdefault("pricing_currency", "RUB")
     item.setdefault("price_rub", "")
-    item.setdefault("pricing_mode", "manual")
+    item.setdefault("pricing_mode", "supplier_markup")
     item.setdefault("supplier_markup_percent", 15)
-    item.setdefault("supplier_min_margin_rub", 180)
-    item.setdefault("ozon_markup_percent", 3)
-    item.setdefault("market_cap_discount_percent", 3)
-    item.setdefault("market_rounding_mode", "up_to_9")
-    item.setdefault("market_auto_update_price", False)
+    item.setdefault("rounding_mode", "up_to_9")
+    item.setdefault("market_rounding_mode", item.get("rounding_mode", "up_to_9"))
     if not isinstance(item.get("market_sources"), list):
-        item["market_sources"] = default_apple_id_market_sources()
+        item["market_sources"] = []
     item.setdefault("fazercards_product_id", "")
     item.setdefault("fazercards_product_name", "")
     item.setdefault("fazercards_category_id", "")
@@ -1522,14 +1515,7 @@ def normalize_apple_id_product(product: dict) -> dict:
     item.setdefault("fazercards_available", None)
     item.setdefault("fazercards_price_usd", None)
     item.setdefault("fazercards_stock", None)
-    existing = {src.get("source"): src for src in item.get("market_sources", []) if isinstance(src, dict)}
-    merged_sources = []
-    for default_src in default_apple_id_market_sources():
-        src = dict(default_src)
-        src.update(existing.get(default_src["source"], {}))
-        src["diagnostics"] = normalize_market_source_diagnostics(src.get("diagnostics"))
-        merged_sources.append(src)
-    item["market_sources"] = merged_sources
+    item["market_sources"] = [src for src in item.get("market_sources", []) if isinstance(src, dict)]
     return item
 
 
@@ -1568,6 +1554,17 @@ def apple_id_product_by_id(product_id: str) -> dict | None:
     return None
 
 
+def get_final_usd_rub_rate() -> tuple[float, str]:
+    manual_rate = get_manual_usd_rub_rate()
+    if manual_rate is not None:
+        return round(manual_rate, 4), "manual"
+    settings = get_usd_rub_settings()
+    cached_rate = normalize_rate(settings.get("final_usd_rub_rate")) or normalize_rate(settings.get("market_usd_rub_rate"))
+    if cached_rate is not None:
+        return round(cached_rate, 4), "auto"
+    return round(USD_RUB_FALLBACK_RATE, 4), "fallback"
+
+
 def apple_id_price_rub_value(product: dict, usd_rub_rate: float | None = None) -> int:
     try:
         price_rub = float(str(product.get("price_rub") or "").replace(",", "."))
@@ -1575,15 +1572,13 @@ def apple_id_price_rub_value(product: dict, usd_rub_rate: float | None = None) -
             return int(round(price_rub))
     except (TypeError, ValueError):
         pass
-    rate = normalize_rate(usd_rub_rate) or get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE
-    try:
-        return int(round(float(product.get("price_usd") or 0) * rate))
-    except (TypeError, ValueError):
-        return 0
+    rec = calculate_apple_id_supplier_markup_price(product, usd_rub_rate)
+    return int(rec.get("recommended_price_rub") or 0)
 
 
 def format_apple_id_client_price(product: dict) -> str:
-    return format_rub(apple_id_price_rub_value(product))
+    price = apple_id_price_rub_value(product)
+    return format_rub(price) if price > 0 else "недоступно"
 
 
 def apple_id_market_checked_at() -> str:
@@ -2124,37 +2119,26 @@ def round_apple_id_market_price(value: float, mode: str) -> int:
     return int(round(float(value or 0)))
 
 
-def calculate_apple_id_recommended_price(product: dict, usd_rub_rate) -> dict:
-    rate = normalize_rate(usd_rub_rate) or USD_RUB_FALLBACK_RATE
-    supplier_price_usd = float(product.get("fazercards_price_usd") or product.get("price_usd") or 0)
+def calculate_apple_id_supplier_markup_price(product: dict, usd_rub_rate=None) -> dict:
+    rate, rate_source = get_final_usd_rub_rate() if usd_rub_rate is None else (normalize_rate(usd_rub_rate) or USD_RUB_FALLBACK_RATE, "manual" if get_manual_usd_rub_rate() else "auto")
+    try:
+        supplier_price_usd = float(product.get("fazercards_price_usd") or product.get("price_usd") or 0)
+    except (TypeError, ValueError):
+        supplier_price_usd = 0.0
+    try:
+        markup_percent = float(product.get("supplier_markup_percent") if product.get("supplier_markup_percent") not in (None, "") else 15)
+    except (TypeError, ValueError):
+        markup_percent = 15.0
+    if supplier_price_usd <= 0:
+        return {"pricing_mode": "supplier_markup", "recommended_price_rub": 0, "supplier_price_usd": 0, "supplier_cost_rub": 0, "supplier_markup_percent": markup_percent, "estimated_margin_rub": 0, "usd_rub_rate_used": rate, "usd_rub_rate_source": rate_source, "pricing_error": "supplier_price_missing"}
     supplier_cost_rub = supplier_price_usd * rate
-    min_safe_price = supplier_cost_rub + float(product.get("supplier_min_margin_rub") or 180)
-    supplier_markup_price = supplier_cost_rub * (1 + float(product.get("supplier_markup_percent") or 15) / 100)
-    ozon_price = None
-    medians = []
-    for src in product.get("market_sources", []):
-        if not src.get("enabled", True) or src.get("status") != "ok" or src.get("match_confidence") != "exact":
-            continue
-        if src.get("source") == "Ozon/Multitransfer" and str(src.get("matched_nominal")) == apple_id_nominal_text(product) and str(src.get("matched_currency")) == str(product.get("currency")):
-            ozon_price = valid_market_price_rub(src.get("last_price_rub"))
-        if src.get("source") in ("Plati", "GGSEL"):
-            median = valid_market_price_rub(src.get("last_median_price_rub"))
-            if median:
-                medians.append(median)
-    ozon_target = ozon_price * (1 + float(product.get("ozon_markup_percent") or 3) / 100) if ozon_price else None
-    digital_market_median = sorted(medians)[len(medians)//2] if medians else None
-    market_cap = digital_market_median * (1 - float(product.get("market_cap_discount_percent") or 3) / 100) if digital_market_median else None
-    mode = product.get("pricing_mode") or "manual"
-    base = max([min_safe_price, supplier_markup_price] + ([ozon_target] if ozon_target else []))
-    recommended = base
-    if mode == "supplier_markup":
-        recommended = max(min_safe_price, supplier_markup_price)
-    elif mode == "ozon_plus":
-        recommended = base
-    elif mode == "market_corridor" and market_cap:
-        recommended = max(min(base, market_cap), min_safe_price)
-    rounded = round_apple_id_market_price(recommended, str(product.get("market_rounding_mode") or "up_to_9"))
-    return {"pricing_mode": mode, "recommended_price_rub": rounded, "supplier_cost_rub": round(supplier_cost_rub), "min_safe_price_rub": round(min_safe_price), "supplier_markup_price_rub": round(supplier_markup_price), "ozon_price_rub": ozon_price, "ozon_target_rub": round(ozon_target) if ozon_target else None, "digital_market_median_rub": digital_market_median, "market_cap_rub": round(market_cap) if market_cap else None, "estimated_margin_rub": round(rounded - supplier_cost_rub), "usd_rub_rate_used": rate}
+    recommended = supplier_cost_rub * (1 + markup_percent / 100)
+    rounded = round_apple_id_market_price(recommended, str(product.get("rounding_mode") or product.get("market_rounding_mode") or "up_to_9"))
+    return {"pricing_mode": "supplier_markup", "recommended_price_rub": rounded, "supplier_price_usd": supplier_price_usd, "supplier_cost_rub": round(supplier_cost_rub), "supplier_markup_percent": markup_percent, "estimated_margin_rub": round(rounded - supplier_cost_rub), "usd_rub_rate_used": rate, "usd_rub_rate_source": rate_source}
+
+
+def calculate_apple_id_recommended_price(product: dict, usd_rub_rate=None) -> dict:
+    return calculate_apple_id_supplier_markup_price(product, usd_rub_rate)
 
 
 def get_fazercards_settings() -> dict:
@@ -2342,8 +2326,10 @@ def mask_secret(value) -> str:
 
 
 def apple_id_product_plan(product: dict) -> dict:
+    recommendation = calculate_apple_id_supplier_markup_price(product)
     price_rub = apple_id_price_rub_value(product)
-    recommendation = calculate_apple_id_recommended_price(product, get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE)
+    if price_rub <= 0:
+        price_rub = int(recommendation.get("recommended_price_rub") or 0)
     return {
         "gb": product["title"],
         "days": "ручная выдача",
@@ -2361,12 +2347,9 @@ def apple_id_product_plan(product: dict) -> dict:
         "usd_rub_rate_used": recommendation.get("usd_rub_rate_used"),
         "supplier_cost_rub": recommendation.get("supplier_cost_rub"),
         "estimated_margin_rub": recommendation.get("estimated_margin_rub"),
-        "pricing_mode": product.get("pricing_mode", "manual"),
-        "market_sources_snapshot": product.get("market_sources", []),
-        "ozon_price_rub_used": recommendation.get("ozon_price_rub"),
-        "ozon_match_confidence": next((s.get("match_confidence") for s in product.get("market_sources", []) if s.get("source") == "Ozon/Multitransfer"), ""),
-        "plati_median_price_rub_used": next((s.get("last_median_price_rub") for s in product.get("market_sources", []) if s.get("source") == "Plati"), ""),
-        "ggsel_median_price_rub_used": next((s.get("last_median_price_rub") for s in product.get("market_sources", []) if s.get("source") == "GGSEL"), ""),
+        "usd_rub_rate_source": recommendation.get("usd_rub_rate_source"),
+        "supplier_markup_percent": recommendation.get("supplier_markup_percent"),
+        "pricing_mode": "supplier_markup",
         "fazercards_mapped": bool(product.get("fazercards_product_id")),
         "fazercards_product_id": product.get("fazercards_product_id", ""),
         "fazercards_product_name": product.get("fazercards_product_name", ""),
@@ -4942,6 +4925,9 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("Товар не найден.", show_alert=True)
         return ConversationHandler.END
     plan = apple_id_product_plan(product)
+    if apple_id_payment_amount_rub(plan) <= 0:
+        await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
+        return ConversationHandler.END
     context.user_data["plan_key"] = product_id
     context.user_data["plan"] = plan
     order = create_apple_id_checkout_order(query.from_user, product)
@@ -5281,13 +5267,10 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "supplier_price_usd": plan.get("supplier_price_usd"),
             "usd_rub_rate_used": plan.get("usd_rub_rate_used"),
             "supplier_cost_rub": plan.get("supplier_cost_rub"),
+            "usd_rub_rate_source": plan.get("usd_rub_rate_source"),
+            "supplier_markup_percent": plan.get("supplier_markup_percent"),
             "estimated_margin_rub": plan.get("estimated_margin_rub"),
-            "pricing_mode": plan.get("pricing_mode"),
-            "market_sources_snapshot": plan.get("market_sources_snapshot"),
-            "ozon_price_rub_used": plan.get("ozon_price_rub_used"),
-            "ozon_match_confidence": plan.get("ozon_match_confidence"),
-            "plati_median_price_rub_used": plan.get("plati_median_price_rub_used"),
-            "ggsel_median_price_rub_used": plan.get("ggsel_median_price_rub_used"),
+            "pricing_mode": "supplier_markup",
             "country": APPLE_ID_REGION_TITLES.get(plan.get("region"), plan.get("region", "—")),
         })
     payment_details = order_payment_details_from_context(context)
@@ -5545,6 +5528,28 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         context.user_data.pop("notification_chat_kind", None)
         await msg.reply_text("✅ Чат уведомлений сохранён.", parse_mode="HTML", reply_markup=notification_chat_detail_keyboard(kind))
+        return
+
+    if input_mode == APPLE_ID_INPUT_MARKUP:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        product_id = str(context.user_data.get("apple_id_product_id") or "")
+        try:
+            markup = float(msg.text.strip().replace(",", "."))
+        except ValueError:
+            markup = -1
+        if markup < 0 or markup > 300:
+            await msg.reply_text("Введите число от 0 до 300, например <code>15</code>.", parse_mode="HTML")
+            return
+        product = set_apple_id_product(product_id, {"supplier_markup_percent": round(markup, 4), "pricing_mode": "supplier_markup"})
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("apple_id_product_id", None)
+        if not product:
+            await msg.reply_text("Товар не найден.", reply_markup=apple_id_catalog_keyboard())
+            return
+        await msg.reply_text("✅ Наценка обновлена.", parse_mode="HTML", reply_markup=apple_id_pricing_keyboard(product))
         return
 
     if input_mode == APPLE_ID_INPUT_PRICE:
@@ -6604,73 +6609,47 @@ def apple_id_admin_product_keyboard(product: dict) -> InlineKeyboardMarkup:
 
 
 def apple_id_pricing_text(product: dict) -> str:
-    rate = get_manual_usd_rub_rate() or load_config().get("usd_rub", {}).get("final_usd_rub_rate") or USD_RUB_FALLBACK_RATE
-    rec = calculate_apple_id_recommended_price(product, rate)
-    sources = {src.get("source"): src for src in product.get("market_sources", [])}
-    ozon = sources.get("Ozon/Multitransfer", {})
-    plati = sources.get("Plati", {})
-    ggsel = sources.get("GGSEL", {})
-    nominal = apple_nominal_text(product)
-    def diag_lines(src: dict, labels: tuple[str, str, str]) -> str:
-        diagnostics = normalize_market_source_diagnostics(src.get("diagnostics"))
-        status_label, exact_label, prices_label = labels
-        details = diagnostics.get("last_error_details") or src.get("error") or "—"
-        return (
-            f"{status_label}: {html_escape(str(src.get('status') or ''))}\n"
-            f"Ошибка: {html_escape(str(src.get('error') or '—'))}\n"
-            f"HTTP: {html_escape(str(diagnostics.get('http_status') or '—'))}\n"
-            f"HTML: {html_escape(str(diagnostics.get('html_length') or 0))} символов\n"
-            f"Фрагментов: {html_escape(str(diagnostics.get('fragments_found') or 0))}\n"
-            f"Scripts: {html_escape(str(diagnostics.get('scripts_found') or 0))}, JSON scripts: {html_escape(str(diagnostics.get('json_scripts_found') or 0))}\n"
-            f"API candidates: {html_escape(str(len(diagnostics.get('api_url_candidates') or [])))}\n"
-            f"{exact_label}: {html_escape(str(diagnostics.get('exact_fragments_found') or 0))}\n"
-            f"{prices_label}: {html_escape(str(diagnostics.get('prices_found') or 0))}\n"
-            f"Детали: {html_escape(str(details))}"
-        )
+    rec = calculate_apple_id_supplier_markup_price(product)
+    rate_source = rec.get("usd_rub_rate_source") or "fallback"
+    markup = rec.get("supplier_markup_percent")
+    if rec.get("pricing_error"):
+        price_line = "⚠️ Не задана закупочная цена FazerCards/price_usd. Цена и оплата недоступны."
+    else:
+        price_line = f"Рекомендованная цена: <b>{format_rub(rec['recommended_price_rub'])}</b>"
     return (
         f"💰 <b>Ценообразование</b>\n\n"
         f"{html_escape(apple_id_display_title_with_nominal(product))}\n\n"
         f"Цена клиента: <b>{html_escape(format_apple_id_client_price(product))}</b>\n"
-        f"Валюта продажи: <b>RUB</b>\n\n"
-        f"Закуп FazerCards: <b>{html_escape(format_usd(product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
+        f"Закуп FazerCards: <b>{html_escape(format_usd(rec.get('supplier_price_usd') or product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
         f"Курс USD/RUB: <b>{float(rec['usd_rub_rate_used']):g}</b>\n"
-        f"Себестоимость: <b>{format_rub(rec['supplier_cost_rub'])}</b>\n\n"
-        f"Ozon/Multitransfer:\n{diag_lines(ozon, ('Статус', 'Exact фрагментов', 'Цен найдено'))}\nЦена exact: {html_escape(str(ozon.get('last_price_rub') or '—'))} ₽\nOzon + {html_escape(str(product.get('ozon_markup_percent', 3)))}%: {format_rub(rec['ozon_target_rub']) if rec.get('ozon_target_rub') else '—'}\nСовпадение: {html_escape(str(ozon.get('match_confidence') or 'none'))}\n\n"
-        f"Plati:\n{diag_lines(plati, ('Статус', 'Exact', 'Цен'))}\nНайдено exact: {html_escape(str(plati.get('matched_count') or 0))}\nМин: {html_escape(str(plati.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(plati.get('last_median_price_rub') or '—'))} ₽\n\n"
-        f"GGSEL:\n{diag_lines(ggsel, ('Статус', 'Exact', 'Цен'))}\nНайдено exact: {html_escape(str(ggsel.get('matched_count') or 0))}\nМин: {html_escape(str(ggsel.get('last_min_price_rub') or '—'))} ₽\nМедиана: {html_escape(str(ggsel.get('last_median_price_rub') or '—'))} ₽\n\n"
-        f"Рыночный коридор:\nНижняя граница: {format_rub(rec['min_safe_price_rub'])}\nВерхняя граница: {format_rub(rec['market_cap_rub']) if rec.get('market_cap_rub') else '—'}\nРекомендованная цена: <b>{format_rub(rec['recommended_price_rub'])}</b>\nМаржа: {format_rub(rec['estimated_margin_rub'])}"
+        f"Источник курса: <b>{html_escape(str(rate_source))}</b>\n"
+        f"Себестоимость: <b>{format_rub(rec['supplier_cost_rub'])}</b>\n"
+        f"Наценка: <b>{float(markup):g}%</b>\n"
+        f"{price_line}\n"
+        f"Маржа: <b>{format_rub(rec['estimated_margin_rub'])}</b>"
     )
 
 
 def apple_id_pricing_keyboard(product: dict) -> InlineKeyboardMarkup:
     pid = product['id']
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Режим: {product.get('pricing_mode', 'manual')}", callback_data=f"admin_apple_id_pricing_mode:{pid}")],
-        [InlineKeyboardButton("🔄 Обновить Ozon", callback_data=f"admin_apple_id_pricing_refresh:ozon:{pid}"), InlineKeyboardButton("🔄 Обновить Plati", callback_data=f"admin_apple_id_pricing_refresh:plati:{pid}")],
-        [InlineKeyboardButton("🔄 Обновить GGSEL", callback_data=f"admin_apple_id_pricing_refresh:ggsel:{pid}"), InlineKeyboardButton("🔄 Обновить все источники", callback_data=f"admin_apple_id_pricing_refresh:all:{pid}")],
-        [InlineKeyboardButton("🧪 Диагностика Ozon", callback_data=f"admin_apple_id_pricing_debug:ozon:{pid}"), InlineKeyboardButton("🧪 Диагностика Plati", callback_data=f"admin_apple_id_pricing_debug:plati:{pid}")],
-        [InlineKeyboardButton("🧪 Диагностика GGSEL", callback_data=f"admin_apple_id_pricing_debug:ggsel:{pid}")],
-        [InlineKeyboardButton("📈 Рассчитать цену", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("✅ Применить рекомендованную цену", callback_data=f"admin_apple_id_pricing_apply:{pid}")],
-        [InlineKeyboardButton("Изменить Ozon +%", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("Изменить мин. маржу ₽", callback_data=f"admin_apple_id_pricing:{pid}")],
-        [InlineKeyboardButton("Изменить наценку %", callback_data=f"admin_apple_id_pricing:{pid}"), InlineKeyboardButton("Округление", callback_data=f"admin_apple_id_pricing_round:{pid}")],
+        [InlineKeyboardButton("Изменить наценку %", callback_data=f"admin_apple_id_pricing_markup:{pid}")],
+        [InlineKeyboardButton("📈 Рассчитать цену", callback_data=f"admin_apple_id_pricing:{pid}")],
+        [InlineKeyboardButton("✅ Применить рекомендованную цену", callback_data=f"admin_apple_id_pricing_apply:{pid}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{pid}")],
     ])
 
 def apple_id_pricing_apply_confirm_text(product: dict) -> str:
-    rec = calculate_apple_id_recommended_price(product, get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE)
-    sources = {src.get("source"): src for src in product.get("market_sources", [])}
-    ozon = sources.get("Ozon/Multitransfer", {})
-    plati = sources.get("Plati", {})
-    ggsel = sources.get("GGSEL", {})
+    rec = calculate_apple_id_supplier_markup_price(product)
     return (
         "✅ <b>Подтвердите применение цены</b>\n\n"
         f"Текущая цена: <b>{html_escape(format_apple_id_client_price(product))}</b>\n"
-        f"Рекомендованная цена: <b>{format_rub(rec['recommended_price_rub'])}</b>\n"
-        f"Ozon exact: {html_escape(str(ozon.get('last_price_rub') or '—'))} ₽\n"
-        f"Plati median: {html_escape(str(plati.get('last_median_price_rub') or '—'))} ₽\n"
-        f"GGSEL median: {html_escape(str(ggsel.get('last_median_price_rub') or '—'))} ₽\n"
-        f"Закуп FazerCards: <b>{html_escape(format_usd(product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
+        f"Новая цена: <b>{format_rub(rec['recommended_price_rub'])}</b>\n"
+        f"Закуп FazerCards: <b>{html_escape(format_usd(rec.get('supplier_price_usd') or product.get('fazercards_price_usd') or product.get('price_usd')))}</b>\n"
+        f"Курс USD/RUB: <b>{float(rec['usd_rub_rate_used']):g}</b>\n"
+        f"Источник курса: <b>{html_escape(str(rec.get('usd_rub_rate_source') or 'fallback'))}</b>\n"
         f"Себестоимость: <b>{format_rub(rec['supplier_cost_rub'])}</b>\n"
+        f"Наценка: <b>{float(rec.get('supplier_markup_percent') or 0):g}%</b>\n"
         f"Маржа: <b>{format_rub(rec['estimated_margin_rub'])}</b>"
     )
 
@@ -7407,6 +7386,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["apple_id_product_id"] = product_id
         await query.answer()
         await edit_or_send(query, context, "Введите новую цену продажи в RUB.\n\nНапример: <code>1089</code>", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_product:{product_id}")]]))
+    elif data.startswith("admin_apple_id_pricing_markup:"):
+        if not has_catalog_admin_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        product_id = data.split(":", 1)[1]
+        context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP
+        context.user_data["apple_id_product_id"] = product_id
+        await query.answer()
+        await edit_or_send(query, context, "Введите наценку % от 0 до 300. Например: <code>15</code>", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_pricing:{product_id}")]]))
     elif data.startswith("admin_apple_id_pricing:"):
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
@@ -7422,9 +7410,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
             return
         product = apple_id_product_by_id(data.split(":", 1)[1])
-        modes = ["manual", "supplier_markup", "ozon_plus", "market_corridor"]
-        current = product.get("pricing_mode", "manual") if product else "manual"
-        product = set_apple_id_product(product["id"], {"pricing_mode": modes[(modes.index(current) + 1) % len(modes)] if current in modes else "manual"}) if product else None
+        product = set_apple_id_product(product["id"], {"pricing_mode": "supplier_markup"}) if product else None
         await query.answer("Режим сохранён.")
         await edit_or_send(query, context, apple_id_pricing_text(product), apple_id_pricing_keyboard(product))
     elif data.startswith("admin_apple_id_pricing_round:"):
@@ -7479,8 +7465,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not product:
             await query.answer("Товар не найден.", show_alert=True)
             return
-        rec = calculate_apple_id_recommended_price(product, get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE)
-        product = set_apple_id_product(product["id"], {"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "supplier_cost_rub": rec["supplier_cost_rub"], "estimated_margin_rub": rec["estimated_margin_rub"], "market_sources_snapshot": product.get("market_sources", [])})
+        rec = calculate_apple_id_supplier_markup_price(product)
+        if rec.get("recommended_price_rub", 0) <= 0:
+            await query.answer("Не задана закупочная цена.", show_alert=True)
+            return
+        product = set_apple_id_product(product["id"], {"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_price_usd": rec["supplier_price_usd"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
         await query.answer("Рекомендованная цена применена вручную.")
         await edit_or_send(query, context, apple_id_pricing_text(product), apple_id_pricing_keyboard(product))
     elif data.startswith("admin_apple_id_pricing_apply:"):
@@ -7999,6 +7988,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Неизвестная команда")
 
 
+async def usd_rub_auto_refresh_loop() -> None:
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await refresh_usd_rub_rate_check()
+            logger.info("USD/RUB auto refresh completed")
+        except Exception as exc:
+            logger.warning("USD/RUB auto refresh failed; keeping last successful rate: %s", exc)
+        await asyncio.sleep(USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS)
+
+
+def schedule_usd_rub_auto_refresh(app: Application) -> None:
+    app.create_task(usd_rub_auto_refresh_loop(), name="usd_rub_auto_refresh")
+
+
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
@@ -8030,6 +8034,7 @@ async def post_init(app: Application) -> None:
     schedule_automatic_backups(app)
     schedule_abandoned_checkout_reminders(app)
     schedule_esim_expiry_reminders(app)
+    schedule_usd_rub_auto_refresh(app)
 
 
 # ─── main ─────────────────────────────────────────────────────────────────────
