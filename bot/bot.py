@@ -2517,12 +2517,12 @@ def fazercards_cards_from_payload(payload: dict) -> list[dict]:
         value = payload.get(field)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
-    data = payload.get("data")
-    if isinstance(data, dict):
-        for field in ("offers", "items", "cards", "products"):
-            value = data.get(field)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
+    for container in (payload.get("data"), payload.get("result")):
+        if isinstance(container, dict):
+            for field in ("offers", "items", "cards", "data", "products"):
+                value = container.get(field)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
     return []
 
 
@@ -2914,6 +2914,11 @@ def is_telegram_premium_branding(text: str) -> bool:
     return has_telegram and has_premium
 
 
+def is_telegram_fazercards_category(text: str) -> bool:
+    low = str(text or "").lower().replace("ё", "е")
+    return bool(re.search(r"\btelegram\b|\btg\b|телеграм", low))
+
+
 def extract_telegram_stars_nominal_from_text(text):
     raw = str(text or "")
     low = raw.lower().replace("ё", "е")
@@ -3093,41 +3098,79 @@ def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict |
     return item
 
 
+def telegram_fazercards_sync_report_text(report: dict) -> str:
+    lines = [
+        "🔗 <b>FazerCards Telegram sync</b>",
+        "",
+        f"Категорий проверено: {report.get('categories_scanned', 0)}",
+        f"Telegram категорий найдено: {report.get('telegram_categories_found', 0)}",
+        f"Карточек проверено: {report.get('cards_scanned', 0)}",
+        f"Stars найдено: {report.get('stars_candidates_found', 0)}",
+        f"Premium найдено: {report.get('premium_candidates_found', 0)}",
+        f"Pending Stars: {report.get('pending_stars_count', 0)}",
+        f"Pending Premium: {report.get('pending_premium_count', 0)}",
+        f"Обновлено: {report.get('updated', 0)}",
+        f"Not found: {report.get('not_found', 0)}",
+        f"Unsupported: {report.get('unsupported', 0)}",
+        f"Ошибки: {report.get('errors', 0)}",
+    ]
+    samples = report.get("samples") or []
+    if report.get("cards_scanned", 0) > 0 and not (report.get("stars_candidates_found") or report.get("premium_candidates_found")) and samples:
+        lines.extend(["", "Samples:"])
+        lines.extend(f"• {html_escape(str(sample))}" for sample in samples[:5])
+    if report.get("error"):
+        lines.extend(["", f"Ошибка: <code>{html_escape(str(report.get('error')))}</code>"])
+    return "\n".join(lines)
+
+
 async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
-    report = {"ok": True, "updated": 0, "pending": 0, "not_found": 0, "unsupported": 0, "errors": 0, "lines": []}
+    report = {"ok": True, "categories_scanned": 0, "telegram_categories_found": 0, "cards_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "samples": [], "lines": []}
     products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
-    items = products_payload.get("items") if isinstance(products_payload, dict) else []
-    if not products_payload.get("ok") or not isinstance(items, list):
-        report.update({"ok": False, "errors": 1, "error": products_payload.get("error") or "giftcards_fetch_failed"})
+    items = fazercards_cards_from_payload(products_payload)
+    if not isinstance(products_payload, dict) or not products_payload.get("ok") or not items:
+        error = products_payload.get("error") if isinstance(products_payload, dict) else "giftcards_fetch_failed"
+        report.update({"ok": False, "errors": 1, "error": error or "giftcards_fetch_failed"})
         return report
     found_stars, found_premium = {}, {}
     for category in items:
+        report["categories_scanned"] += 1
         category_text = fazercards_product_value(category, "name") or str(category)
-        if not (is_telegram_stars_branding(category_text) or is_telegram_premium_branding(category_text) or "telegram" in category_text.lower() or "телеграм" in category_text.lower()):
+        if not is_telegram_fazercards_category(category_text):
             continue
+        report["telegram_categories_found"] += 1
+        if len(report["samples"]) < 5:
+            report["samples"].append(category_text)
         category_id = fazercards_category_id_value(category)
         payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
-        cards = payload.get("items") if isinstance(payload, dict) else []
-        if not payload.get("ok") or not isinstance(cards, list):
+        cards = fazercards_cards_from_payload(payload)
+        if not payload.get("ok") or not cards:
             report["errors"] += 1; continue
+        report["cards_scanned"] += len(cards)
         for card in cards:
+            if len(report["samples"]) < 5:
+                report["samples"].append(f"{category_text} / {fazercards_product_value(card, 'name') or str(card)}")
             for k, found in (("stars", found_stars), ("premium", found_premium)):
                 if kind not in ("all", k): continue
                 pos = _telegram_supplier_position(category, card, k)
                 if not pos: continue
                 if pos.get("unsupported"):
                     report["unsupported"] += 1; continue
+                if k == "stars":
+                    report["stars_candidates_found"] += 1
+                else:
+                    report["premium_candidates_found"] += 1
                 found[pos["id"]] = pos
+    supplier_read_ok = report["cards_scanned"] > 0
     if kind in ("all", "stars"):
         catalog = telegram_stars_products(); ids = {p.get("id") for p in catalog}
         for p in catalog:
             match = found_stars.get(p.get("id"))
             if match:
                 enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
-            else:
+            elif supplier_read_ok:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_stars.items() if k not in ids]
-        cfg = load_config(); cfg["telegram_stars_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending"] += len(pending)
+        cfg = load_config(); cfg["telegram_stars_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending_stars_count"] = len(pending[:100])
         save_telegram_stars_products(catalog)
     if kind in ("all", "premium"):
         catalog = telegram_premium_products(); ids = {p.get("id") for p in catalog}
@@ -3135,11 +3178,12 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
             match = found_premium.get(p.get("id"))
             if match:
                 enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
-            else:
+            elif supplier_read_ok:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_premium.items() if k not in ids]
-        cfg = load_config(); cfg["telegram_premium_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending"] += len(pending)
+        cfg = load_config(); cfg["telegram_premium_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending_premium_count"] = len(pending[:100])
         save_telegram_premium_products(catalog)
+    report["pending"] = report["pending_stars_count"] + report["pending_premium_count"]
     return report
 
 
@@ -4917,7 +4961,7 @@ def admin_telegram_services_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔗 Синхронизировать Premium", callback_data="admin_telegram_sync_premium")],
         [InlineKeyboardButton("🔗 Синхронизировать всё", callback_data="admin_telegram_sync_all")],
         [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_telegram_supplier_found_disabled")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="admin_business")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
 
 
@@ -8601,7 +8645,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Синхронизирую FazerCards...")
         kind = "stars" if data.endswith("stars") else ("premium" if data.endswith("premium") else "all")
         report = await sync_telegram_fazercards_bulk(kind)
-        await edit_or_send(query, context, f"🔗 <b>FazerCards Telegram sync</b>\n\nОбновлено: {report.get('updated')}\nPending: {report.get('pending')}\nNot found: {report.get('not_found')}\nUnsupported: {report.get('unsupported')}\nОшибки: {report.get('errors')}", admin_telegram_services_keyboard())
+        await edit_or_send(query, context, telegram_fazercards_sync_report_text(report), admin_telegram_services_keyboard())
     elif data in {"admin_telegram_add_pending_stars", "admin_telegram_add_pending_premium"}:
         await query.answer()
         kind = "stars" if data.endswith("stars") else "premium"
