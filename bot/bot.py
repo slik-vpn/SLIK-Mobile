@@ -2903,7 +2903,7 @@ def telegram_services_pricing_settings() -> dict:
 def is_telegram_stars_branding(text: str) -> bool:
     low = str(text or "").lower().replace("ё", "е")
     has_telegram = bool(re.search(r"\btelegram\b|\btg\b|телеграм", low))
-    has_stars = bool(re.search(r"\bstars?\b|звезд|⭐|\bxtr\b", low))
+    has_stars = bool(re.search(r"\bstars?\b|звезд|зв\.|\bзв\b|⭐|☆|★|\bxtr\b", low))
     return has_telegram and has_stars
 
 
@@ -2922,12 +2922,12 @@ def is_telegram_fazercards_category(text: str) -> bool:
 def extract_telegram_stars_nominal_from_text(text):
     raw = str(text or "")
     low = raw.lower().replace("ё", "е")
-    if re.search(r"\d+\s*(?:-|–|—|to|до)\s*\d+|(?:from|от)\s*\d+|\d+[\.,]\d+", low):
+    if re.search(r"\d+\s*(?:-|–|—|\bto\b|\bдо\b)\s*\d+|(?:\bfrom\b|\bот\b)\s*\d+|\d+[\.,]\d+", low):
         return None
-    token = r"(?:stars?|⭐|xtr|звезд[а-я]*)"
+    token = r"(?:stars?|⭐|☆|★|xtr|зв\.|\bзв\b|звезд[а-я]*)"
     candidates = []
     for pattern in (rf"(?<![\d.,])(\d{{1,5}})\s*{token}", rf"{token}\s*(\d{{1,5}})(?![\d.,])"):
-        for m in re.finditer(pattern, low):
+        for m in re.finditer(pattern, low, re.I):
             try:
                 candidates.append(int(m.group(1)))
             except ValueError:
@@ -3075,9 +3075,10 @@ def telegram_product_plan(product: dict, product_type: str) -> dict:
 
 
 def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict | None:
-    category_name = fazercards_product_value(category, "name") or str(category)
-    card_name = fazercards_product_value(card, "name") or str(card)
-    text = f"{category_name} {card_name}"
+    category_text = fazercards_text_blob(category)
+    card_text = fazercards_text_blob(card)
+    text = f"{category_text} {card_text}"
+    card_name = fazercards_product_value(card, "name") or card_text or str(card)
     if kind == "stars":
         if not is_telegram_stars_branding(text): return None
         amount = extract_telegram_stars_nominal_from_text(text)
@@ -3098,12 +3099,20 @@ def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict |
     return item
 
 
+def _fazercards_category_sample(category: dict) -> dict:
+    return {"category_id": fazercards_category_id_value(category), "text": fazercards_text_blob(category)}
+
+
+def _fazercards_card_sample(category_id: str, card: dict) -> dict:
+    return {"category_id": category_id, "card_id": fazercards_product_value(card, "card_id"), "text": fazercards_text_blob(card), "price_usd": fazercards_product_value(card, "price_usd"), "stock": fazercards_product_value(card, "stock")}
+
 def telegram_fazercards_sync_report_text(report: dict) -> str:
     lines = [
         "🔗 <b>FazerCards Telegram sync</b>",
         "",
         f"Категорий проверено: {report.get('categories_scanned', 0)}",
         f"Telegram категорий найдено: {report.get('telegram_categories_found', 0)}",
+        f"Категорий без ID: {report.get('categories_without_id', 0)}",
         f"Карточек проверено: {report.get('cards_scanned', 0)}",
         f"Stars найдено: {report.get('stars_candidates_found', 0)}",
         f"Premium найдено: {report.get('premium_candidates_found', 0)}",
@@ -3114,17 +3123,24 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         f"Unsupported: {report.get('unsupported', 0)}",
         f"Ошибки: {report.get('errors', 0)}",
     ]
-    samples = report.get("samples") or []
-    if report.get("cards_scanned", 0) > 0 and not (report.get("stars_candidates_found") or report.get("premium_candidates_found")) and samples:
-        lines.extend(["", "Samples:"])
-        lines.extend(f"• {html_escape(str(sample))}" for sample in samples[:5])
+    category_samples = report.get("category_samples") or []
+    if category_samples:
+        lines.extend(["", "Samples категорий:"])
+        for idx, sample in enumerate(category_samples[:10], start=1):
+            lines.append(f"{idx}. category_id={html_escape(str(sample.get('category_id') or '—'))} | text={html_escape(str(sample.get('text') or '—'))[:500]}")
+    card_samples = report.get("card_samples") or []
+    if card_samples:
+        lines.extend(["", "Samples cards:"])
+        for idx, sample in enumerate(card_samples[:10], start=1):
+            lines.append(f"{idx}. category_id={html_escape(str(sample.get('category_id') or '—'))} | card_id={html_escape(str(sample.get('card_id') or '—'))} | text={html_escape(str(sample.get('text') or '—'))[:400]} | price_usd={html_escape(str(sample.get('price_usd') or '—'))} | stock={html_escape(str(sample.get('stock') or '—'))}")
+    if report.get("cards_scanned", 0) == 0:
+        lines.extend(["", "Cards не проверялись. Возможная причина: category_id не извлекается."])
     if report.get("error"):
         lines.extend(["", f"Ошибка: <code>{html_escape(str(report.get('error')))}</code>"])
     return "\n".join(lines)
 
-
 async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
-    report = {"ok": True, "categories_scanned": 0, "telegram_categories_found": 0, "cards_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "samples": [], "lines": []}
+    report = {"ok": True, "categories_scanned": 0, "telegram_categories_found": 0, "categories_without_id": 0, "cards_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "samples": [], "category_samples": [], "card_samples": [], "lines": []}
     products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
     items = fazercards_cards_from_payload(products_payload)
     if not isinstance(products_payload, dict) or not products_payload.get("ok") or not items:
@@ -3134,21 +3150,31 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
     found_stars, found_premium = {}, {}
     for category in items:
         report["categories_scanned"] += 1
-        category_text = fazercards_product_value(category, "name") or str(category)
-        if not is_telegram_fazercards_category(category_text):
-            continue
-        report["telegram_categories_found"] += 1
-        if len(report["samples"]) < 5:
-            report["samples"].append(category_text)
+        category_text = fazercards_text_blob(category)
+        if is_telegram_fazercards_category(category_text):
+            report["telegram_categories_found"] += 1
+        if len(report["category_samples"]) < 10:
+            report["category_samples"].append(_fazercards_category_sample(category))
         category_id = fazercards_category_id_value(category)
+        if not category_id:
+            report["categories_without_id"] += 1
+            continue
         payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
         cards = fazercards_cards_from_payload(payload)
-        if not payload.get("ok") or not cards:
+        if not payload.get("ok"):
             report["errors"] += 1; continue
+        if not cards:
+            continue
         report["cards_scanned"] += len(cards)
         for card in cards:
-            if len(report["samples"]) < 5:
-                report["samples"].append(f"{category_text} / {fazercards_product_value(card, 'name') or str(card)}")
+            card_text = fazercards_text_blob(card)
+            combined_text = f"{category_text} {card_text}"
+            if is_telegram_fazercards_category(combined_text) and not is_telegram_fazercards_category(category_text):
+                report["telegram_categories_found"] += 1
+            if len(report["card_samples"]) < 10:
+                report["card_samples"].append(_fazercards_card_sample(category_id, card))
+            if len(report["samples"]) < 10:
+                report["samples"].append(combined_text)
             for k, found in (("stars", found_stars), ("premium", found_premium)):
                 if kind not in ("all", k): continue
                 pos = _telegram_supplier_position(category, card, k)
@@ -8000,20 +8026,42 @@ def set_apple_id_product(product_id: str, updates: dict) -> dict | None:
 
 
 def fazercards_category_id_value(item: dict) -> str:
-    for field in ("category_id", "categoryId", "id", "slug", "code"):
+    for field in ("id", "categoryId", "category_id", "giftcard_id", "giftcardId", "product_id", "productId", "uuid", "slug", "code"):
         value = item.get(field)
         if value not in (None, ""):
             return str(value)
     return ""
 
+def fazercards_text_blob(item) -> str:
+    fields = {"name", "title", "label", "caption", "slug", "code", "product_name", "productName", "category_name", "categoryName", "name_ru", "name_en", "title_ru", "title_en", "description", "short_description", "shortDescription", "type", "service", "provider", "brand", "translations", "attributes"}
+    chunks = []
+    def collect(value):
+        if value in (None, ""):
+            return
+        if isinstance(value, (str, int, float, bool)):
+            chunks.append(str(value))
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                if k in fields or isinstance(v, (dict, list)):
+                    collect(v)
+        elif isinstance(value, list):
+            for v in value:
+                collect(v)
+    if isinstance(item, dict):
+        for field in fields:
+            collect(item.get(field))
+    else:
+        collect(item)
+    return " ".join(chunks)
+
 def fazercards_product_value(item: dict, key: str) -> str:
     aliases = {
         "id": ("supplier_product_id", "supplierProductId", "product_id", "productId", "card_id", "cardId", "id", "slug", "code", "sku"),
-        "category_id": ("category_id", "categoryId"),
-        "card_id": ("card_id", "cardId", "supplier_product_id", "supplierProductId", "product_id", "productId", "id"),
-        "name": ("name", "title", "product_name", "productName"),
-        "price_usd": ("price_usd", "priceUsd", "price", "usd_price", "usdPrice"),
-        "stock": ("stock", "quantity", "available", "available_count", "availableCount"),
+        "category_id": ("category_id", "categoryId", "id", "giftcard_id", "giftcardId", "product_id", "productId", "uuid"),
+        "card_id": ("card_id", "cardId", "id", "offer_id", "offerId", "sku", "supplier_product_id", "supplierProductId", "product_id", "productId"),
+        "name": ("name", "title", "label", "caption", "product_name", "productName", "name_ru", "name_en", "title_ru", "title_en"),
+        "price_usd": ("price_usd", "priceUsd", "price", "usd_price", "usdPrice", "amount_usd", "amountUsd"),
+        "stock": ("stock", "quantity", "available", "count", "in_stock", "inStock", "available_count", "availableCount"),
     }
     for field in aliases[key]:
         value = item.get(field)
