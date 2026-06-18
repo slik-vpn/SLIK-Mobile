@@ -6166,7 +6166,10 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             return
         context.user_data["apple_id_add_amount"] = int(amount)
         context.user_data["client_input"] = APPLE_ID_INPUT_ADD_PRICE
-        await msg.reply_text("Введите цену продажи в RUB.\n\nПример: <code>9.5</code>", parse_mode="HTML")
+        if region == "RU":
+            await msg.reply_text("Введите цену продажи в RUB.\n\nПример: <code>1000</code>", parse_mode="HTML")
+        else:
+            await msg.reply_text("Введите цену продажи в USD.\n\nПример: <code>9.5</code>", parse_mode="HTML")
         return
 
     if input_mode == APPLE_ID_INPUT_ADD_PRICE:
@@ -6195,7 +6198,12 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         if not is_valid_apple_id_nominal(region, currency, amount):
             await msg.reply_text("Номинал вне допустимого диапазона: USA $1–$200, Turkey 100–2000₺ или Russia 100–15000₽.", parse_mode="HTML")
             return
-        catalog.setdefault(region, []).append({"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "price_rub": int(round(price)), "pricing_currency": "RUB", "pricing_mode": "supplier_markup", "enabled": True})
+        product = {"id": product_id, "region": region, "title": title, "amount": amount, "currency": currency, "enabled": True}
+        if region == "RU":
+            product.update({"price_rub": int(round(price)), "pricing_currency": "RUB", "pricing_mode": "supplier_markup"})
+        else:
+            product.update({"price_usd": round(price, 2)})
+        catalog.setdefault(region, []).append(product)
         save_apple_id_products(catalog)
         context.user_data.pop("client_input", None)
         context.user_data.pop("apple_id_add_region", None)
