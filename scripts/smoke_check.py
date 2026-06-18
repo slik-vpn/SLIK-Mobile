@@ -159,10 +159,12 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     for handler in handlers:
         check_contains(bot_text, handler, "bot/bot.py menu/handler functions")
 
+    main_menu_block = function_block(bot_text, "main_menu_keyboard")
     record(
-        "main menu contains Apple ID topup button after eSIM",
-        bool(re.search(r"Купить eSIM.*?🍎 Пополнить Apple ID.*?Личный кабинет.*?Поддержка", function_block(bot_text, "main_menu_keyboard"), re.DOTALL)),
+        "main menu contains Apple ID first Telegram Stars second eSIM third",
+        bool(re.search(r"🍎 Пополнить Apple ID.*?⭐ Купить Telegram Stars.*?🌍 Купить eSIM.*?Личный кабинет.*?Поддержка", main_menu_block, re.DOTALL)),
     )
+    record("main menu has no Telegram services label", "Telegram услуги" not in main_menu_block)
     record(
         "Apple ID catalog has USA and Turkey regions",
         "APPLE_ID_PRODUCTS" in bot_text and '"US"' in bot_text and '"TR"' in bot_text
@@ -1107,8 +1109,62 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("recalculate_all_apple_id_prices(apply=True) is not called before access check", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)"))
     record("bulk recalc price_rub is protected by admin access", access_before_call(recalc_confirm_branch, "recalculate_all_apple_id_prices(apply=True)") and '"price_rub": rec["recommended_price_rub"]' in function_block(bot_text, "recalculate_all_apple_id_prices"))
     record("CryptoBot Apple ID amount uses price_rub helper", "apple_id_payment_amount_rub(plan)" in cryptobot_branch and "amount <= 0" in cryptobot_branch)
-    record("card payment amount uses Apple ID RUB helper", 'plan.get("product_type") == "apple_id"' in card_lock_block and "apple_id_payment_amount_rub(plan)" in card_lock_block)
+    record("card payment amount uses Apple ID RUB helper", "apple_id_payment_amount_rub(plan)" in card_lock_block)
     record("auto refresh logs and keeps last successful rate on failure", "logger.warning" in auto_loop_block and "keeping last successful rate" in auto_loop_block)
+
+    telegram_sync_block = function_block(bot_text, "sync_telegram_fazercards_bulk")
+    record("Telegram Stars main button exists", "⭐ Купить Telegram Stars" in bot_text and "telegram_stars_start" in bot_text)
+    record("Telegram section contains Stars and Premium choices", "⭐ Звёзды" in bot_text and "💎 Premium" in bot_text)
+    record("Telegram product types exist", "telegram_stars" in bot_text and "telegram_premium" in bot_text)
+    record("Telegram catalogs and pending lists exist", all(x in bot_text for x in ("telegram_stars_products", "telegram_premium_products", "telegram_stars_pending_supplier_positions", "telegram_premium_pending_supplier_positions")))
+    record("Telegram sync uses only GET giftcards endpoints", "fetch_fazercards_products_readonly()  # GET /giftcards" in telegram_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in telegram_sync_block and "client.post" not in telegram_sync_block and "/giftcards/order" not in bot_text)
+    record("Stars branding requires telegram and stars groups", "def is_telegram_stars_branding" in bot_text and "has_telegram and has_stars" in function_block(bot_text, "is_telegram_stars_branding"))
+    record("Premium branding requires telegram and premium groups", "def is_telegram_premium_branding" in bot_text and "has_telegram and has_premium" in function_block(bot_text, "is_telegram_premium_branding"))
+    record("Stars nominal parser exists with min max", "extract_telegram_stars_nominal_from_text" in bot_text and "50 <= nominal <= 10000" in bot_text)
+    record("Premium duration parser supports only 1/3/6/12", "extract_telegram_premium_duration_from_text" in bot_text and "TELEGRAM_PREMIUM_SUPPORTED_DURATIONS = {1, 3, 6, 12}" in bot_text)
+    record("Telegram price formula uses supplier USD final USD/RUB markup", "calculate_telegram_supplier_markup_price" in bot_text and "supplier_price * rate" in bot_text and "1 + markup / 100" in bot_text and "get_final_usd_rub_rate()" in bot_text)
+    record("manual USD/RUB priority preserved", "def get_final_usd_rub_rate" in bot_text and "get_manual_usd_rub_rate()" in function_block(bot_text, "get_final_usd_rub_rate"))
+    record("Telegram no zero payments", "telegram_payment_amount_rub(plan) <= 0" in bot_text and "Оплата не создана" in bot_text)
+    record("Telegram user catalog requires enabled supplier_available price", "product.get(\"enabled\") is not True" in bot_text and "product.get(\"supplier_available\") is not True" in bot_text and "telegram_payment_amount_rub(product) <= 0" in bot_text)
+    record("Telegram recipient username collected and saved", "normalize_telegram_recipient_username" in bot_text and "telegram_recipient_username" in bot_text and "👤 Получатель — мой аккаунт" in bot_text)
+    record("CRM supports Telegram Stars and Premium", "Заказ Telegram Stars" in bot_text and "Заказ Telegram Premium" in bot_text)
+    record("notifications include Telegram Stars and Premium", "Новый заказ Telegram Stars" in bot_text and "Новый заказ Telegram Premium" in bot_text)
+    user_order_block = function_block(bot_text, "build_user_order_card_text")
+    notify_block = function_block(bot_text, "notify_admin")
+    notify_telegram_block = notify_block.split('if order.get("product_type") in {"telegram_stars", "telegram_premium"}:', 1)[1].split('elif order.get("product_type") == "apple_id":', 1)[0] if 'if order.get("product_type") in {"telegram_stars", "telegram_premium"}:' in notify_block else ""
+    begin_tg_block = function_block(bot_text, "begin_telegram_payment")
+    get_telegram_block = function_block(bot_text, "get_telegram")
+    build_order_card_block = function_block(bot_text, "build_order_card_text")
+    record("build_user_order_card_text Telegram payment_method is defined", "payment_method =" in user_order_block and "order.get(\"payment_method\")" in user_order_block and "Оплата:" in user_order_block)
+    record("notify_admin Telegram branch does not return formatted string", "return (" not in notify_telegram_block and "return" not in notify_telegram_block)
+    record("notify_admin forms text for telegram_stars", "Новый заказ Telegram Stars" in notify_telegram_block and "text =" in notify_telegram_block and "Закуп:" in notify_telegram_block and "Маржа:" in notify_telegram_block and "card_id" in notify_telegram_block)
+    record("notify_admin reaches send_admin_order_message", "await send_admin_order_message(context, admin_id, text, order_id)" in notify_block)
+    record("notify_admin forms text for telegram_premium", "Новый заказ Telegram Premium" in notify_telegram_block and "text =" in notify_telegram_block and "Закуп:" in notify_telegram_block and "Маржа:" in notify_telegram_block and "card_id" in notify_telegram_block)
+    record("Telegram order is initially created once in begin payment", begin_tg_block.count("create_telegram_checkout_order") == 1 and function_block(bot_text, "create_telegram_checkout_order").count("append_order") == 1)
+    record("checkout_order_id update prevents Telegram duplicate order", "checkout_order_id" in get_telegram_block and "update_checkout_order(checkout_order_id" in get_telegram_block and "or append_order(order_payload)" in get_telegram_block)
+    record("CRM card supports Telegram Stars without crashing", "telegram_stars" in build_order_card_block and "Заказ Telegram Stars" in build_order_card_block and "payment_method" in build_order_card_block)
+    record("CRM card supports Telegram Premium without crashing", "telegram_premium" in build_order_card_block and "Заказ Telegram Premium" in build_order_card_block and "payment_method" in build_order_card_block)
+    record("personal account order card supports Telegram Stars", "telegram_stars" in user_order_block and "Заказ Telegram Stars" in user_order_block)
+    record("personal account order card supports Telegram Premium", "telegram_premium" in user_order_block and "Заказ Telegram Premium" in user_order_block)
+
+    admin_tg_keyboard_block = function_block(bot_text, "admin_telegram_services_keyboard")
+    tg_sync_report_block = function_block(bot_text, "telegram_sync_report_text")
+    tg_category_block = function_block(bot_text, "is_telegram_supplier_category")
+    cards_payload_block = function_block(bot_text, "fazercards_cards_from_payload")
+    add_pending_block_tg = function_block(bot_text, "add_telegram_pending_supplier_positions")
+    record("admin Telegram services back returns to settings", "admin_payment_sections" in admin_tg_keyboard_block and "admin_business" not in admin_tg_keyboard_block)
+    record("internal Telegram admin screens return to admin_telegram_services", "admin_telegram_services_keyboard()" in bot_text and "callback_data=\"admin_telegram_services\"" in bot_text)
+    record("Telegram sync uses fazercards_cards_from_payload", "cards = fazercards_cards_from_payload(payload)" in telegram_sync_block and "cards = payload.get(\"items\")" not in telegram_sync_block)
+    record("FazerCards cards helper supports result items offers", "result = payload.get(\"result\")" in cards_payload_block and "offers" in cards_payload_block and "items" in cards_payload_block)
+    record("Telegram sync report has diagnostics counters", all(token in telegram_sync_block and token in tg_sync_report_block for token in ("categories_scanned", "telegram_categories_found", "cards_scanned", "stars_candidates_found", "premium_candidates_found")))
+    record("Telegram supplier category filter accepts Telegram-only categories", "def is_telegram_supplier_category" in bot_text and "has_telegram" in tg_category_block and "return has_telegram" in tg_category_block)
+    record("Stars parser supports ru stars and XTR examples", all(token in function_block(bot_text, "extract_telegram_stars_nominal_from_text") for token in ("звезд", "⭐", "xtr")))
+    record("Premium parser supports ru months and m/months", all(token in function_block(bot_text, "extract_telegram_premium_duration_from_text") for token in ("месяц", "m", "months")))
+    record("Telegram sync populates pending Stars", "telegram_stars_pending_supplier_positions" in telegram_sync_block and "pending_stars_count" in telegram_sync_block)
+    record("Telegram sync populates pending Premium", "telegram_premium_pending_supplier_positions" in telegram_sync_block and "pending_premium_count" in telegram_sync_block)
+    record("add pending Stars creates catalog product and clears pending", "normalize_telegram_stars_product" in add_pending_block_tg and 'cfg["telegram_stars_pending_supplier_positions"] = []' in add_pending_block_tg)
+    record("add pending Premium creates catalog product and clears pending", "normalize_telegram_premium_product" in add_pending_block_tg and 'cfg["telegram_premium_pending_supplier_positions"] = []' in add_pending_block_tg)
+    record("Telegram sync failure does not mark all products not_found", "supplier_read_success = False" in telegram_sync_block and "elif supplier_read_success" in telegram_sync_block)
 
 
 def main() -> int:
