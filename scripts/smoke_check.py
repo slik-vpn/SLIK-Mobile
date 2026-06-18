@@ -192,9 +192,9 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     )
     record(
         "Apple ID user flow uses runtime catalog and hides disabled products",
-        "apple_id_products_by_region(region, enabled_only=True)" in bot_text
+        "apple_id_products_by_region(region, enabled_only=True" in bot_text
         and "Сейчас товары этого региона временно недоступны" in bot_text
-        and "for product in apple_id_products_by_region(region, enabled_only=True)" in bot_text,
+        and "apple_id_products_by_region(region, enabled_only=True" in function_block(bot_text, "apple_id_products_keyboard"),
     )
     record(
         "Apple ID admin catalog handlers can edit toggle add and delete",
@@ -965,10 +965,26 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
     record("parse_apple_id_supplier_position exists", "def parse_apple_id_supplier_position" in bot_text and "return None" in parse_supplier_block)
     record("extract_exact_apple_nominal_from_text exists", "def extract_exact_apple_nominal_from_text" in bot_text and "return int(amount)" in extract_nominal_block)
+    visible_product_block = function_block(bot_text, "is_visible_apple_id_product")
+    user_keyboard_block = function_block(bot_text, "apple_id_products_keyboard")
+    show_product_block = function_block(bot_text, "show_apple_id_product")
+    start_apple_purchase_block = function_block(bot_text, "start_apple_id_purchase")
+    admin_region_keyboard_block = function_block(bot_text, "apple_id_admin_region_keyboard")
+
     record("is_valid_apple_id_nominal helper exists", "def is_valid_apple_id_nominal" in bot_text)
     record("US/USD nominal range is 1..200", 'region == "US" and currency == "USD"' in nominal_valid_block and "1 <= nominal <= 200" in nominal_valid_block)
     record("TR/TRY nominal range is 100..2000", 'region == "TR" and currency == "TRY"' in nominal_valid_block and "100 <= nominal <= 2000" in nominal_valid_block)
     record("nominal helper rejects non-positive and non-integer values", "nominal <= 0" in nominal_valid_block and "not isinstance(amount, int)" in nominal_valid_block and "return False" in nominal_valid_block)
+    record("is_visible_apple_id_product helper exists", "def is_visible_apple_id_product" in bot_text and "is_valid_apple_id_nominal" in visible_product_block)
+    record("apple_id_products_by_region has valid_only enabled by default", "def apple_id_products_by_region(region: str, enabled_only: bool = False, valid_only: bool = True)" in bot_text)
+    record("apple_id_products_by_region filters visible products", "is_visible_apple_id_product(p, enabled_only=enabled_only)" in products_by_region_block)
+    record("user Apple ID list uses enabled visible region products", "apple_id_products_by_region(region, enabled_only=True" in user_keyboard_block)
+    record("show_apple_id_product checks visible enabled product", "is_visible_apple_id_product(product, enabled_only=True)" in show_product_block)
+    record("start_apple_id_purchase checks visible enabled product", "is_visible_apple_id_product(product, enabled_only=True)" in start_apple_purchase_block)
+    record("admin Apple ID list uses visible region products", "apple_id_products_by_region(region" in admin_region_keyboard_block and "valid_only=True" in admin_region_keyboard_block)
+    record("build_grid_keyboard helper exists", "def build_grid_keyboard" in bot_text and "buttons[i:i + columns]" in function_block(bot_text, "build_grid_keyboard"))
+    record("user Apple ID keyboard uses grid", "build_grid_keyboard" in user_keyboard_block and "apple_id_grid_columns" in user_keyboard_block)
+    record("admin Apple ID keyboard uses grid", "build_grid_keyboard" in admin_region_keyboard_block and "apple_id_grid_columns" in admin_region_keyboard_block)
     for label, needle in (
         ("supports $2", r"\$\s*(\d+(?:[.,]\d+)?)"),
         ("supports 4$", r"(\d+(?:[.,]\d+)?)\s*\$"),
