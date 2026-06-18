@@ -6518,8 +6518,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         )
         return
 
-    payment_method = order.get("payment_method")
-    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
+    payment_method = order.get("payment_method") or order.get("payment_provider") or "—"
+    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n"
     payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
     payment_details_line = ""
     if payment_method == "Карта" and payment_details:
@@ -6544,6 +6544,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
                 f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
                 f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
                 f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+                f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
                 f"Статус: ожидает оплаты / нужна ручная выдача\n"
                 f"{payment_line}{payment_details_line}"
                 f"🕒 {html_escape(order.get('created_at', '—'))}\n"
@@ -6557,6 +6559,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
                 f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
                 f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
                 f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+                f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
                 f"Статус: ожидает оплаты / нужна ручная выдача\n"
                 f"{payment_line}{payment_details_line}"
                 f"🕒 {html_escape(order.get('created_at', '—'))}\n"
