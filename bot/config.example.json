@@ -19,5 +19,14 @@
     "supplier_markup_percent": 40,
     "rounding_mode": "up_to_9",
     "pricing_mode": "supplier_markup"
-  }
+  },
+  "telegram_services_pricing": {
+    "stars_markup_percent": 40,
+    "premium_markup_percent": 40,
+    "rounding": 1
+  },
+  "telegram_stars_products": [],
+  "telegram_premium_products": [],
+  "telegram_stars_pending_supplier_positions": [],
+  "telegram_premium_pending_supplier_positions": []
 }
