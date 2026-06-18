@@ -12,7 +12,8 @@
     "client_activity": "",
     "new_clients": "",
     "payments": "",
-    "tech_alerts": ""
+    "tech_alerts": "",
+    "rate": ""
   },
   "apple_id_pricing": {
     "supplier_markup_percent": 40,

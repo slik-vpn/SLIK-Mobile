@@ -321,6 +321,7 @@ DEFAULT_CONFIG = {
         "new_clients": "",
         "payments": "",
         "tech_alerts": "",
+        "rate": "",
     },
     "apple_id_products": {},
     "apple_id_pending_supplier_positions": [],
@@ -517,6 +518,7 @@ NOTIFICATION_CHAT_META = {
     "new_clients": ("Новые клиенты", "NEW_CLIENTS_CHAT_ID", "чат новых клиентов"),
     "payments": ("Оплаты", "PAYMENTS_CHAT_ID", "чат оплат"),
     "tech_alerts": ("Техника", "TECH_ALERTS_CHAT_ID", "технический чат"),
+    "rate": ("💱 Курс", "RATE_CHAT_ID", "чат курса"),
 }
 
 
@@ -579,6 +581,15 @@ def get_payments_chat_id() -> int | None:
 
 def get_tech_alerts_chat_id() -> int | None:
     return get_notification_chat_id("tech_alerts")
+
+
+def get_rate_chat_id() -> int | None:
+    cfg = load_config()
+    chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
+    config_id = _parse_chat_id(chats.get("rate"))
+    if config_id is not None:
+        return config_id
+    return _parse_chat_id(os.environ.get("RATE_CHAT_ID", ""))
 
 
 def set_notification_chat_id(kind: str, chat_id: str) -> None:
@@ -958,13 +969,83 @@ async def check_market_usd_rub_rate_with_diagnostics() -> tuple[float, str, list
         source_results = await collect_usd_rub_source_rates(client)
     return calculate_usd_rub_market_rate(source_results)
 
+
+
+def format_rate_value(value) -> str:
+    rate = normalize_rate(value)
+    return f"{rate:g} ₽" if rate is not None else "—"
+
+
+def format_rate_delta(previous, current) -> str:
+    prev = normalize_rate(previous)
+    cur = normalize_rate(current)
+    if prev is None or cur is None:
+        return "—"
+    diff = cur - prev
+    percent = diff / prev * 100 if prev else 0
+    return f"{diff:+.2f} ₽ / {percent:+.2f}%"
+
+
+def rate_diagnostics_summary(diagnostics: list[dict] | None) -> tuple[int, str, str]:
+    if not isinstance(diagnostics, list):
+        return 0, "нет данных", "нет"
+    accepted = [item for item in diagnostics if item.get("status") == "accepted"]
+    sources = ", ".join(str(item.get("source") or "—") for item in accepted[:3]) or "нет валидных"
+    fallback = "да" if not accepted else "нет"
+    return len(accepted), sources, fallback
+
+
+def format_usd_rub_update_notification(previous: dict, current: dict, final_rate, final_source: str, manual_active: bool, method: str, updated_at: str) -> str:
+    previous_auto = previous.get("market_usd_rub_rate")
+    current_auto = current.get("market_usd_rub_rate")
+    diagnostics = current.get("rate_diagnostics") if isinstance(current, dict) else []
+    source_count, source_list, fallback_used = rate_diagnostics_summary(diagnostics)
+    validation_status = f"OK ({USD_RUB_MIN_RATE:g}–{USD_RUB_MAX_RATE:g} ₽)" if normalize_rate(current_auto) is not None else "fallback/invalid"
+    lines = [
+        "💱 <b>USD/RUB обновлён</b>",
+        "",
+        f"Авто-курс был: <b>{html_escape(format_rate_value(previous_auto))}</b>",
+        f"Авто-курс стал: <b>{html_escape(format_rate_value(current_auto))}</b>",
+        f"Изменение: <b>{html_escape(format_rate_delta(previous_auto, current_auto))}</b>",
+        "",
+    ]
+    if manual_active:
+        lines.extend([
+            "⚠️ Ручной курс активен.",
+            f"Финальный курс для расчётов: <b>{html_escape(format_rate_value(final_rate))}</b>",
+            "Auto курс сохранён, но не используется в расчётах.",
+            "",
+        ])
+    else:
+        lines.extend([f"Финальный курс для расчётов: <b>{html_escape(format_rate_value(final_rate))}</b>", ""])
+    lines.extend([
+        f"Источник: <b>{html_escape(str(final_source or method or current.get('rate_source') or 'auto'))}</b>",
+        f"Метод: <b>{html_escape(str(method or current.get('rate_method') or 'auto'))}</b>",
+        f"Валидация min/max: <b>{html_escape(validation_status)}</b>",
+        f"Fallback used: <b>{fallback_used}</b>",
+        f"Источников: <b>{source_count}</b> ({html_escape(source_list)})",
+        f"Время: <b>{html_escape(updated_at)}</b>",
+    ])
+    return "\n".join(lines)
+
+
+async def notify_rate_chat(bot, text: str) -> None:
+    chat_id = get_rate_chat_id()
+    if chat_id is None:
+        return
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("USD/RUB rate notification failed for chat %s: %s", chat_id, exc)
+
 async def refresh_usd_rub_rate_check() -> tuple[float, str]:
     rate, source, diagnostics = await check_market_usd_rub_rate_with_diagnostics()
     markup = get_configured_usd_rub_markup_percent()
     manual_rate = get_manual_usd_rub_rate()
     base_rate = manual_rate or rate
+    updated_at = now_str()
     save_usd_rub_settings(
-        rate_checked_at=now_str(),
+        rate_checked_at=updated_at,
         rate_source=source,
         rate_method=source,
         rate_diagnostics=diagnostics,
@@ -4464,7 +4545,8 @@ def notification_chats_help_text() -> str:
         "   • SLIK Действия клиентов\n"
         "   • SLIK Новые клиенты\n"
         "   • SLIK Оплаты\n"
-        "   • SLIK Техника\n\n"
+        "   • SLIK Техника\n"
+        "   • SLIK Курс\n\n"
         "2. Добавьте бота SLIK Mobile в нужную группу.\n\n"
         "3. В этой группе напишите:\n"
         "   <code>/chatid</code>\n\n"
@@ -4478,7 +4560,8 @@ def notification_chats_help_text() -> str:
         "   • Действия клиентов\n"
         "   • Новые клиенты\n"
         "   • Оплаты\n"
-        "   • Техника\n\n"
+        "   • Техника\n"
+        "   • 💱 Курс — сюда приходят уведомления после каждого автоматического обновления USD/RUB: старый курс, новый курс, источник и изменение.\n\n"
         "8. Нажмите “✏️ Изменить” и вставьте chat_id.\n\n"
         "9. Нажмите “🧪 Тест”. Если сообщение пришло в группу — чат подключён.\n\n"
         "10. Если тест не пришёл:\n"
@@ -4504,7 +4587,7 @@ def notification_chat_detail_text(kind: str) -> str:
 
 def notification_routes_text() -> str:
     lines = []
-    for kind in ("orders", "client_activity", "new_clients", "payments", "tech_alerts"):
+    for kind in ("orders", "client_activity", "new_clients", "payments", "tech_alerts", "rate"):
         title, _env, _label = NOTIFICATION_CHAT_META[kind]
         chat_id, source = get_notification_chat_source(kind)
         chat_text = str(chat_id) if chat_id is not None else "не задан"
@@ -8472,11 +8555,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Неизвестная команда")
 
 
-async def usd_rub_auto_refresh_loop() -> None:
+async def usd_rub_auto_refresh_loop(app: Application) -> None:
     await asyncio.sleep(5)
     while True:
         try:
+            previous = get_usd_rub_settings()
+            previous_snapshot = dict(previous)
             await refresh_usd_rub_rate_check()
+            current = get_usd_rub_settings()
+            manual_rate = get_manual_usd_rub_rate()
+            final_rate, final_source = get_final_usd_rub_rate()
+            text = format_usd_rub_update_notification(
+                previous_snapshot,
+                current,
+                final_rate,
+                final_source,
+                manual_rate is not None,
+                str(current.get("rate_method") or current.get("rate_source") or "auto"),
+                str(current.get("rate_checked_at") or now_str()),
+            )
+            await notify_rate_chat(app.bot, text)
             logger.info("USD/RUB auto refresh completed")
         except Exception as exc:
             logger.warning("USD/RUB auto refresh failed; keeping last successful rate: %s", exc)
@@ -8484,7 +8582,7 @@ async def usd_rub_auto_refresh_loop() -> None:
 
 
 def schedule_usd_rub_auto_refresh(app: Application) -> None:
-    app.create_task(usd_rub_auto_refresh_loop(), name="usd_rub_auto_refresh")
+    app.create_task(usd_rub_auto_refresh_loop(app), name="usd_rub_auto_refresh")
 
 
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
