@@ -67,6 +67,8 @@ FAZERCARDS_TIMEOUT_SECONDS = 8.0
 FAZERCARDS_BALANCE_ENDPOINT = "/balance"
 FAZERCARDS_PRODUCTS_ENDPOINT = "/giftcards?limit=100"
 FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT = "/giftcards/cards"
+FAZERCARDS_TELEGRAM_STARS_ENDPOINT = "/api/v2/telegram/stars"
+FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/api/v2/telegram/premium"
 MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/products/business/APPLE%20ID"
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
@@ -2510,6 +2512,35 @@ async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> di
         return {"ok": False, "error": safe_error, "items": []}
 
 
+async def fetch_fazercards_telegram_endpoint_readonly(endpoint: str, label: str) -> dict:
+    api_key = get_fazercards_api_key()
+    if not api_key:
+        return {"ok": False, "items": [], "raw": None, "error": "API key не указан"}
+    try:
+        async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+            response = await client.get(endpoint, headers=fazercards_headers(api_key))
+            response.raise_for_status()
+            raw = response.json()
+        items = fazercards_cards_from_payload(raw) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        ok = bool(raw.get("ok", True)) if isinstance(raw, dict) else isinstance(raw, list)
+        if not ok:
+            error = str(raw.get("error") or raw.get("message") or f"{label}_fetch_failed") if isinstance(raw, dict) else f"{label}_fetch_failed"
+            return {"ok": False, "items": [], "raw": raw, "error": error}
+        return {"ok": True, "items": [item for item in items if isinstance(item, dict)], "raw": raw, "error": ""}
+    except Exception as exc:
+        safe_error = fazercards_api_error(exc)
+        logger.warning("FazerCards Telegram %s fetch failed: %s", label, safe_error)
+        return {"ok": False, "items": [], "raw": None, "error": safe_error}
+
+
+async def fetch_fazercards_telegram_stars_readonly() -> dict:
+    return await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_STARS_ENDPOINT, "stars")
+
+
+async def fetch_fazercards_telegram_premium_readonly() -> dict:
+    return await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT, "premium")
+
+
 def fazercards_cards_from_payload(payload: dict) -> list[dict]:
     if not isinstance(payload, dict):
         return []
@@ -2919,6 +2950,58 @@ def is_telegram_fazercards_category(text: str) -> bool:
     return bool(re.search(r"\btelegram\b|\btg\b|телеграм", low))
 
 
+def telegram_api_item_id(item: dict) -> str:
+    for field in ("id", "product_id", "productId", "offer_id", "offerId", "card_id", "cardId", "sku", "package_id", "packageId"):
+        value = item.get(field) if isinstance(item, dict) else None
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def telegram_api_item_price_usd(item: dict) -> float | None:
+    for field in ("price_usd", "priceUsd", "price", "usd_price", "usdPrice", "amount_usd", "amountUsd"):
+        value = item.get(field) if isinstance(item, dict) else None
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        try:
+            return float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def telegram_api_item_stock(item: dict) -> int | None:
+    for field in ("stock", "quantity", "available", "count", "in_stock", "inStock", "is_available", "isAvailable"):
+        value = item.get(field) if isinstance(item, dict) else None
+        if value in (None, ""):
+            continue
+        if isinstance(value, bool):
+            return 1 if value else 0
+        try:
+            return int(float(str(value).replace(",", ".")))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def telegram_api_item_text(item: dict) -> str:
+    return fazercards_text_blob(item)
+
+
+def _telegram_explicit_int(item: dict, fields: tuple[str, ...]) -> int | None:
+    for field in fields:
+        value = item.get(field) if isinstance(item, dict) else None
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        try:
+            number = float(str(value).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+        if number.is_integer():
+            return int(number)
+    return None
+
+
 def extract_telegram_stars_nominal_from_text(text):
     raw = str(text or "")
     low = raw.lower().replace("ё", "е")
@@ -2939,6 +3022,13 @@ def extract_telegram_stars_nominal_from_text(text):
     return nominal if 50 <= nominal <= 10000 else None
 
 
+def extract_telegram_stars_nominal(item: dict) -> int | None:
+    amount = _telegram_explicit_int(item, ("stars", "amount", "count", "quantity", "value", "nominal"))
+    if amount is not None:
+        return amount if 50 <= amount <= 10000 else None
+    return extract_telegram_stars_nominal_from_text(telegram_api_item_text(item))
+
+
 def extract_telegram_premium_duration_from_text(text):
     low = str(text or "").lower().replace("ё", "е")
     if re.search(r"annual|yearly|1\s*(?:год|year)", low):
@@ -2950,6 +3040,15 @@ def extract_telegram_premium_duration_from_text(text):
     if len(matches) != 1:
         return None
     return matches[0] if matches[0] in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS else None
+
+
+def extract_telegram_premium_duration(item: dict) -> int | None:
+    months = _telegram_explicit_int(item, ("duration_months", "durationMonths", "months", "period", "value", "duration"))
+    if months == 1 and re.search(r"annual|yearly|год|year", telegram_api_item_text(item), re.I):
+        months = 12
+    if months is not None:
+        return months if months in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS else None
+    return extract_telegram_premium_duration_from_text(telegram_api_item_text(item))
 
 
 def normalize_telegram_stars_product(product: dict) -> dict:
@@ -2966,6 +3065,7 @@ def normalize_telegram_stars_product(product: dict) -> dict:
     item.setdefault("supplier_last_seen", "")
     item.setdefault("fazercards_category_id", "")
     item.setdefault("fazercards_card_id", "")
+    item.setdefault("fazercards_telegram_product_id", "")
     item.setdefault("fazercards_price_usd", None)
     item.setdefault("supplier_price_usd", item.get("fazercards_price_usd"))
     item.setdefault("supplier_cost_rub", None)
@@ -2988,6 +3088,7 @@ def normalize_telegram_premium_product(product: dict) -> dict:
     item.setdefault("supplier_last_seen", "")
     item.setdefault("fazercards_category_id", "")
     item.setdefault("fazercards_card_id", "")
+    item.setdefault("fazercards_telegram_product_id", "")
     item.setdefault("fazercards_price_usd", None)
     item.setdefault("supplier_price_usd", item.get("fazercards_price_usd"))
     item.setdefault("supplier_cost_rub", None)
@@ -3067,11 +3168,36 @@ def telegram_product_plan(product: dict, product_type: str) -> dict:
     kind = "stars" if product_type == "telegram_stars" else "premium"
     rec = calculate_telegram_supplier_markup_price(product, kind)
     price_rub = telegram_payment_amount_rub(product) or int(rec.get("recommended_price_rub") or 0)
-    plan = {"gb": product.get("title"), "days": "ручная выдача", "price": format_rub(price_rub), "product_type": product_type, "product_id": product.get("id"), "product_title": product.get("title"), "currency": product.get("currency"), "price_rub": price_rub, "supplier_price_usd": product.get("supplier_price_usd") or product.get("fazercards_price_usd"), "fazercards_category_id": product.get("fazercards_category_id", ""), "fazercards_card_id": product.get("fazercards_card_id", ""), "supplier_available": product.get("supplier_available"), "supplier_stock": product.get("supplier_stock")}
+    plan = {"gb": product.get("title"), "days": "ручная выдача", "price": format_rub(price_rub), "product_type": product_type, "product_id": product.get("id"), "product_title": product.get("title"), "currency": product.get("currency"), "price_rub": price_rub, "supplier_price_usd": product.get("supplier_price_usd") or product.get("fazercards_price_usd"), "fazercards_category_id": product.get("fazercards_category_id", ""), "fazercards_card_id": product.get("fazercards_card_id", ""), "fazercards_telegram_product_id": product.get("fazercards_telegram_product_id", ""), "supplier_available": product.get("supplier_available"), "supplier_stock": product.get("supplier_stock")}
     if product_type == "telegram_stars": plan["amount"] = int(product.get("amount") or 0)
     else: plan["duration_months"] = int(product.get("duration_months") or 0)
     plan.update({k: rec.get(k) for k in ("usd_rub_rate_used", "usd_rub_rate_source", "supplier_cost_rub", "supplier_markup_percent", "estimated_margin_rub")})
     return plan
+
+
+def _telegram_api_supplier_position(item: dict, kind: str) -> dict | None:
+    text = telegram_api_item_text(item)
+    product_id = telegram_api_item_id(item)
+    price_usd = telegram_api_item_price_usd(item)
+    stock = telegram_api_item_stock(item)
+    if stock is None:
+        stock = 1
+    if kind == "stars":
+        amount = extract_telegram_stars_nominal(item)
+        if amount is None:
+            return None
+        pid, title, extra = f"tgstars_{amount}", f"Telegram Stars {amount} ⭐", {"amount": amount, "currency": "XTR"}
+    else:
+        months = extract_telegram_premium_duration(item)
+        if months not in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS:
+            return {"unsupported": True, "title": text}
+        pid, title, extra = f"tgpremium_{months}m", f"Telegram Premium {months} {month_word(months)}", {"duration_months": months, "currency": "PREMIUM"}
+    value = price_usd or 0.0
+    result = {"id": pid, "title": title, **extra, "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": stock > 0, "supplier_stock": stock, "supplier_status": "found" if stock > 0 else "out_of_stock", "supplier_last_seen": now_str(), "fazercards_telegram_product_id": product_id, "fazercards_card_id": product_id, "fazercards_price_usd": value, "supplier_price_usd": value}
+    rec = calculate_telegram_supplier_markup_price(result, kind)
+    if not rec.get("pricing_error"):
+        result.update({"price_rub": rec["recommended_price_rub"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+    return result
 
 
 def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict | None:
@@ -3093,7 +3219,8 @@ def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict |
     except Exception: stock = 0
     try: price_usd = float(fazercards_product_value(card, "price_usd") or 0)
     except Exception: price_usd = 0
-    item = {"id": pid, "title": title, **extra, "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": stock > 0, "supplier_status": "found" if stock > 0 else "out_of_stock", "supplier_stock": stock, "supplier_last_seen": now_str(), "fazercards_category_id": fazercards_category_id_value(category), "fazercards_card_id": fazercards_product_value(card, "card_id"), "fazercards_price_usd": price_usd, "supplier_price_usd": price_usd}
+    card_id = fazercards_product_value(card, "card_id")
+    item = {"id": pid, "title": title, **extra, "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": stock > 0, "supplier_status": "found" if stock > 0 else "out_of_stock", "supplier_stock": stock, "supplier_last_seen": now_str(), "fazercards_category_id": fazercards_category_id_value(category), "fazercards_card_id": card_id, "fazercards_telegram_product_id": card_id, "fazercards_price_usd": price_usd, "supplier_price_usd": price_usd}
     rec = calculate_telegram_supplier_markup_price(item, kind)
     if not rec.get("pricing_error"): item.update({"price_rub": rec["recommended_price_rub"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
     return item
@@ -3106,94 +3233,133 @@ def _fazercards_category_sample(category: dict) -> dict:
 def _fazercards_card_sample(category_id: str, card: dict) -> dict:
     return {"category_id": category_id, "card_id": fazercards_product_value(card, "card_id"), "text": fazercards_text_blob(card), "price_usd": fazercards_product_value(card, "price_usd"), "stock": fazercards_product_value(card, "stock")}
 
+
+def _telegram_api_sample(item: dict, kind: str) -> dict:
+    sample = {"id": telegram_api_item_id(item), "text": telegram_api_item_text(item), "price_usd": telegram_api_item_price_usd(item), "stock": telegram_api_item_stock(item)}
+    if kind == "stars":
+        sample["amount"] = extract_telegram_stars_nominal(item)
+    else:
+        sample["months"] = extract_telegram_premium_duration(item)
+    return sample
+
+
 def telegram_fazercards_sync_report_text(report: dict) -> str:
     lines = [
         "🔗 <b>FazerCards Telegram sync</b>",
         "",
-        f"Категорий проверено: {report.get('categories_scanned', 0)}",
-        f"Telegram категорий найдено: {report.get('telegram_categories_found', 0)}",
-        f"Категорий без ID: {report.get('categories_without_id', 0)}",
-        f"Карточек проверено: {report.get('cards_scanned', 0)}",
-        f"Stars найдено: {report.get('stars_candidates_found', 0)}",
-        f"Premium найдено: {report.get('premium_candidates_found', 0)}",
+        f"Stars endpoint: {'OK' if report.get('telegram_stars_endpoint_ok') else 'ERROR'}",
+        f"Premium endpoint: {'OK' if report.get('telegram_premium_endpoint_ok') else 'ERROR'}",
+        f"Stars items checked: {report.get('stars_items_scanned', 0)}",
+        f"Premium items checked: {report.get('premium_items_scanned', 0)}",
+        f"Stars found: {report.get('stars_candidates_found', 0)}",
+        f"Premium found: {report.get('premium_candidates_found', 0)}",
         f"Pending Stars: {report.get('pending_stars_count', 0)}",
         f"Pending Premium: {report.get('pending_premium_count', 0)}",
-        f"Обновлено: {report.get('updated', 0)}",
+        f"Updated: {report.get('updated', 0)}",
         f"Not found: {report.get('not_found', 0)}",
         f"Unsupported: {report.get('unsupported', 0)}",
-        f"Ошибки: {report.get('errors', 0)}",
+        f"Errors: {report.get('errors', 0)}",
+        f"Fallback giftcards: {'yes' if report.get('fallback_used') else 'no'}",
     ]
-    category_samples = report.get("category_samples") or []
-    if category_samples:
-        lines.extend(["", "Samples категорий:"])
-        for idx, sample in enumerate(category_samples[:10], start=1):
-            lines.append(f"{idx}. category_id={html_escape(str(sample.get('category_id') or '—'))} | text={html_escape(str(sample.get('text') or '—'))[:500]}")
-    card_samples = report.get("card_samples") or []
-    if card_samples:
-        lines.extend(["", "Samples cards:"])
-        for idx, sample in enumerate(card_samples[:10], start=1):
-            lines.append(f"{idx}. category_id={html_escape(str(sample.get('category_id') or '—'))} | card_id={html_escape(str(sample.get('card_id') or '—'))} | text={html_escape(str(sample.get('text') or '—'))[:400]} | price_usd={html_escape(str(sample.get('price_usd') or '—'))} | stock={html_escape(str(sample.get('stock') or '—'))}")
-    if report.get("cards_scanned", 0) == 0:
-        lines.extend(["", "Cards не проверялись. Возможная причина: category_id не извлекается."])
     if report.get("error"):
         lines.extend(["", f"Ошибка: <code>{html_escape(str(report.get('error')))}</code>"])
+    for label, key, amount_key in (("Samples Stars", "stars_samples", "amount"), ("Samples Premium", "premium_samples", "months")):
+        samples = report.get(key) or []
+        if samples:
+            lines.extend(["", f"{label}:"])
+            for sample in samples[:10]:
+                lines.append(f"• id={html_escape(str(sample.get('id') or '—'))} | text={html_escape(str(sample.get('text') or '—'))[:400]} | {amount_key}={html_escape(str(sample.get(amount_key) or '—'))} | price_usd={html_escape(str(sample.get('price_usd') or '—'))} | stock={html_escape(str(sample.get('stock') if sample.get('stock') is not None else '—'))}")
     return "\n".join(lines)
 
-async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
-    report = {"ok": True, "categories_scanned": 0, "telegram_categories_found": 0, "categories_without_id": 0, "cards_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "samples": [], "category_samples": [], "card_samples": [], "lines": []}
+
+async def _sync_telegram_giftcards_fallback(kind: str, report: dict) -> tuple[dict, dict, bool]:
+    found_stars, found_premium = {}, {}
     products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
     items = fazercards_cards_from_payload(products_payload)
     if not isinstance(products_payload, dict) or not products_payload.get("ok") or not items:
-        error = products_payload.get("error") if isinstance(products_payload, dict) else "giftcards_fetch_failed"
-        report.update({"ok": False, "errors": 1, "error": error or "giftcards_fetch_failed"})
-        return report
-    found_stars, found_premium = {}, {}
+        report["errors"] += 1
+        report["error"] = report.get("error") or (products_payload.get("error") if isinstance(products_payload, dict) else "giftcards_fetch_failed")
+        return found_stars, found_premium, False
+    supplier_read_ok = False
     for category in items:
-        report["categories_scanned"] += 1
-        category_text = fazercards_text_blob(category)
-        if is_telegram_fazercards_category(category_text):
-            report["telegram_categories_found"] += 1
-        if len(report["category_samples"]) < 10:
-            report["category_samples"].append(_fazercards_category_sample(category))
         category_id = fazercards_category_id_value(category)
         if not category_id:
-            report["categories_without_id"] += 1
             continue
         payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
         cards = fazercards_cards_from_payload(payload)
         if not payload.get("ok"):
-            report["errors"] += 1; continue
-        if not cards:
+            report["errors"] += 1
             continue
-        report["cards_scanned"] += len(cards)
+        supplier_read_ok = True
         for card in cards:
-            card_text = fazercards_text_blob(card)
-            combined_text = f"{category_text} {card_text}"
-            if is_telegram_fazercards_category(combined_text) and not is_telegram_fazercards_category(category_text):
-                report["telegram_categories_found"] += 1
-            if len(report["card_samples"]) < 10:
-                report["card_samples"].append(_fazercards_card_sample(category_id, card))
-            if len(report["samples"]) < 10:
-                report["samples"].append(combined_text)
             for k, found in (("stars", found_stars), ("premium", found_premium)):
-                if kind not in ("all", k): continue
+                if kind not in ("all", k):
+                    continue
                 pos = _telegram_supplier_position(category, card, k)
-                if not pos: continue
+                if not pos:
+                    continue
+                if pos.get("unsupported"):
+                    report["unsupported"] += 1
+                    continue
+                found[pos["id"]] = pos
+    return found_stars, found_premium, supplier_read_ok
+
+
+async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
+    report = {"ok": True, "telegram_stars_endpoint_ok": None, "telegram_premium_endpoint_ok": None, "stars_items_scanned": 0, "premium_items_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "stars_samples": [], "premium_samples": [], "fallback_used": False, "error": ""}
+    found_stars, found_premium = {}, {}
+    stars_ok = premium_ok = True
+    if kind in ("all", "stars"):
+        stars_payload = await fetch_fazercards_telegram_stars_readonly()
+        stars_ok = bool(stars_payload.get("ok"))
+        report["telegram_stars_endpoint_ok"] = stars_ok
+        if stars_ok:
+            for item in stars_payload.get("items") or []:
+                report["stars_items_scanned"] += 1
+                if len(report["stars_samples"]) < 10:
+                    report["stars_samples"].append(_telegram_api_sample(item, "stars"))
+                pos = _telegram_api_supplier_position(item, "stars")
+                if pos:
+                    found_stars[pos["id"]] = pos
+                    report["stars_candidates_found"] += 1
+        else:
+            report["errors"] += 1; report["error"] = stars_payload.get("error") or report["error"]
+    if kind in ("all", "premium"):
+        premium_payload = await fetch_fazercards_telegram_premium_readonly()
+        premium_ok = bool(premium_payload.get("ok"))
+        report["telegram_premium_endpoint_ok"] = premium_ok
+        if premium_ok:
+            for item in premium_payload.get("items") or []:
+                report["premium_items_scanned"] += 1
+                if len(report["premium_samples"]) < 10:
+                    report["premium_samples"].append(_telegram_api_sample(item, "premium"))
+                pos = _telegram_api_supplier_position(item, "premium")
+                if not pos:
+                    continue
                 if pos.get("unsupported"):
                     report["unsupported"] += 1; continue
-                if k == "stars":
-                    report["stars_candidates_found"] += 1
-                else:
-                    report["premium_candidates_found"] += 1
-                found[pos["id"]] = pos
-    supplier_read_ok = report["cards_scanned"] > 0
+                found_premium[pos["id"]] = pos
+                report["premium_candidates_found"] += 1
+        else:
+            report["errors"] += 1; report["error"] = report.get("error") or premium_payload.get("error")
+    supplier_read_ok_stars = kind in ("all", "stars") and stars_ok
+    supplier_read_ok_premium = kind in ("all", "premium") and premium_ok
+    if (kind in ("all", "stars") and not stars_ok) or (kind in ("all", "premium") and not premium_ok):
+        report["fallback_used"] = True
+        fallback_stars, fallback_premium, fallback_ok = await _sync_telegram_giftcards_fallback(kind, report)
+        if not stars_ok:
+            found_stars.update(fallback_stars); supplier_read_ok_stars = fallback_ok
+            report["stars_candidates_found"] += len(fallback_stars)
+        if not premium_ok:
+            found_premium.update(fallback_premium); supplier_read_ok_premium = fallback_ok
+            report["premium_candidates_found"] += len(fallback_premium)
     if kind in ("all", "stars"):
         catalog = telegram_stars_products(); ids = {p.get("id") for p in catalog}
         for p in catalog:
             match = found_stars.get(p.get("id"))
             if match:
                 enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
-            elif supplier_read_ok:
+            elif supplier_read_ok_stars:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_stars.items() if k not in ids]
         cfg = load_config(); cfg["telegram_stars_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending_stars_count"] = len(pending[:100])
@@ -3204,11 +3370,12 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
             match = found_premium.get(p.get("id"))
             if match:
                 enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
-            elif supplier_read_ok:
+            elif supplier_read_ok_premium:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_premium.items() if k not in ids]
         cfg = load_config(); cfg["telegram_premium_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending_premium_count"] = len(pending[:100])
         save_telegram_premium_products(catalog)
+    report["ok"] = report["errors"] == 0 or report["updated"] > 0 or report["pending_stars_count"] > 0 or report["pending_premium_count"] > 0
     report["pending"] = report["pending_stars_count"] + report["pending_premium_count"]
     return report
 
