@@ -72,6 +72,7 @@ APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
 APPLE_ID_PRICE_MAX_RUB = 100000
 DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 40, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
+DEFAULT_TELEGRAM_SERVICES_PRICING = {"stars_markup_percent": 40, "premium_markup_percent": 40, "rounding": 1}
 APPLE_ID_ORDER_PAGE_SIZE = 5
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
@@ -244,6 +245,7 @@ ADMIN_ACCESS_DENIED_TEXT = "⛔ У вас нет доступа."
 
 WAITING_PAYMENT, WAITING_NAME, WAITING_TELEGRAM = range(1, 4)
 WAITING_BANNER = 10
+WAITING_TELEGRAM_RECIPIENT = 11
 
 # ─── Время ────────────────────────────────────────────────────────────────────
 
@@ -295,6 +297,8 @@ def apple_id_payment_amount_rub(plan: dict) -> int:
 def payment_amount_error_text(plan: dict) -> str:
     if plan.get("product_type") == "apple_id":
         return "⚠️ Не удалось определить сумму Apple ID в рублях. Оплата не создана, напишите менеджеру."
+    if plan.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        return "⚠️ Товар временно недоступен. Оплата не создана, напишите менеджеру."
     return "⚠️ Не удалось определить сумму оплаты. Попробуйте позже или напишите менеджеру."
 
 
@@ -337,6 +341,11 @@ DEFAULT_CONFIG = {
     "apple_id_products": {},
     "apple_id_pending_supplier_positions": [],
     "apple_id_pricing": DEFAULT_APPLE_ID_PRICING.copy(),
+    "telegram_services_pricing": DEFAULT_TELEGRAM_SERVICES_PRICING.copy(),
+    "telegram_stars_products": [],
+    "telegram_premium_products": [],
+    "telegram_stars_pending_supplier_positions": [],
+    "telegram_premium_pending_supplier_positions": [],
     "fazercards": {
         "api_key": "",
         "enabled": False,
@@ -495,6 +504,20 @@ def load_config() -> dict:
         data["apple_id_products"] = {}
     if not isinstance(data.get("apple_id_pending_supplier_positions"), list):
         data["apple_id_pending_supplier_positions"] = []
+    if not isinstance(data.get("telegram_stars_products"), list):
+        data["telegram_stars_products"] = []
+    if not isinstance(data.get("telegram_premium_products"), list):
+        data["telegram_premium_products"] = []
+    if not isinstance(data.get("telegram_stars_pending_supplier_positions"), list):
+        data["telegram_stars_pending_supplier_positions"] = []
+    if not isinstance(data.get("telegram_premium_pending_supplier_positions"), list):
+        data["telegram_premium_pending_supplier_positions"] = []
+    telegram_pricing = data.get("telegram_services_pricing")
+    if not isinstance(telegram_pricing, dict):
+        telegram_pricing = {}
+        data["telegram_services_pricing"] = telegram_pricing
+    for key, value in DEFAULT_TELEGRAM_SERVICES_PRICING.items():
+        telegram_pricing.setdefault(key, value)
     apple_id_pricing = data.get("apple_id_pricing")
     if not isinstance(apple_id_pricing, dict):
         apple_id_pricing = {}
@@ -1069,8 +1092,8 @@ async def refresh_usd_rub_rate_check() -> tuple[float, str]:
 async def create_card_payment_lock(plan: dict) -> dict:
     rate, source = await get_usd_rub_rate()
     markup_percent = get_configured_usd_rub_markup_percent()
-    if plan.get("product_type") == "apple_id":
-        rub_amount = apple_id_payment_amount_rub(plan)
+    if plan.get("product_type") in {"apple_id", "telegram_stars", "telegram_premium"}:
+        rub_amount = telegram_payment_amount_rub(plan) if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else apple_id_payment_amount_rub(plan)
         if rub_amount <= 0:
             raise ValueError("invalid_apple_id_rub_amount")
         usd_price = round(rub_amount / rate, 2) if rate else 0
@@ -1087,7 +1110,7 @@ async def create_card_payment_lock(plan: dict) -> dict:
         "usd_rub_rate": round(rate, 2),
         "rate_source": source,
         "rate_checked_at": now_str(),
-        "markup_percent": 0 if plan.get("product_type") == "apple_id" else markup_percent,
+        "markup_percent": 0 if plan.get("product_type") in {"apple_id", "telegram_stars", "telegram_premium"} else markup_percent,
         "final_usd_rub_rate": round(final_rate, 4),
         "rub_amount": rub_amount,
         "rate_locked_until": locked_until.isoformat(timespec="seconds"),
@@ -2865,6 +2888,277 @@ def recalculate_all_apple_id_prices(apply: bool = False) -> tuple[dict, dict]:
     return report, catalog
 
 
+
+# ─── Telegram Stars / Premium catalog ─────────────────────────────────────────
+
+TELEGRAM_PREMIUM_SUPPORTED_DURATIONS = {1, 3, 6, 12}
+
+
+def telegram_services_pricing_settings() -> dict:
+    cfg = load_config()
+    settings = cfg.get("telegram_services_pricing") if isinstance(cfg.get("telegram_services_pricing"), dict) else {}
+    return {**DEFAULT_TELEGRAM_SERVICES_PRICING, **settings}
+
+
+def is_telegram_stars_branding(text: str) -> bool:
+    low = str(text or "").lower().replace("ё", "е")
+    has_telegram = bool(re.search(r"\btelegram\b|\btg\b|телеграм", low))
+    has_stars = bool(re.search(r"\bstars?\b|звезд|⭐|\bxtr\b", low))
+    return has_telegram and has_stars
+
+
+def is_telegram_premium_branding(text: str) -> bool:
+    low = str(text or "").lower().replace("ё", "е")
+    has_telegram = bool(re.search(r"\btelegram\b|\btg\b|телеграм", low))
+    has_premium = bool(re.search(r"\bpremium\b|премиум", low))
+    return has_telegram and has_premium
+
+
+def extract_telegram_stars_nominal_from_text(text):
+    raw = str(text or "")
+    low = raw.lower().replace("ё", "е")
+    if re.search(r"\d+\s*(?:-|–|—|to|до)\s*\d+|(?:from|от)\s*\d+|\d+[\.,]\d+", low):
+        return None
+    token = r"(?:stars?|⭐|xtr|звезд[а-я]*)"
+    candidates = []
+    for pattern in (rf"(?<![\d.,])(\d{{1,5}})\s*{token}", rf"{token}\s*(\d{{1,5}})(?![\d.,])"):
+        for m in re.finditer(pattern, low):
+            try:
+                candidates.append(int(m.group(1)))
+            except ValueError:
+                pass
+    candidates = sorted(set(candidates))
+    if len(candidates) != 1:
+        return None
+    nominal = candidates[0]
+    return nominal if 50 <= nominal <= 10000 else None
+
+
+def extract_telegram_premium_duration_from_text(text):
+    low = str(text or "").lower().replace("ё", "е")
+    if re.search(r"annual|yearly|1\s*(?:год|year)", low):
+        return 12
+    matches = []
+    for m in re.finditer(r"(?<!\d)(1|3|6|12)\s*(?:m\b|month|months|мес|месяц|месяца|месяцев)", low):
+        matches.append(int(m.group(1)))
+    matches = sorted(set(matches))
+    if len(matches) != 1:
+        return None
+    return matches[0] if matches[0] in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS else None
+
+
+def normalize_telegram_stars_product(product: dict) -> dict:
+    item = dict(product)
+    item.setdefault("id", f"tgstars_{item.get('amount')}")
+    item.setdefault("title", f"Telegram Stars {item.get('amount')} ⭐")
+    item.setdefault("currency", "XTR")
+    item.setdefault("price_rub", "")
+    item.setdefault("enabled", True)
+    item.setdefault("pricing_mode", "supplier_markup")
+    item.setdefault("supplier_available", None)
+    item.setdefault("supplier_stock", None)
+    item.setdefault("supplier_status", "unknown")
+    item.setdefault("supplier_last_seen", "")
+    item.setdefault("fazercards_category_id", "")
+    item.setdefault("fazercards_card_id", "")
+    item.setdefault("fazercards_price_usd", None)
+    item.setdefault("supplier_price_usd", item.get("fazercards_price_usd"))
+    item.setdefault("supplier_cost_rub", None)
+    item.setdefault("supplier_markup_percent", None)
+    item.setdefault("estimated_margin_rub", None)
+    return item
+
+
+def normalize_telegram_premium_product(product: dict) -> dict:
+    item = dict(product)
+    item.setdefault("id", f"tgpremium_{item.get('duration_months')}m")
+    item.setdefault("title", f"Telegram Premium {item.get('duration_months')} {month_word(item.get('duration_months'))}")
+    item.setdefault("currency", "PREMIUM")
+    item.setdefault("price_rub", "")
+    item.setdefault("enabled", True)
+    item.setdefault("pricing_mode", "supplier_markup")
+    item.setdefault("supplier_available", None)
+    item.setdefault("supplier_stock", None)
+    item.setdefault("supplier_status", "unknown")
+    item.setdefault("supplier_last_seen", "")
+    item.setdefault("fazercards_category_id", "")
+    item.setdefault("fazercards_card_id", "")
+    item.setdefault("fazercards_price_usd", None)
+    item.setdefault("supplier_price_usd", item.get("fazercards_price_usd"))
+    item.setdefault("supplier_cost_rub", None)
+    item.setdefault("supplier_markup_percent", None)
+    item.setdefault("estimated_margin_rub", None)
+    return item
+
+
+def month_word(n) -> str:
+    try: n = int(n)
+    except Exception: return "месяцев"
+    return "месяц" if n == 1 else ("месяца" if n in {2,3,4} else "месяцев")
+
+
+def telegram_stars_products() -> list[dict]:
+    return sorted([normalize_telegram_stars_product(p) for p in load_config().get("telegram_stars_products", []) if isinstance(p, dict)], key=lambda p: int(p.get("amount") or 0))
+
+
+def telegram_premium_products() -> list[dict]:
+    return sorted([normalize_telegram_premium_product(p) for p in load_config().get("telegram_premium_products", []) if isinstance(p, dict)], key=lambda p: int(p.get("duration_months") or 0))
+
+
+def save_telegram_stars_products(products: list[dict]) -> None:
+    cfg = load_config(); cfg["telegram_stars_products"] = [normalize_telegram_stars_product(p) for p in products]; save_config(cfg)
+
+
+def save_telegram_premium_products(products: list[dict]) -> None:
+    cfg = load_config(); cfg["telegram_premium_products"] = [normalize_telegram_premium_product(p) for p in products]; save_config(cfg)
+
+
+def telegram_stars_pending_supplier_positions() -> list[dict]:
+    return [p for p in load_config().get("telegram_stars_pending_supplier_positions", []) if isinstance(p, dict)][:100]
+
+
+def telegram_premium_pending_supplier_positions() -> list[dict]:
+    return [p for p in load_config().get("telegram_premium_pending_supplier_positions", []) if isinstance(p, dict)][:100]
+
+
+def is_visible_telegram_stars_product(product: dict, enabled_only: bool = False) -> bool:
+    if not isinstance(product, dict) or product.get("currency") != "XTR": return False
+    try: amount = int(product.get("amount"))
+    except Exception: return False
+    if not 50 <= amount <= 10000: return False
+    if enabled_only and (product.get("enabled") is not True or product.get("supplier_available") is not True or telegram_payment_amount_rub(product) <= 0): return False
+    return True
+
+
+def is_visible_telegram_premium_product(product: dict, enabled_only: bool = False) -> bool:
+    if not isinstance(product, dict) or product.get("currency") != "PREMIUM": return False
+    try: months = int(product.get("duration_months"))
+    except Exception: return False
+    if months not in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS: return False
+    if enabled_only and (product.get("enabled") is not True or product.get("supplier_available") is not True or telegram_payment_amount_rub(product) <= 0): return False
+    return True
+
+
+def telegram_payment_amount_rub(plan: dict) -> int:
+    try: return int(round(float(str(plan.get("price_rub") or "").replace(" ", "").replace(",", "."))))
+    except Exception: return 0
+
+
+def calculate_telegram_supplier_markup_price(product: dict, kind: str) -> dict:
+    settings = telegram_services_pricing_settings()
+    markup = float(settings.get("stars_markup_percent" if kind == "stars" else "premium_markup_percent", 40) or 0)
+    supplier_price = product.get("supplier_price_usd") or product.get("fazercards_price_usd")
+    try: supplier_price = float(supplier_price)
+    except Exception: supplier_price = 0
+    rate, source = get_final_usd_rub_rate()
+    if supplier_price <= 0 or rate <= 0:
+        return {"pricing_error": "missing_supplier_price_usd"}
+    cost = supplier_price * rate
+    price = math.ceil(cost * (1 + markup / 100))
+    return {"recommended_price_rub": price, "supplier_price_usd": supplier_price, "usd_rub_rate_used": rate, "usd_rub_rate_source": source, "supplier_cost_rub": round(cost, 2), "supplier_markup_percent": markup, "estimated_margin_rub": round(price - cost, 2)}
+
+
+def telegram_product_plan(product: dict, product_type: str) -> dict:
+    kind = "stars" if product_type == "telegram_stars" else "premium"
+    rec = calculate_telegram_supplier_markup_price(product, kind)
+    price_rub = telegram_payment_amount_rub(product) or int(rec.get("recommended_price_rub") or 0)
+    plan = {"gb": product.get("title"), "days": "ручная выдача", "price": format_rub(price_rub), "product_type": product_type, "product_id": product.get("id"), "product_title": product.get("title"), "currency": product.get("currency"), "price_rub": price_rub, "supplier_price_usd": product.get("supplier_price_usd") or product.get("fazercards_price_usd"), "fazercards_category_id": product.get("fazercards_category_id", ""), "fazercards_card_id": product.get("fazercards_card_id", ""), "supplier_available": product.get("supplier_available"), "supplier_stock": product.get("supplier_stock")}
+    if product_type == "telegram_stars": plan["amount"] = int(product.get("amount") or 0)
+    else: plan["duration_months"] = int(product.get("duration_months") or 0)
+    plan.update({k: rec.get(k) for k in ("usd_rub_rate_used", "usd_rub_rate_source", "supplier_cost_rub", "supplier_markup_percent", "estimated_margin_rub")})
+    return plan
+
+
+def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict | None:
+    category_name = fazercards_product_value(category, "name") or str(category)
+    card_name = fazercards_product_value(card, "name") or str(card)
+    text = f"{category_name} {card_name}"
+    if kind == "stars":
+        if not is_telegram_stars_branding(text): return None
+        amount = extract_telegram_stars_nominal_from_text(text)
+        if amount is None: return None
+        pid, title, extra = f"tgstars_{amount}", f"Telegram Stars {amount} ⭐", {"amount": amount, "currency": "XTR"}
+    else:
+        if not is_telegram_premium_branding(text): return None
+        months = extract_telegram_premium_duration_from_text(text)
+        if months not in TELEGRAM_PREMIUM_SUPPORTED_DURATIONS: return {"unsupported": True, "title": card_name}
+        pid, title, extra = f"tgpremium_{months}m", f"Telegram Premium {months} {month_word(months)}", {"duration_months": months, "currency": "PREMIUM"}
+    try: stock = int(float(fazercards_product_value(card, "stock") or 0))
+    except Exception: stock = 0
+    try: price_usd = float(fazercards_product_value(card, "price_usd") or 0)
+    except Exception: price_usd = 0
+    item = {"id": pid, "title": title, **extra, "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": stock > 0, "supplier_status": "found" if stock > 0 else "out_of_stock", "supplier_stock": stock, "supplier_last_seen": now_str(), "fazercards_category_id": fazercards_category_id_value(category), "fazercards_card_id": fazercards_product_value(card, "card_id"), "fazercards_price_usd": price_usd, "supplier_price_usd": price_usd}
+    rec = calculate_telegram_supplier_markup_price(item, kind)
+    if not rec.get("pricing_error"): item.update({"price_rub": rec["recommended_price_rub"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+    return item
+
+
+async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
+    report = {"ok": True, "updated": 0, "pending": 0, "not_found": 0, "unsupported": 0, "errors": 0, "lines": []}
+    products_payload = await fetch_fazercards_products_readonly()  # GET /giftcards
+    items = products_payload.get("items") if isinstance(products_payload, dict) else []
+    if not products_payload.get("ok") or not isinstance(items, list):
+        report.update({"ok": False, "errors": 1, "error": products_payload.get("error") or "giftcards_fetch_failed"})
+        return report
+    found_stars, found_premium = {}, {}
+    for category in items:
+        category_text = fazercards_product_value(category, "name") or str(category)
+        if not (is_telegram_stars_branding(category_text) or is_telegram_premium_branding(category_text) or "telegram" in category_text.lower() or "телеграм" in category_text.lower()):
+            continue
+        category_id = fazercards_category_id_value(category)
+        payload = await fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards?category_id=...
+        cards = payload.get("items") if isinstance(payload, dict) else []
+        if not payload.get("ok") or not isinstance(cards, list):
+            report["errors"] += 1; continue
+        for card in cards:
+            for k, found in (("stars", found_stars), ("premium", found_premium)):
+                if kind not in ("all", k): continue
+                pos = _telegram_supplier_position(category, card, k)
+                if not pos: continue
+                if pos.get("unsupported"):
+                    report["unsupported"] += 1; continue
+                found[pos["id"]] = pos
+    if kind in ("all", "stars"):
+        catalog = telegram_stars_products(); ids = {p.get("id") for p in catalog}
+        for p in catalog:
+            match = found_stars.get(p.get("id"))
+            if match:
+                enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
+            else:
+                p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
+        pending = [v for k, v in found_stars.items() if k not in ids]
+        cfg = load_config(); cfg["telegram_stars_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending"] += len(pending)
+        save_telegram_stars_products(catalog)
+    if kind in ("all", "premium"):
+        catalog = telegram_premium_products(); ids = {p.get("id") for p in catalog}
+        for p in catalog:
+            match = found_premium.get(p.get("id"))
+            if match:
+                enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1
+            else:
+                p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
+        pending = [v for k, v in found_premium.items() if k not in ids]
+        cfg = load_config(); cfg["telegram_premium_pending_supplier_positions"] = pending[:100]; save_config(cfg); report["pending"] += len(pending)
+        save_telegram_premium_products(catalog)
+    return report
+
+
+def add_telegram_pending_supplier_positions(kind: str) -> dict:
+    cfg = load_config(); report = {"added": 0, "skipped": 0}
+    if kind == "stars":
+        catalog = telegram_stars_products(); ids = {p.get("id") for p in catalog}
+        for item in telegram_stars_pending_supplier_positions():
+            if item.get("id") in ids: report["skipped"] += 1; continue
+            catalog.append(normalize_telegram_stars_product(item)); report["added"] += 1
+        cfg["telegram_stars_pending_supplier_positions"] = []; save_config(cfg); save_telegram_stars_products(catalog)
+    else:
+        catalog = telegram_premium_products(); ids = {p.get("id") for p in catalog}
+        for item in telegram_premium_pending_supplier_positions():
+            if item.get("id") in ids: report["skipped"] += 1; continue
+            catalog.append(normalize_telegram_premium_product(item)); report["added"] += 1
+        cfg["telegram_premium_pending_supplier_positions"] = []; save_config(cfg); save_telegram_premium_products(catalog)
+    return report
+
 def summarize_fazercards_products(products_payload: dict) -> tuple[int, list[str]]:
     items = products_payload.get("items") if isinstance(products_payload, dict) else []
     if not isinstance(items, list):
@@ -3660,6 +3954,22 @@ def build_order_card_text(order: dict) -> str:
             f"Итоговый курс: <b>{final_rate:.4f} ₽</b>\n"
         )
     username = order.get("tg_handle") or "—"
+    if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        is_stars = order.get("product_type") == "telegram_stars"
+        title = "⭐ <b>Заказ Telegram Stars</b>" if is_stars else "💎 <b>Заказ Telegram Premium</b>"
+        qty_line = f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>" if is_stars else f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>"
+        return (
+            f"{title}\n\n"
+            f"Номер: <b>{html_escape(order_number_plain(order))}</b>\n"
+            f"Клиент: <b>{html_escape(order.get('name', '—'))}</b> / <code>{html_escape(order.get('user_id', '—'))}</code>\n"
+            f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+            f"{qty_line}\n"
+            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"Оплата: <b>{html_escape(payment_method)}</b>\n"
+            f"Поставщик:\n- статус: <b>{html_escape(order.get('supplier_status', order.get('status', '—')))}</b>\n- stock: <b>{html_escape(order.get('supplier_stock', '—'))}</b>\n- card_id: <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n- закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+            f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
+            f"Статус: нужна ручная выдача / <b>{html_escape(order_status_with_icon(order.get('status')))}</b>"
+        )
     if order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
@@ -4538,12 +4848,93 @@ def get_tma_url() -> str | None:
     return tma_url or None
 
 
+
+def telegram_services_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Звёзды", callback_data="telegram_stars_catalog")],
+        [InlineKeyboardButton("💎 Premium", callback_data="telegram_premium_catalog")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+    ])
+
+
+def telegram_stars_catalog_keyboard() -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(f"{p['amount']} ⭐", callback_data=f"telegram_stars_product:{p['id']}") for p in telegram_stars_products() if is_visible_telegram_stars_product(p, enabled_only=True)]
+    rows = build_grid_keyboard(buttons, 3)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="telegram_stars_start")])
+    return InlineKeyboardMarkup(rows)
+
+
+def telegram_premium_catalog_keyboard() -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(f"{p['duration_months']} {month_word(p['duration_months'])}", callback_data=f"telegram_premium_product:{p['id']}") for p in telegram_premium_products() if is_visible_telegram_premium_product(p, enabled_only=True)]
+    rows = build_grid_keyboard(buttons, 2)
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="telegram_stars_start")])
+    return InlineKeyboardMarkup(rows)
+
+
+def telegram_product_by_id(product_id: str, product_type: str) -> dict | None:
+    products = telegram_stars_products() if product_type == "telegram_stars" else telegram_premium_products()
+    for product in products:
+        if product.get("id") == product_id:
+            return product
+    return None
+
+
+def telegram_product_keyboard(product: dict, product_type: str) -> InlineKeyboardMarkup:
+    back = "telegram_stars_catalog" if product_type == "telegram_stars" else "telegram_premium_catalog"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Купить", callback_data=f"buy_{product_type}_product:{product['id']}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=back)],
+    ])
+
+
+def telegram_recipient_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Получатель — мой аккаунт", callback_data="telegram_recipient_me")],
+        [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
+    ])
+
+
+def normalize_telegram_recipient_username(text: str) -> str:
+    raw = str(text or "").strip()
+    raw = re.sub(r"^https?://t\.me/", "", raw, flags=re.I)
+    raw = re.sub(r"^t\.me/", "", raw, flags=re.I)
+    raw = raw.split("/", 1)[0].split("?", 1)[0].strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", raw or ""):
+        return ""
+    return f"@{raw}"
+
+
+def create_telegram_checkout_order(user, product: dict, product_type: str, recipient: str) -> dict:
+    plan = telegram_product_plan(product, product_type)
+    return append_order({**plan, "telegram_recipient_username": recipient, "payment_status": "pending", "payment_method": "", "payment_provider": "", "name": "", "tg_handle": user_tag(user), "user_id": user.id, "status": "waiting_payment", "checkout_created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"), "abandoned_reminder_sent": False})
+
+
+def admin_telegram_services_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Stars каталог", callback_data="admin_telegram_stars_catalog")],
+        [InlineKeyboardButton("💎 Premium каталог", callback_data="admin_telegram_premium_catalog")],
+        [InlineKeyboardButton("🔗 Синхронизировать Stars", callback_data="admin_telegram_sync_stars")],
+        [InlineKeyboardButton("🔗 Синхронизировать Premium", callback_data="admin_telegram_sync_premium")],
+        [InlineKeyboardButton("🔗 Синхронизировать всё", callback_data="admin_telegram_sync_all")],
+        [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_telegram_supplier_found_disabled")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="admin_business")],
+    ])
+
+
+def admin_telegram_services_text() -> str:
+    return ("⭐ <b>Telegram Stars</b>\n\n"
+            f"Stars в каталоге: <b>{len(telegram_stars_products())}</b>\n"
+            f"Premium в каталоге: <b>{len(telegram_premium_products())}</b>\n"
+            f"Новых Stars у поставщика: <b>{len(telegram_stars_pending_supplier_positions())}</b>\n"
+            f"Новых Premium у поставщика: <b>{len(telegram_premium_pending_supplier_positions())}</b>")
+
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
         [InlineKeyboardButton("🍎 Пополнить Apple ID",       callback_data="buy_apple_id")],
+        [InlineKeyboardButton("⭐ Купить Telegram Stars",    callback_data="telegram_stars_start")],
+        [InlineKeyboardButton("🌍 Купить eSIM",              callback_data="buy_esim")],
         [InlineKeyboardButton("👤 Личный кабинет",           callback_data="profile")],
-        [InlineKeyboardButton("👨‍💻 Поддержка",              url=SUPPORT_URL)],
+        [InlineKeyboardButton("🆘 Поддержка",                 url=SUPPORT_URL)],
     ]
     # TMA_URL and Mini App code are preserved, but the open-app button is temporarily hidden.
     tma_url = get_tma_url()
@@ -4580,6 +4971,7 @@ def admin_payment_sections_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
         [InlineKeyboardButton("💱 Курс USD/RUB", callback_data="admin_usd_rub")],
         [InlineKeyboardButton("🍎 Apple ID каталог", callback_data="admin_apple_id_catalog")],
+        [InlineKeyboardButton("⭐ Telegram Stars", callback_data="admin_telegram_services")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
     ])
 
@@ -5378,6 +5770,24 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def build_user_order_card_text(order: dict) -> str:
+    if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        payment_provider = order.get("payment_provider") or ""
+        payment_method = order.get("payment_method") or (payment_provider_label(payment_provider) if payment_provider else "—")
+        is_stars = order.get("product_type") == "telegram_stars"
+        title = "⭐ <b>Заказ Telegram Stars</b>" if is_stars else "💎 <b>Заказ Telegram Premium</b>"
+        qty_line = f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>" if is_stars else f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>"
+        return (
+            f"{title}\n\n"
+            f"Номер: <b>{html_escape(order_number_plain(order))}</b>\n"
+            f"Клиент: <b>{html_escape(order.get('name', '—'))}</b> / <code>{html_escape(order.get('user_id', '—'))}</code>\n"
+            f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+            f"{qty_line}\n"
+            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+            f"Оплата: <b>{html_escape(payment_method)}</b>\n"
+            f"Поставщик:\n- статус: <b>{html_escape(order.get('supplier_status', order.get('status', '—')))}</b>\n- stock: <b>{html_escape(order.get('supplier_stock', '—'))}</b>\n- card_id: <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n- закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+            f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
+            f"Статус: нужна ручная выдача / <b>{html_escape(order_status_with_icon(order.get('status')))}</b>"
+        )
     if order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
@@ -5566,6 +5976,76 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
     return WAITING_PAYMENT
 
 
+
+
+async def start_telegram_product_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    prefix, product_id = query.data.split(":", 1)
+    product_type = "telegram_stars" if prefix == "buy_telegram_stars_product" else "telegram_premium"
+    product = telegram_product_by_id(product_id, product_type)
+    visible = is_visible_telegram_stars_product(product, True) if product_type == "telegram_stars" else is_visible_telegram_premium_product(product, True)
+    if not visible:
+        await query.answer("Товар временно недоступен.", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["telegram_pending_product_type"] = product_type
+    context.user_data["telegram_pending_product_id"] = product_id
+    await query.message.reply_text("Введите @username получателя Telegram.", parse_mode="HTML", reply_markup=telegram_recipient_keyboard())
+    return WAITING_TELEGRAM_RECIPIENT
+
+
+async def receive_telegram_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    username = normalize_telegram_recipient_username(update.message.text)
+    if not username:
+        await update.message.reply_text("Введите корректный username: @username, username или t.me/username.", reply_markup=telegram_recipient_keyboard())
+        return WAITING_TELEGRAM_RECIPIENT
+    return await begin_telegram_payment(update, context, username)
+
+
+async def telegram_recipient_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    username = normalize_telegram_recipient_username(getattr(query.from_user, "username", ""))
+    if not username:
+        await query.message.reply_text("У вашего аккаунта нет username. Введите @username получателя вручную.", reply_markup=telegram_recipient_keyboard())
+        return WAITING_TELEGRAM_RECIPIENT
+    return await begin_telegram_payment(update, context, username)
+
+
+async def begin_telegram_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, recipient: str) -> int:
+    query = getattr(update, "callback_query", None)
+    message = query.message if query else update.message
+    user = query.from_user if query else update.effective_user
+    product_type = context.user_data.get("telegram_pending_product_type")
+    product_id = context.user_data.get("telegram_pending_product_id")
+    product = telegram_product_by_id(product_id, product_type)
+    visible = is_visible_telegram_stars_product(product, True) if product_type == "telegram_stars" else is_visible_telegram_premium_product(product, True)
+    if not visible:
+        await message.reply_text("Товар временно недоступен. Оплата не создана.")
+        return ConversationHandler.END
+    plan = telegram_product_plan(product, product_type)
+    if telegram_payment_amount_rub(plan) <= 0:
+        await message.reply_text("Товар временно недоступен. Оплата не создана.")
+        return ConversationHandler.END
+    context.user_data["telegram_recipient_username"] = recipient
+    context.user_data["plan_key"] = product_id
+    context.user_data["plan"] = plan
+    order = create_telegram_checkout_order(user, product, product_type, recipient)
+    context.user_data["checkout_order_id"] = order["id"]
+    methods = enabled_payment_methods()
+    if list(methods.keys()) == ["card"] or not methods:
+        cfg = load_config(); card = cfg["payment"].get("card", "")
+        context.user_data["payment_method"] = payment_provider_label("card")
+        context.user_data["payment_provider"] = "card"
+        lock = await create_card_payment_lock_or_notify(query or type("Q", (), {"message": message})(), plan)
+        if not lock: return WAITING_PAYMENT
+        context.user_data["card_payment_lock"] = lock
+        update_checkout_order(order["id"], telegram_recipient_username=recipient, payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
+        await message.reply_text(build_card_payment_text(plan, card, lock), parse_mode="HTML", reply_markup=card_payment_keyboard())
+    else:
+        await message.reply_text("💳 <b>Выберите способ оплаты</b>\n\n" + f"Товар: <b>{html_escape(plan['product_title'])}</b>\nПолучатель: <b>{html_escape(recipient)}</b>\nЦена: <b>{html_escape(plan['price'])}</b>", parse_mode="HTML", reply_markup=payment_keyboard(product_id))
+    return WAITING_PAYMENT
+
 async def repeat_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     order_id = int(query.data.split(":", 1)[1])
@@ -5627,14 +6107,14 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         context.user_data["payment_method"] = payment_provider_label("cryptobot")
         context.user_data["payment_provider"] = "cryptobot"
-        amount = apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else parse_price(plan.get("price", "0"))
+        amount = (apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else (telegram_payment_amount_rub(plan) if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else parse_price(plan.get("price", "0"))))
         if amount <= 0:
             await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
             return WAITING_PAYMENT
         description = (
             f"SLIK Apple ID {plan.get('product_title', '')}".strip()
             if plan.get("product_type") == "apple_id"
-            else f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip()
+            else (f"SLIK Telegram {plan.get('product_title', '')}".strip() if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip())
         )
         invoice = await crypto_create_invoice(token, amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}")
         if not invoice:
@@ -5881,6 +6361,28 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "pricing_mode": "supplier_markup",
             "country": APPLE_ID_REGION_TITLES.get(plan.get("region"), plan.get("region", "—")),
         })
+    if plan.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        order_payload.update({
+            "product_id": plan.get("product_id"),
+            "product_title": plan.get("product_title"),
+            "amount": plan.get("amount"),
+            "duration_months": plan.get("duration_months"),
+            "currency": plan.get("currency"),
+            "telegram_recipient_username": context.user_data.get("telegram_recipient_username"),
+            "payment_status": "paid",
+            "price_rub": plan.get("price_rub"),
+            "supplier_price_usd": plan.get("supplier_price_usd"),
+            "usd_rub_rate_used": plan.get("usd_rub_rate_used"),
+            "usd_rub_rate_source": plan.get("usd_rub_rate_source"),
+            "supplier_cost_rub": plan.get("supplier_cost_rub"),
+            "supplier_markup_percent": plan.get("supplier_markup_percent"),
+            "estimated_margin_rub": plan.get("estimated_margin_rub"),
+            "fazercards_category_id": plan.get("fazercards_category_id"),
+            "fazercards_card_id": plan.get("fazercards_card_id"),
+            "supplier_available": plan.get("supplier_available"),
+            "supplier_stock": plan.get("supplier_stock"),
+            "country": "Telegram",
+        })
     payment_details = order_payment_details_from_context(context)
     if payment_details:
         order_payload["payment_details"] = payment_details
@@ -5891,7 +6393,12 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         order = append_order(order_payload)
     profile, previous_status, current_status, cashback_amount = record_user_order(user, order)
 
-    if plan.get("product_type") == "apple_id":
+    if plan.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        if plan.get("product_type") == "telegram_stars":
+            client_text = ("✅ <b>Заявка создана</b>\n\n" f"🧾 Номер заказа: <b>{order['number']}</b>\n\n" f"⭐ Товар: <b>{html_escape(plan.get('product_title', 'Telegram Stars'))}</b>\n" f"Количество: <b>{html_escape(str(plan.get('amount')))} ⭐</b>\n" f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n" f"Сумма: <b>{html_escape(plan['price'])}</b>\n\nПосле оплаты менеджер вручную зачислит Stars.")
+        else:
+            client_text = ("✅ <b>Заявка создана</b>\n\n" f"🧾 Номер заказа: <b>{order['number']}</b>\n\n" f"💎 Товар: <b>{html_escape(plan.get('product_title', 'Telegram Premium'))}</b>\n" f"Срок: <b>{html_escape(str(plan.get('duration_months')))} {month_word(plan.get('duration_months'))}</b>\n" f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n" f"Сумма: <b>{html_escape(plan['price'])}</b>\n\nПосле оплаты менеджер вручную оформит Premium.")
+    elif plan.get("product_type") == "apple_id":
         nominal = apple_id_product_nominal_label({"amount": plan.get("amount"), "currency": plan.get("currency")})
         client_text = (
             "✅ <b>Заявка создана</b>\n\n"
@@ -6011,8 +6518,8 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
         )
         return
 
-    payment_method = order.get("payment_method")
-    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n" if payment_method else ""
+    payment_method = order.get("payment_method") or order.get("payment_provider") or "—"
+    payment_line = f"💳 Оплата: <b>{html_escape(payment_method)}</b>\n"
     payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
     payment_details_line = ""
     if payment_method == "Карта" and payment_details:
@@ -6028,7 +6535,38 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
             f"Итоговый курс: <b>{html_escape(final_rate_text)} ₽</b>\n"
             f"К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
         )
-    if order.get("product_type") == "apple_id":
+    if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
+        if order.get("product_type") == "telegram_stars":
+            text = (
+                "⭐ <b>Новый заказ Telegram Stars</b>\n\n"
+                f"Номер заказа: <b>{html_escape(order_number)}</b>\n"
+                f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>\n"
+                f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+                f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+                f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+                f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
+                f"Статус: ожидает оплаты / нужна ручная выдача\n"
+                f"{payment_line}{payment_details_line}"
+                f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+                f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+            )
+        else:
+            text = (
+                "💎 <b>Новый заказ Telegram Premium</b>\n\n"
+                f"Номер заказа: <b>{html_escape(order_number)}</b>\n"
+                f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>\n"
+                f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
+                f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
+                f"Поставщик: <b>{html_escape(order.get('supplier_status', '—'))}</b>, stock <b>{html_escape(order.get('supplier_stock', '—'))}</b>, card_id <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n"
+                f"Закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
+                f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
+                f"Статус: ожидает оплаты / нужна ручная выдача\n"
+                f"{payment_line}{payment_details_line}"
+                f"🕒 {html_escape(order.get('created_at', '—'))}\n"
+                f"Маршрут: orders · {html_escape(source)} · <code>{html_escape(str(admin_id))}</code>"
+            )
+    elif order.get("product_type") == "apple_id":
         amount = order.get("amount", "—")
         currency = order.get("currency", "")
         nominal = apple_id_product_nominal_label({"amount": amount, "currency": currency})
@@ -8045,6 +8583,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"✅ Права администратора у пользователя {admin_target_label(user_id)} удалены.",
                 admin_management_keyboard(),
             )
+    elif data == "admin_telegram_services":
+        await query.answer()
+        await edit_or_send(query, context, admin_telegram_services_text(), admin_telegram_services_keyboard())
+    elif data in {"admin_telegram_stars_catalog", "admin_telegram_premium_catalog"}:
+        await query.answer()
+        if data == "admin_telegram_stars_catalog":
+            lines = ["⭐ <b>Stars каталог</b>", ""] + [f"{p.get('title')} — {format_rub(p.get('price_rub'))} — {p.get('supplier_status')}" for p in telegram_stars_products()]
+            if not telegram_stars_products(): lines.append("Каталог пуст. Запустите sync FazerCards и подтвердите найденные позиции.")
+            lines.append(f"\nPending: {len(telegram_stars_pending_supplier_positions())}")
+        else:
+            lines = ["💎 <b>Premium каталог</b>", ""] + [f"{p.get('title')} — {format_rub(p.get('price_rub'))} — {p.get('supplier_status')}" for p in telegram_premium_products()]
+            if not telegram_premium_products(): lines.append("Каталог пуст. Запустите sync FazerCards и подтвердите найденные позиции.")
+            lines.append(f"\nPending: {len(telegram_premium_pending_supplier_positions())}")
+        await edit_or_send(query, context, "\n".join(lines), InlineKeyboardMarkup([[InlineKeyboardButton("✅ Добавить pending Stars", callback_data="admin_telegram_add_pending_stars")], [InlineKeyboardButton("✅ Добавить pending Premium", callback_data="admin_telegram_add_pending_premium")], [InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_services")]]))
+    elif data in {"admin_telegram_sync_stars", "admin_telegram_sync_premium", "admin_telegram_sync_all"}:
+        await query.answer("Синхронизирую FazerCards...")
+        kind = "stars" if data.endswith("stars") else ("premium" if data.endswith("premium") else "all")
+        report = await sync_telegram_fazercards_bulk(kind)
+        await edit_or_send(query, context, f"🔗 <b>FazerCards Telegram sync</b>\n\nОбновлено: {report.get('updated')}\nPending: {report.get('pending')}\nNot found: {report.get('not_found')}\nUnsupported: {report.get('unsupported')}\nОшибки: {report.get('errors')}", admin_telegram_services_keyboard())
+    elif data in {"admin_telegram_add_pending_stars", "admin_telegram_add_pending_premium"}:
+        await query.answer()
+        kind = "stars" if data.endswith("stars") else "premium"
+        report = add_telegram_pending_supplier_positions(kind)
+        await edit_or_send(query, context, f"✅ Добавлено: {report['added']}\nПропущено: {report['skipped']}", admin_telegram_services_keyboard())
+    elif data == "admin_telegram_supplier_found_disabled":
+        await query.answer()
+        disabled = [p.get('title') for p in telegram_stars_products() + telegram_premium_products() if p.get('enabled') is False and p.get('supplier_available') is True]
+        await edit_or_send(query, context, "🔎 <b>Найдены у поставщика, но выключены</b>\n\n" + ("\n".join(disabled) if disabled else "Нет таких товаров."), admin_telegram_services_keyboard())
     elif data == "admin_apple_id_catalog":
         if not has_catalog_admin_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
@@ -8706,6 +9272,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_admin_healthcheck(update, context)
     elif data == "admin_backups":
         await show_admin_backups(update, context)
+    elif data == "telegram_stars_start":
+        await query.answer()
+        await edit_or_send(query, context, "⭐ <b>Telegram Stars</b>\n\nВыберите, что хотите купить:", telegram_services_start_keyboard())
+    elif data == "telegram_stars_catalog":
+        await query.answer()
+        products = [p for p in telegram_stars_products() if is_visible_telegram_stars_product(p, enabled_only=True)]
+        text = "⭐ <b>Telegram Stars</b>\n\nВыберите количество звёзд:" if products else "⭐ <b>Telegram Stars</b>\n\nТовар временно недоступен."
+        await edit_or_send(query, context, text, telegram_stars_catalog_keyboard())
+    elif data == "telegram_premium_catalog":
+        await query.answer()
+        products = [p for p in telegram_premium_products() if is_visible_telegram_premium_product(p, enabled_only=True)]
+        text = "💎 <b>Telegram Premium</b>\n\nВыберите срок подписки:" if products else "💎 <b>Telegram Premium</b>\n\nТовар временно недоступен."
+        await edit_or_send(query, context, text, telegram_premium_catalog_keyboard())
+    elif data.startswith("telegram_stars_product:"):
+        product = telegram_product_by_id(data.split(":", 1)[1], "telegram_stars")
+        if not is_visible_telegram_stars_product(product, True):
+            await query.answer("Товар временно недоступен.", show_alert=True); return
+        await query.answer()
+        await edit_or_send(query, context, f"⭐ <b>{html_escape(product['title'])}</b>\n\nКоличество: <b>{product['amount']} ⭐</b>\nЦена: <b>{format_rub(product.get('price_rub'))}</b>\n\nДля зачисления Stars понадобится Telegram аккаунт получателя.", telegram_product_keyboard(product, "telegram_stars"))
+    elif data.startswith("telegram_premium_product:"):
+        product = telegram_product_by_id(data.split(":", 1)[1], "telegram_premium")
+        if not is_visible_telegram_premium_product(product, True):
+            await query.answer("Товар временно недоступен.", show_alert=True); return
+        await query.answer()
+        await edit_or_send(query, context, f"💎 <b>{html_escape(product['title'])}</b>\n\nСрок: <b>{product['duration_months']} {month_word(product['duration_months'])}</b>\nЦена: <b>{format_rub(product.get('price_rub'))}</b>\n\nДля оформления понадобится Telegram username получателя.", telegram_product_keyboard(product, "telegram_premium"))
     elif data == "buy_esim":
         await show_buy_esim(update, context)
     elif data == "buy_apple_id":
@@ -8843,6 +9434,7 @@ def main() -> None:
         entry_points=[
             CallbackQueryHandler(start_purchase, pattern=r"^buy_plan_"),
             CallbackQueryHandler(start_apple_id_purchase, pattern=r"^buy_apple_id_product:"),
+            CallbackQueryHandler(start_telegram_product_purchase, pattern=r"^buy_telegram_(stars|premium)_product:"),
             CallbackQueryHandler(repeat_order, pattern=r"^repeat_order:\d+$"),
             CallbackQueryHandler(show_existing_checkout_payment, pattern=r"^abandoned_continue:\d+$"),
         ],
@@ -8854,6 +9446,7 @@ def main() -> None:
             ],
             WAITING_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
             WAITING_TELEGRAM: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_telegram)],
+            WAITING_TELEGRAM_RECIPIENT: [CallbackQueryHandler(telegram_recipient_me, pattern=r"^telegram_recipient_me$"), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_telegram_recipient)],
         },
         fallbacks=[
             CallbackQueryHandler(cancel_order_conv, pattern="^cancel_order$"),
