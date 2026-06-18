@@ -255,6 +255,34 @@ def parse_price(s: str) -> float:
         return 0.0
 
 
+def apple_id_payment_amount_rub(plan: dict) -> int:
+    if not isinstance(plan, dict) or plan.get("product_type") != "apple_id":
+        return 0
+    try:
+        amount = int(round(float(str(plan.get("price_rub") or "").replace(" ", "").replace(",", "."))))
+    except (TypeError, ValueError):
+        amount = 0
+    if amount > 0:
+        return amount
+    try:
+        amount = int(round(float(str(plan.get("recommended_price_rub") or "").replace(" ", "").replace(",", "."))))
+    except (TypeError, ValueError):
+        amount = 0
+    if amount > 0:
+        return amount
+    try:
+        fallback = int(round(float(plan.get("price_usd") or 0) * (get_manual_usd_rub_rate() or USD_RUB_FALLBACK_RATE)))
+    except (TypeError, ValueError):
+        fallback = 0
+    return fallback if fallback > 0 else 0
+
+
+def payment_amount_error_text(plan: dict) -> str:
+    if plan.get("product_type") == "apple_id":
+        return "⚠️ Не удалось определить сумму Apple ID в рублях. Оплата не создана, напишите менеджеру."
+    return "⚠️ Не удалось определить сумму оплаты. Попробуйте позже или напишите менеджеру."
+
+
 def parse_order_days(value) -> int | None:
     match = re.search(r"\d+", str(value or ""))
     if not match:
@@ -938,21 +966,40 @@ async def refresh_usd_rub_rate_check() -> tuple[float, str]:
 
 
 async def create_card_payment_lock(plan: dict) -> dict:
-    usd_price = parse_price(plan.get("price", "0"))
     rate, source = await get_usd_rub_rate()
     markup_percent = get_configured_usd_rub_markup_percent()
-    rub_amount = math.ceil(usd_price * rate * (1 + markup_percent / 100))
+    if plan.get("product_type") == "apple_id":
+        rub_amount = apple_id_payment_amount_rub(plan)
+        if rub_amount <= 0:
+            raise ValueError("invalid_apple_id_rub_amount")
+        usd_price = round(rub_amount / rate, 2) if rate else 0
+        final_rate = rate
+    else:
+        usd_price = parse_price(plan.get("price", "0"))
+        rub_amount = math.ceil(usd_price * rate * (1 + markup_percent / 100))
+        final_rate = rate * (1 + markup_percent / 100)
+    if rub_amount <= 0:
+        raise ValueError("invalid_payment_amount")
     locked_until = rate_lock_now() + datetime.timedelta(seconds=CARD_RATE_LOCK_SECONDS)
     return {
         "usd_price": usd_price,
         "usd_rub_rate": round(rate, 2),
         "rate_source": source,
         "rate_checked_at": now_str(),
-        "markup_percent": markup_percent,
-        "final_usd_rub_rate": round(rate * (1 + markup_percent / 100), 4),
+        "markup_percent": 0 if plan.get("product_type") == "apple_id" else markup_percent,
+        "final_usd_rub_rate": round(final_rate, 4),
         "rub_amount": rub_amount,
         "rate_locked_until": locked_until.isoformat(timespec="seconds"),
     }
+
+
+async def create_card_payment_lock_or_notify(query, plan: dict) -> dict | None:
+    try:
+        return await create_card_payment_lock(plan)
+    except ValueError as exc:
+        logger.warning("Payment amount is invalid for %s: %s", plan.get("product_type", "plan"), exc)
+        await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
+        return None
 
 
 def build_card_payment_text(plan: dict, card: str, lock: dict) -> str:
@@ -1511,12 +1558,16 @@ def apple_id_region_aliases(region: str) -> list[str]:
     return {"US": ["usa", "us", "сша", "united states"], "TR": ["turkey", "tr", "турция", "türkiye", "turkiye"]}.get(str(region).upper(), [str(region).lower()])
 
 
-def apple_id_nominal_text(product: dict) -> str:
+def format_apple_id_amount_for_match(amount) -> str:
     try:
-        amount = float(product.get("amount") or 0)
-        return f"{amount:g}"
+        numeric = float(amount or 0)
+        return f"{numeric:g}"
     except (TypeError, ValueError):
-        return str(product.get("amount") or "").strip()
+        return str(amount or "").strip()
+
+
+def apple_id_nominal_text(product: dict) -> str:
+    return format_apple_id_amount_for_match(product.get("amount"))
 
 
 def apple_id_exact_market_match(title: str, product: dict) -> bool:
@@ -4039,7 +4090,9 @@ async def show_existing_checkout_payment(update: Update, context: ContextTypes.D
         return WAITING_PAYMENT
 
     cfg = load_config()
-    lock = await create_card_payment_lock(plan)
+    lock = await create_card_payment_lock_or_notify(query, plan)
+    if not lock:
+        return WAITING_PAYMENT
     context.user_data["card_payment_lock"] = lock
     update_checkout_order(order_id, payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
     await edit_or_send(query, context, build_card_payment_text(plan, cfg["payment"].get("card", ""), lock), card_payment_keyboard())
@@ -4412,7 +4465,9 @@ async def start_purchase_for_plan(update: Update, context: ContextTypes.DEFAULT_
         card = cfg["payment"].get("card", "")
         context.user_data["payment_method"] = payment_provider_label("card")
         context.user_data["payment_provider"] = "card"
-        lock = await create_card_payment_lock(plan)
+        lock = await create_card_payment_lock_or_notify(query, plan)
+        if not lock:
+            return WAITING_PAYMENT
         context.user_data["card_payment_lock"] = lock
         update_checkout_order(order["id"], payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
         await query.message.reply_text(
@@ -4466,7 +4521,9 @@ async def start_apple_id_purchase(update: Update, context: ContextTypes.DEFAULT_
         card = cfg["payment"].get("card", "")
         context.user_data["payment_method"] = payment_provider_label("card")
         context.user_data["payment_provider"] = "card"
-        lock = await create_card_payment_lock(plan)
+        lock = await create_card_payment_lock_or_notify(query, plan)
+        if not lock:
+            return WAITING_PAYMENT
         context.user_data["card_payment_lock"] = lock
         update_checkout_order(order["id"], payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
         await query.message.reply_text(build_card_payment_text(plan, card, lock), parse_mode="HTML", reply_markup=card_payment_keyboard())
@@ -4544,7 +4601,10 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         context.user_data["payment_method"] = payment_provider_label("cryptobot")
         context.user_data["payment_provider"] = "cryptobot"
-        amount = parse_price(plan.get("price", "0"))
+        amount = apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else parse_price(plan.get("price", "0"))
+        if amount <= 0:
+            await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
+            return WAITING_PAYMENT
         description = (
             f"SLIK Apple ID {plan.get('product_title', '')}".strip()
             if plan.get("product_type") == "apple_id"
@@ -4592,7 +4652,9 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ):
             cfg = load_config()
             card = cfg["payment"].get("card", "")
-            new_lock = await create_card_payment_lock(plan)
+            new_lock = await create_card_payment_lock_or_notify(query, plan)
+            if not new_lock:
+                return WAITING_PAYMENT
             context.user_data["card_payment_lock"] = new_lock
             await query.message.reply_text(
                 "⏳ <b>Время действия суммы истекло</b>\n"
@@ -4620,7 +4682,9 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         card = cfg["payment"].get("card", "")
         context.user_data["payment_method"] = payment_provider_label("card")
         context.user_data["payment_provider"] = "card"
-        lock = await create_card_payment_lock(plan)
+        lock = await create_card_payment_lock_or_notify(query, plan)
+        if not lock:
+            return WAITING_PAYMENT
         context.user_data["card_payment_lock"] = lock
         update_checkout_order(context.user_data.get("checkout_order_id"), payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
         await query.message.reply_text(
