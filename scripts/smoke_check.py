@@ -917,7 +917,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("eSIM logic present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text and "await get_usd_rub_rate()" in bot_text)
     record("cashback disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
     record("global apple_id_pricing exists", '"apple_id_pricing"' in bot_text and "DEFAULT_APPLE_ID_PRICING" in bot_text)
-    record("default supplier_markup_percent = 20", '"supplier_markup_percent": 20' in bot_text)
+    record("default supplier_markup_percent = 40", '"supplier_markup_percent": 40' in bot_text)
     record("settings section active name is Настройки", "⚙️ Настройки" in bot_text and "💳 Оплата и курс" not in function_block(bot_text, "admin_panel_keyboard"))
     record("TMA/open app button hidden but TMA config remains", "def get_tma_url" in bot_text and "web_app=WebAppInfo" not in function_block(bot_text, "main_menu_keyboard"))
     record("FazerCards bulk sync button exists", "🔗 Синхронизировать FazerCards" in bot_text and "admin_apple_id_fazer_sync" in bot_text)
@@ -950,6 +950,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     recalc_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all":')
     recalc_confirm_branch = callback_branch_block(bot_text, 'elif data == "admin_apple_id_recalc_all_confirm":')
     parse_supplier_block = function_block(bot_text, "parse_apple_id_supplier_position")
+    extract_nominal_block = function_block(bot_text, "extract_exact_apple_nominal_from_text")
     add_pending_block = function_block(bot_text, "add_apple_id_pending_supplier_positions")
 
     def access_before_call(branch: str, call: str) -> bool:
@@ -959,6 +960,21 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
 
     record("admin_apple_id_fazer_sync branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in fazer_sync_branch)
     record("parse_apple_id_supplier_position exists", "def parse_apple_id_supplier_position" in bot_text and "return None" in parse_supplier_block)
+    record("extract_exact_apple_nominal_from_text exists", "def extract_exact_apple_nominal_from_text" in bot_text and "return int(amount)" in extract_nominal_block)
+    for label, needle in (
+        ("supports $2", r"\$\s*(\d+(?:[.,]\d+)?)"),
+        ("supports 4$", r"(\d+(?:[.,]\d+)?)\s*\$"),
+        ("supports USD 2", r"\bUSD\s*(\d+(?:[.,]\d+)?)\b"),
+        ("supports 2 USD", r"\b(\d+(?:[.,]\d+)?)\s*USD\b"),
+        ("supports ₺100", r"₺\s*(\d+(?:[.,]\d+)?)"),
+        ("supports 100₺", r"(\d+(?:[.,]\d+)?)\s*₺"),
+        ("supports TRY 100", r"\bTRY\s*(\d+(?:[.,]\d+)?)\b"),
+        ("supports 100 TRY", r"\b(\d+(?:[.,]\d+)?)\s*TRY\b"),
+        ("supports TL 100", r"\bTL\s*(\d+(?:[.,]\d+)?)\b"),
+        ("supports 100 TL", r"\b(\d+(?:[.,]\d+)?)\s*TL\b"),
+    ):
+        record(f"nominal extractor {label}", needle in extract_nominal_block)
+    record("nominal extractor rejects from/ot and ranges", "from|от" in extract_nominal_block and r"\bto\b|\bдо\b" in extract_nominal_block and "-|–|—" in extract_nominal_block)
     record("new supplier positions are structured and saved", '"new_supplier_positions_list": []' in bulk_sync_block and "new_supplier_positions.append(parsed)" in bulk_sync_block and "save_apple_id_pending_supplier_positions" in bulk_sync_block)
     record("pending supplier list exists in config", '"apple_id_pending_supplier_positions"' in bot_text and "get_apple_id_pending_supplier_positions" in bot_text)
     record("add supplier positions callback exists", 'admin_apple_id_add_supplier_positions' in bot_text)
@@ -970,6 +986,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("new supplier product price_rub is calculated immediately", 'calculate_apple_id_supplier_markup_price(product)' in add_pending_block and '"price_rub": rec["recommended_price_rub"]' in add_pending_block)
     record("new supplier add supports apple_us_2/apple_us_3/apple_us_4 stable ids", 'f"apple_{region.lower()}_{amount}"' in add_pending_block and '"US"' in parse_supplier_block and '"USD"' in parse_supplier_block)
     record("supplier sync uses only GET giftcards endpoints", "client.post" not in bulk_sync_block and "/giftcards/order" not in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bulk_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bulk_sync_block)
+    record("calculate supplier markup fallback is 40", 'global_pricing.get("supplier_markup_percent", 40)' in calc_block and "markup_percent = 40.0" in calc_block)
     record("admin_apple_id_global_markup branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in global_markup_branch)
     record("admin_apple_id_recalc_all branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_branch)
     record("admin_apple_id_recalc_all_confirm branch contains has_catalog_admin_access", "has_catalog_admin_access(query.from_user)" in recalc_confirm_branch)
@@ -1023,6 +1040,7 @@ def main() -> int:
         check_contains(env_example_text, needle, ".env.example notification routing")
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
     check_contains(config_example_text, '"new_clients"', "bot/config.example.json")
+    check_contains(config_example_text, '"supplier_markup_percent": 40', "bot/config.example.json")
     check_contains(readme_text, "Разделение уведомлений по чатам", "README.md")
     check_contains(readme_text, "/notification_routes", "README.md")
 

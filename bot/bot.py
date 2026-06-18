@@ -71,7 +71,7 @@ MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/produc
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
 APPLE_ID_PRICE_MAX_RUB = 100000
-DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 20, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
+DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 40, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
 APPLE_ID_ORDER_PAGE_SIZE = 5
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
@@ -2167,9 +2167,9 @@ def calculate_apple_id_supplier_markup_price(product: dict, usd_rub_rate=None) -
         supplier_price_usd = 0.0
     try:
         global_pricing = get_apple_id_pricing_settings()
-        markup_percent = float(global_pricing.get("supplier_markup_percent", 20))
+        markup_percent = float(global_pricing.get("supplier_markup_percent", 40))
     except (TypeError, ValueError):
-        markup_percent = 20.0
+        markup_percent = 40.0
     if supplier_price_usd <= 0:
         return {"pricing_mode": "supplier_markup", "recommended_price_rub": 0, "supplier_price_usd": 0, "supplier_cost_rub": 0, "supplier_markup_percent": markup_percent, "estimated_margin_rub": 0, "usd_rub_rate_used": rate, "usd_rub_rate_source": rate_source, "pricing_error": "supplier_price_missing"}
     supplier_cost_rub = supplier_price_usd * rate
@@ -2340,6 +2340,46 @@ def apple_id_exact_fazercards_match(product: dict, category: dict, card: dict) -
     return fazercards_name_has_amount(names, amount_text)
 
 
+def extract_exact_apple_nominal_from_text(text: str, currency: str) -> int | None:
+    names = str(text or "")
+    # Do not import vague "from 2 USD" or ranges like 2-5 USD / 2 to 5 USD.
+    if re.search(r"\b(?:from|от)\s*\d+(?:[.,]\d+)?\s*(?:\$|usd|try|tl|₺)?", names, re.I):
+        return None
+    if re.search(r"\d+(?:[.,]\d+)?\s*(?:-|–|—|\bto\b|\bдо\b)\s*\d+(?:[.,]\d+)?", names, re.I):
+        return None
+    if str(currency or "").upper() == "USD":
+        patterns = (
+            r"\$\s*(\d+(?:[.,]\d+)?)",
+            r"(\d+(?:[.,]\d+)?)\s*\$",
+            r"\bUSD\s*(\d+(?:[.,]\d+)?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*USD\b",
+        )
+    elif str(currency or "").upper() == "TRY":
+        patterns = (
+            r"₺\s*(\d+(?:[.,]\d+)?)",
+            r"(\d+(?:[.,]\d+)?)\s*₺",
+            r"\bTRY\s*(\d+(?:[.,]\d+)?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*TRY\b",
+            r"\bTL\s*(\d+(?:[.,]\d+)?)\b",
+            r"\b(\d+(?:[.,]\d+)?)\s*TL\b",
+        )
+    else:
+        return None
+    values = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, names, re.I):
+            try:
+                values.add(float(str(match).replace(",", ".")))
+            except (TypeError, ValueError):
+                return None
+    if len(values) != 1:
+        return None
+    amount = values.pop()
+    if amount <= 0 or not amount.is_integer():
+        return None
+    return int(amount)
+
+
 def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
     names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title"), card.get("product_name"), card.get("productName")))
     region = None
@@ -2354,20 +2394,9 @@ def parse_apple_id_supplier_position(category: dict, card: dict) -> dict | None:
         currency = "TRY"
     if not region or not currency:
         return None
-    # Do not import vague "from 2 USD" or ranges like 2-5 USD / 2 to 5 USD.
-    if re.search(r"\b(?:from|от)\s*\d+(?:[.,]\d+)?\s*(?:\$|usd|try|tl|₺)?", names, re.I):
+    amount = extract_exact_apple_nominal_from_text(names, currency)
+    if amount is None:
         return None
-    if re.search(r"\d+(?:[.,]\d+)?\s*(?:-|–|—|\bto\b|\bдо\b)\s*\d+(?:[.,]\d+)?", names, re.I):
-        return None
-    currency_pattern = r"(?:\$|USD)" if currency == "USD" else r"(?:₺|TRY|TL)"
-    matches = re.findall(rf"(?:{currency_pattern}\s*)?(\d+(?:[.,]\d+)?)(?:\s*{currency_pattern})", names, re.I)
-    exact_amounts = {float(value.replace(",", ".")) for value in matches}
-    if len(exact_amounts) != 1:
-        return None
-    amount = exact_amounts.pop()
-    if amount <= 0 or not amount.is_integer():
-        return None
-    amount = int(amount)
     category_id = fazercards_category_id_value(category)
     card_id = fazercards_product_value(card, "card_id")
     try:
@@ -7712,7 +7741,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         context.user_data["client_input"] = APPLE_ID_INPUT_MARKUP
         context.user_data.pop("apple_id_product_id", None)
-        current_markup = get_apple_id_pricing_settings().get("supplier_markup_percent", 20)
+        current_markup = get_apple_id_pricing_settings().get("supplier_markup_percent", 40)
         await edit_or_send(query, context, f"✏️ <b>Глобальная наценка Apple ID</b>\n\nТекущая наценка: <b>{float(current_markup):g}%</b>\nВведите новое значение от 0 до 300.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")]]))
     elif data == "admin_apple_id_recalc_all":
         if not has_catalog_admin_access(query.from_user):
