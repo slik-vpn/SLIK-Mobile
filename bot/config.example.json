@@ -23,7 +23,8 @@
   "telegram_services_pricing": {
     "stars_markup_percent": 40,
     "premium_markup_percent": 40,
-    "rounding": 1
+    "rounding": 1,
+    "quote_test_username": ""
   },
   "telegram_stars_products": [],
   "telegram_premium_products": [],

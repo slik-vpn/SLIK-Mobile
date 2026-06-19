@@ -74,7 +74,7 @@ APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
 APPLE_ID_PRICE_MAX_RUB = 100000
 DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 40, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
-DEFAULT_TELEGRAM_SERVICES_PRICING = {"stars_markup_percent": 40, "premium_markup_percent": 40, "rounding": 1}
+DEFAULT_TELEGRAM_SERVICES_PRICING = {"stars_markup_percent": 40, "premium_markup_percent": 40, "rounding": 1, "quote_test_username": ""}
 APPLE_ID_ORDER_PAGE_SIZE = 5
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
@@ -424,6 +424,7 @@ APPLE_ID_INPUT_PRICE = "apple_id_price"
 APPLE_ID_INPUT_ADD_AMOUNT = "apple_id_add_amount"
 APPLE_ID_INPUT_ADD_PRICE = "apple_id_add_price"
 APPLE_ID_INPUT_MARKUP = "apple_id_markup"
+TELEGRAM_QUOTE_USERNAME_INPUT = "telegram_quote_username"
 FAZERCARDS_INPUT_API_KEY = "fazercards_api_key"
 ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
 ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
@@ -2512,26 +2513,76 @@ async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> di
         return {"ok": False, "error": safe_error, "items": []}
 
 
-async def fetch_fazercards_telegram_endpoint_readonly(endpoint: str, label: str) -> dict:
+def telegram_raw_diagnostics(raw, status_code: int | None = None) -> dict:
+    diag = {
+        "http_status": status_code,
+        "raw_type": type(raw).__name__ if raw is not None else "none",
+        "raw_keys": [],
+        "raw_message": "",
+        "raw_sample": "",
+    }
+    if isinstance(raw, dict):
+        diag["raw_keys"] = [str(k) for k in list(raw.keys())[:20]]
+        diag["raw_message"] = str(raw.get("message") or raw.get("error") or raw.get("detail") or raw.get("status") or "")
+        simple = {}
+        for key, value in list(raw.items())[:20]:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                simple[str(key)] = value
+        sample = simple or raw
+    elif isinstance(raw, list):
+        diag["raw_message"] = f"list length: {len(raw)}"
+        sample = {"length": len(raw), "first_item": raw[0] if raw else None}
+    else:
+        sample = raw
+    try:
+        diag["raw_sample"] = json.dumps(sample, ensure_ascii=False, default=str)[:TELEGRAM_RAW_SAMPLE_LIMIT]
+    except Exception:
+        diag["raw_sample"] = str(sample)[:TELEGRAM_RAW_SAMPLE_LIMIT]
+    return diag
+
+
+def telegram_items_from_payload(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    containers = ("offers", "items", "cards", "data", "result", "payload", "quotes", "plans", "packages", "tariffs", "products", "rows", "list")
+    for field in containers:
+        value = payload.get(field)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    for parent in ("data", "result", "payload"):
+        container = payload.get(parent)
+        if isinstance(container, dict):
+            for field in ("items", "plans", "packages", "quotes", "products", "tariffs", "rows", "list", "cards", "offers"):
+                value = container.get(field)
+                if isinstance(value, list):
+                    return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+async def fetch_fazercards_telegram_endpoint_readonly(endpoint: str, label: str, params: dict | None = None) -> dict:
     logger.debug("FazerCards Telegram %s endpoint path: %s", label, endpoint)
     api_key = get_fazercards_api_key()
     if not api_key:
         return {"ok": False, "items": [], "raw": None, "error": "API key не указан"}
     try:
         async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
-            response = await client.get(endpoint, headers=fazercards_headers(api_key))
+            response = await client.get(endpoint, headers=fazercards_headers(api_key), params=params or None)
+            status_code = response.status_code
             response.raise_for_status()
             raw = response.json()
-        items = fazercards_cards_from_payload(raw) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+        raw_diag = telegram_raw_diagnostics(raw, status_code)
+        items = telegram_items_from_payload(raw)
         ok = bool(raw.get("ok", True)) if isinstance(raw, dict) else isinstance(raw, list)
         if not ok:
             error = str(raw.get("error") or raw.get("message") or f"{label}_fetch_failed") if isinstance(raw, dict) else f"{label}_fetch_failed"
-            return {"ok": False, "items": [], "raw": raw, "error": error}
-        return {"ok": True, "items": [item for item in items if isinstance(item, dict)], "raw": raw, "error": ""}
+            return {"ok": False, "items": [], "raw": raw, "raw_diag": raw_diag, "error": error}
+        return {"ok": True, "items": [item for item in items if isinstance(item, dict)], "raw": raw, "raw_diag": raw_diag, "error": ""}
     except Exception as exc:
         safe_error = fazercards_api_error(exc)
         logger.warning("FazerCards Telegram %s fetch failed: %s", label, safe_error)
-        return {"ok": False, "items": [], "raw": None, "error": safe_error}
+        return {"ok": False, "items": [], "raw": None, "raw_diag": telegram_raw_diagnostics(None, None), "error": safe_error}
 
 
 async def fetch_fazercards_telegram_stars_readonly() -> dict:
@@ -2924,12 +2975,35 @@ def recalculate_all_apple_id_prices(apply: bool = False) -> tuple[dict, dict]:
 # ─── Telegram Stars / Premium catalog ─────────────────────────────────────────
 
 TELEGRAM_PREMIUM_SUPPORTED_DURATIONS = {1, 3, 6, 12}
+TELEGRAM_STARS_STANDARD_PACKAGES = (50, 100, 200, 250, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000)
+TELEGRAM_PREMIUM_STANDARD_DURATIONS = (1, 3, 6, 12)
+TELEGRAM_QUOTE_USERNAME_PARAM = "username"
+TELEGRAM_STARS_AMOUNT_PARAM = "amount"
+TELEGRAM_PREMIUM_MONTHS_PARAM = "months"
+TELEGRAM_RAW_SAMPLE_LIMIT = 1000
 
 
 def telegram_services_pricing_settings() -> dict:
     cfg = load_config()
     settings = cfg.get("telegram_services_pricing") if isinstance(cfg.get("telegram_services_pricing"), dict) else {}
     return {**DEFAULT_TELEGRAM_SERVICES_PRICING, **settings}
+
+
+def normalize_telegram_quote_username(value: str) -> str:
+    username = str(value or "").strip()
+    username = re.sub(r"^https?://t\.me/", "", username, flags=re.I)
+    username = re.sub(r"^t\.me/", "", username, flags=re.I)
+    username = username.strip().lstrip("@").split("/", 1)[0].split("?", 1)[0]
+    return username if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username or "") else ""
+
+
+def save_telegram_services_pricing_settings(update: dict) -> dict:
+    cfg = load_config()
+    settings = cfg.get("telegram_services_pricing") if isinstance(cfg.get("telegram_services_pricing"), dict) else {}
+    settings = {**DEFAULT_TELEGRAM_SERVICES_PRICING, **settings, **update}
+    cfg["telegram_services_pricing"] = settings
+    save_config(cfg)
+    return settings
 
 
 def is_telegram_stars_branding(text: str) -> bool:
@@ -3201,6 +3275,28 @@ def _telegram_api_supplier_position(item: dict, kind: str) -> dict | None:
     return result
 
 
+def _telegram_quote_supplier_position(raw: dict, kind: str, value: int) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    price_usd = telegram_api_item_price_usd(raw)
+    if price_usd is None and isinstance(raw.get("data"), dict):
+        price_usd = telegram_api_item_price_usd(raw["data"])
+    if price_usd is None and isinstance(raw.get("result"), dict):
+        price_usd = telegram_api_item_price_usd(raw["result"])
+    if not price_usd or price_usd <= 0:
+        return None
+    product_id = telegram_api_item_id(raw) or (telegram_api_item_id(raw.get("data")) if isinstance(raw.get("data"), dict) else "") or (telegram_api_item_id(raw.get("result")) if isinstance(raw.get("result"), dict) else "")
+    if kind == "stars":
+        pid, title, extra = f"tgstars_{value}", f"Telegram Stars {value} ⭐", {"amount": value, "currency": "XTR"}
+    else:
+        pid, title, extra = f"tgpremium_{value}m", f"Telegram Premium {value} {month_word(value)}", {"duration_months": value, "currency": "PREMIUM"}
+    result = {"id": pid, "title": title, **extra, "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": True, "supplier_stock": 1, "supplier_status": "found", "supplier_last_seen": now_str(), "fazercards_telegram_product_id": product_id, "fazercards_card_id": product_id, "fazercards_price_usd": price_usd, "supplier_price_usd": price_usd}
+    rec = calculate_telegram_supplier_markup_price(result, kind)
+    if not rec.get("pricing_error"):
+        result.update({"price_rub": rec["recommended_price_rub"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+    return result
+
+
 def _telegram_supplier_position(category: dict, card: dict, kind: str) -> dict | None:
     category_text = fazercards_text_blob(category)
     card_text = fazercards_text_blob(card)
@@ -3252,8 +3348,12 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         f"Premium endpoint: {'OK' if report.get('telegram_premium_endpoint_ok') else 'ERROR'}",
         f"Stars endpoint path: {html_escape(FAZERCARDS_TELEGRAM_STARS_ENDPOINT)}",
         f"Premium endpoint path: {html_escape(FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT)}",
+        f"Stars mode: {html_escape(str(report.get('stars_mode') or 'unknown'))}",
+        f"Premium mode: {html_escape(str(report.get('premium_mode') or 'unknown'))}",
         f"Stars items checked: {report.get('stars_items_scanned', 0)}",
         f"Premium items checked: {report.get('premium_items_scanned', 0)}",
+        f"Stars quotes requested: {report.get('stars_quotes_requested', 0)}",
+        f"Premium quotes requested: {report.get('premium_quotes_requested', 0)}",
         f"Stars found: {report.get('stars_candidates_found', 0)}",
         f"Premium found: {report.get('premium_candidates_found', 0)}",
         f"Pending Stars: {report.get('pending_stars_count', 0)}",
@@ -3264,6 +3364,21 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         f"Errors: {report.get('errors', 0)}",
         f"Fallback giftcards: {'yes' if report.get('fallback_used') else 'no'}",
     ]
+    if report.get("stars_requires_params"):
+        lines.append(f"Stars requires params: {html_escape(str(report.get('stars_requires_params')))}")
+    if report.get("premium_requires_params"):
+        lines.append(f"Premium requires params: {html_escape(str(report.get('premium_requires_params')))}")
+    lines.append(f"Quote test username: {'задан' if report.get('quote_test_username_set') else 'не задан'}")
+    for label, key in (("Stars", "stars_raw_diag"), ("Premium", "premium_raw_diag")):
+        diag = report.get(key) or {}
+        lines.extend([
+            "",
+            f"{label} HTTP status: {html_escape(str(diag.get('http_status') or '—'))}",
+            f"{label} raw type: {html_escape(str(diag.get('raw_type') or '—'))}",
+            f"{label} raw keys: {html_escape(', '.join(diag.get('raw_keys') or []) or '—')}",
+            f"{label} raw message: {html_escape(str(diag.get('raw_message') or '—'))}",
+            f"{label} sample raw: <code>{html_escape(str(diag.get('raw_sample') or '—'))}</code>",
+        ])
     if report.get("error"):
         lines.extend(["", f"Ошибка: <code>{html_escape(str(report.get('error')))}</code>"])
     for label, key, amount_key in (("Samples Stars", "stars_samples", "amount"), ("Samples Premium", "premium_samples", "months")):
@@ -3309,15 +3424,18 @@ async def _sync_telegram_giftcards_fallback(kind: str, report: dict) -> tuple[di
 
 
 async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
-    report = {"ok": True, "telegram_stars_endpoint_ok": None, "telegram_premium_endpoint_ok": None, "stars_items_scanned": 0, "premium_items_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "stars_samples": [], "premium_samples": [], "fallback_used": False, "error": ""}
+    report = {"ok": True, "telegram_stars_endpoint_ok": None, "telegram_premium_endpoint_ok": None, "stars_items_scanned": 0, "premium_items_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "stars_samples": [], "premium_samples": [], "fallback_used": False, "error": "", "stars_mode": "unknown", "premium_mode": "unknown", "stars_quotes_requested": 0, "premium_quotes_requested": 0, "stars_requires_params": "", "premium_requires_params": "", "quote_test_username_set": bool(normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))), "stars_raw_diag": {}, "premium_raw_diag": {}}
     found_stars, found_premium = {}, {}
     stars_ok = premium_ok = True
     if kind in ("all", "stars"):
         stars_payload = await fetch_fazercards_telegram_stars_readonly()
         stars_ok = bool(stars_payload.get("ok"))
         report["telegram_stars_endpoint_ok"] = stars_ok
+        report["stars_raw_diag"] = stars_payload.get("raw_diag") or {}
         if stars_ok:
-            for item in stars_payload.get("items") or []:
+            items = stars_payload.get("items") or []
+            report["stars_mode"] = "list" if items else "quote"
+            for item in items:
                 report["stars_items_scanned"] += 1
                 if len(report["stars_samples"]) < 10:
                     report["stars_samples"].append(_telegram_api_sample(item, "stars"))
@@ -3325,14 +3443,37 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
                 if pos:
                     found_stars[pos["id"]] = pos
                     report["stars_candidates_found"] += 1
+            if not items:
+                username = normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))
+                report["stars_requires_params"] = f"{TELEGRAM_QUOTE_USERNAME_PARAM}, {TELEGRAM_STARS_AMOUNT_PARAM}"
+                if not username:
+                    report["errors"] += 1
+                    report["error"] = report.get("error") or "Для Telegram Stars quote нужен test username. Укажите его в конфиге/админке."
+                else:
+                    for amount in TELEGRAM_STARS_STANDARD_PACKAGES:
+                        quote = await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_STARS_ENDPOINT, "stars", {TELEGRAM_QUOTE_USERNAME_PARAM: username, TELEGRAM_STARS_AMOUNT_PARAM: amount})
+                        report["stars_quotes_requested"] += 1
+                        if quote.get("raw_diag"):
+                            report["stars_raw_diag"] = quote.get("raw_diag")
+                        if not quote.get("ok"):
+                            continue
+                        pos = _telegram_quote_supplier_position(quote.get("raw"), "stars", amount)
+                        if pos:
+                            found_stars[pos["id"]] = pos
+                            report["stars_candidates_found"] += 1
+                            if len(report["stars_samples"]) < 10:
+                                report["stars_samples"].append({"id": pos["id"], "text": pos["title"], "amount": amount, "price_usd": pos.get("supplier_price_usd"), "stock": 1})
         else:
             report["errors"] += 1; report["error"] = stars_payload.get("error") or report["error"]
     if kind in ("all", "premium"):
         premium_payload = await fetch_fazercards_telegram_premium_readonly()
         premium_ok = bool(premium_payload.get("ok"))
         report["telegram_premium_endpoint_ok"] = premium_ok
+        report["premium_raw_diag"] = premium_payload.get("raw_diag") or {}
         if premium_ok:
-            for item in premium_payload.get("items") or []:
+            items = premium_payload.get("items") or []
+            report["premium_mode"] = "list" if items else "quote"
+            for item in items:
                 report["premium_items_scanned"] += 1
                 if len(report["premium_samples"]) < 10:
                     report["premium_samples"].append(_telegram_api_sample(item, "premium"))
@@ -3343,6 +3484,26 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
                     report["unsupported"] += 1; continue
                 found_premium[pos["id"]] = pos
                 report["premium_candidates_found"] += 1
+            if not items:
+                username = normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))
+                report["premium_requires_params"] = f"{TELEGRAM_QUOTE_USERNAME_PARAM}, {TELEGRAM_PREMIUM_MONTHS_PARAM}"
+                if not username:
+                    report["errors"] += 1
+                    report["error"] = report.get("error") or "Для Telegram Premium quote нужен test username. Укажите его в конфиге/админке."
+                else:
+                    for months in TELEGRAM_PREMIUM_STANDARD_DURATIONS:
+                        quote = await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT, "premium", {TELEGRAM_QUOTE_USERNAME_PARAM: username, TELEGRAM_PREMIUM_MONTHS_PARAM: months})
+                        report["premium_quotes_requested"] += 1
+                        if quote.get("raw_diag"):
+                            report["premium_raw_diag"] = quote.get("raw_diag")
+                        if not quote.get("ok"):
+                            continue
+                        pos = _telegram_quote_supplier_position(quote.get("raw"), "premium", months)
+                        if pos:
+                            found_premium[pos["id"]] = pos
+                            report["premium_candidates_found"] += 1
+                            if len(report["premium_samples"]) < 10:
+                                report["premium_samples"].append({"id": pos["id"], "text": pos["title"], "months": months, "price_usd": pos.get("supplier_price_usd"), "stock": 1})
         else:
             report["errors"] += 1; report["error"] = report.get("error") or premium_payload.get("error")
     supplier_read_ok_stars = kind in ("all", "stars") and stars_ok
@@ -5156,17 +5317,20 @@ def admin_telegram_services_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔗 Синхронизировать Stars", callback_data="admin_telegram_sync_stars")],
         [InlineKeyboardButton("🔗 Синхронизировать Premium", callback_data="admin_telegram_sync_premium")],
         [InlineKeyboardButton("🔗 Синхронизировать всё", callback_data="admin_telegram_sync_all")],
+        [InlineKeyboardButton("👤 Username для проверки цен", callback_data="admin_telegram_quote_username")],
         [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_telegram_supplier_found_disabled")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
 
 
 def admin_telegram_services_text() -> str:
+    quote_username = normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))
     return ("⭐ <b>Telegram Stars</b>\n\n"
             f"Stars в каталоге: <b>{len(telegram_stars_products())}</b>\n"
             f"Premium в каталоге: <b>{len(telegram_premium_products())}</b>\n"
             f"Новых Stars у поставщика: <b>{len(telegram_stars_pending_supplier_positions())}</b>\n"
-            f"Новых Premium у поставщика: <b>{len(telegram_premium_pending_supplier_positions())}</b>")
+            f"Новых Premium у поставщика: <b>{len(telegram_premium_pending_supplier_positions())}</b>\n"
+            f"Username для quote: <b>{html_escape('@' + quote_username if quote_username else 'не задан')}</b>")
 
 def main_menu_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [
@@ -6941,6 +7105,21 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             await msg.reply_text("Товар не найден.", reply_markup=apple_id_catalog_keyboard())
             return
         await msg.reply_text("✅ Наценка обновлена.", parse_mode="HTML", reply_markup=apple_id_pricing_keyboard(product))
+        return
+
+    if input_mode == TELEGRAM_QUOTE_USERNAME_INPUT:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        username = normalize_telegram_quote_username(msg.text)
+        if not username and msg.text.strip() not in {"-", "—", "нет", "clear", "очистить"}:
+            await msg.reply_text("Введите корректный username: @username, username или t.me/username. Для очистки отправьте <code>-</code>.", parse_mode="HTML")
+            return
+        save_telegram_services_pricing_settings({"quote_test_username": username})
+        context.user_data.pop("client_input", None)
+        text = f"✅ Username для quote сохранён: <b>{html_escape('@' + username if username else 'не задан')}</b>"
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=admin_telegram_services_keyboard())
         return
 
     if input_mode == APPLE_ID_INPUT_PRICE:
@@ -8864,6 +9043,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kind = "stars" if data.endswith("stars") else ("premium" if data.endswith("premium") else "all")
         report = await sync_telegram_fazercards_bulk(kind)
         await edit_or_send(query, context, telegram_fazercards_sync_report_text(report), admin_telegram_services_keyboard())
+    elif data == "admin_telegram_quote_username":
+        await query.answer()
+        context.user_data["client_input"] = TELEGRAM_QUOTE_USERNAME_INPUT
+        await edit_or_send(query, context, "👤 <b>Username для проверки цен</b>\n\nВведите @username, username или t.me/username. Он используется только для quote/sync цен и не создаёт заказ.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_services")]]))
     elif data in {"admin_telegram_add_pending_stars", "admin_telegram_add_pending_premium"}:
         await query.answer()
         kind = "stars" if data.endswith("stars") else "premium"
