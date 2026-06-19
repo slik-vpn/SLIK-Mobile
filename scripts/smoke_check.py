@@ -114,6 +114,15 @@ def check_multiservice_crm(bot_text: str) -> None:
     record("$3 is not formatted as 3 RUB", "parse_price" not in order_amount_block and "return 0.0" in order_amount_block and "price_rub" in order_amount_block and "amount_rub" in order_amount_block and "rub_amount" in order_amount_block)
     record("order_display_amount is used in order list and card", "price = order_display_amount(order)" in function_block(bot_text, "format_order_button_text") and "amount = order_display_amount(order)" in function_block(bot_text, "build_order_card_text"))
     record("CRM RUB totals use trusted RUB amounts only", "total_spent_rub = round(sum(order_amount_rub(order)" in function_block(bot_text, "collect_clients"))
+    analytics_block = function_block(bot_text, "build_analytics_text")
+    record("analytics helpers exist", all(x in bot_text for x in ("def analytics_revenue_rub", "def analytics_paid_orders", "def analytics_by_category", "def analytics_top_products")))
+    record("analytics uses RUB revenue", "format_rub(today_revenue)" in analytics_block and "format_rub(week_revenue)" in analytics_block and "format_rub(average_order)" in analytics_block)
+    record("general analytics has no top-5 countries", "Топ-5 стран по количеству заказов" not in analytics_block)
+    record("general analytics has category and top products blocks", "Продажи по категориям" in analytics_block and "Топ товаров" in analytics_block)
+    record("eSIM countries are separate", "def top_esim_countries_by_orders" in bot_text and "order_category_key(order) != \"esim\"" in function_block(bot_text, "top_esim_countries_by_orders"))
+    record("non-paid orders excluded from revenue", "explicit == \"paid\"" in function_block(bot_text, "is_revenue_order") and all(x in function_block(bot_text, "is_revenue_order") for x in ("pending_payment", "waiting_payment", "payment_failed", "cancelled", "refunded", "failed")))
+    record("client search uses RUB summary", "client_search_summary" in bot_text and 'format_rub(client["total_spent_rub"])' in function_block(bot_text, "client_search_summary"))
+    record("order card notes missing RUB amount", "RUB-сумма" in order_card_block and "не зафиксирована" in order_card_block)
 
 def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
@@ -845,13 +854,10 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         )),
     )
 
+    revenue_block = function_block(bot_text, "is_revenue_order")
     record(
         "is_revenue_order excludes waiting_payment",
-        bool(re.search(
-            r"def\s+is_revenue_order\(order: dict\).*?not in\s+\{[^}]*[\"']cancelled[\"'][^}]*[\"']waiting_payment[\"'][^}]*\}",
-            bot_text,
-            re.DOTALL,
-        )),
+        "waiting_payment" in revenue_block and "cancelled" in revenue_block and "return explicit == \"paid\"" in revenue_block,
     )
 
     reminder_job = re.search(

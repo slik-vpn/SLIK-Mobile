@@ -1398,7 +1398,7 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
     user_orders = orders if orders is not None else get_user_orders(user_id)
     active_orders = [order for order in user_orders if is_revenue_order(order)]
     profile["orders_count"] = len(active_orders)
-    profile["total_spent"] = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
+    profile["total_spent"] = round(sum(order_amount_rub(order) for order in active_orders), 2)
     profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
     profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
     profile["bonus_balance"] = profile.get("slik_balance", 0)
@@ -1413,7 +1413,7 @@ def award_cashback_if_needed(profile: dict, order: dict) -> float:
     if not is_revenue_order(order):
         return 0.0
 
-    order_amount = parse_price(order.get("price", "0"))
+    order_amount = order_amount_rub(order)
     if order_amount <= 0:
         return 0.0
 
@@ -4632,16 +4632,13 @@ def fulfillment_status_label(order: dict) -> str:
 
 
 def order_amount_rub(order: dict) -> float:
-    """Return only a trusted RUB amount; never infer RUB from USD-looking price strings."""
-    for key in ("price_rub", "amount_rub", "rub_amount"):
+    """Return only a trusted fixed RUB amount; never infer RUB from display price strings."""
+    for key in ("price_rub", "amount_rub", "rub_amount", "payment_amount_rub"):
         if order.get(key) not in (None, ""):
             return safe_float(order.get(key))
     payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
     if payment_details.get("rub_amount") not in (None, ""):
         return safe_float(payment_details.get("rub_amount"))
-    price = str(order.get("price") or "").strip()
-    if "₽" in price or re.search(r"(?i)(^|\s)(rub|rur|руб\.?)(\s|$)", price):
-        return safe_float(re.sub(r"(?i)(₽|rub|rur|руб\.?)", "", price).replace(" ", ""))
     return 0.0
 
 
@@ -4679,8 +4676,8 @@ def build_orders_dashboard() -> str:
     month_revenue_orders = [order for order in month_orders if is_revenue_order(order)]
     week_waiting_payment = count_status(week_orders, "waiting_payment")
     month_waiting_payment = count_status(month_orders, "waiting_payment")
-    week_total = sum(parse_price(order.get("price", "0")) for order in week_revenue_orders)
-    month_total = sum(parse_price(order.get("price", "0")) for order in month_revenue_orders)
+    week_total = sum(order_amount_rub(order) for order in week_revenue_orders)
+    month_total = sum(order_amount_rub(order) for order in month_revenue_orders)
     return (
         "📋 <b>Заказы</b>\n\n"
         "<b>Сегодня:</b>\n"
@@ -4691,11 +4688,11 @@ def build_orders_dashboard() -> str:
         "<b>За 7 дней:</b>\n"
         f"📦 Всего заказов: <b>{len(week_revenue_orders)}</b>\n"
         f"🟠 Ожидают оплаты: <b>{week_waiting_payment}</b>\n"
-        f"💵 Сумма: <b>${week_total:.2f}</b>\n\n"
+        f"💵 Сумма: <b>{format_rub(week_total)}</b>\n\n"
         "<b>За 30 дней:</b>\n"
         f"📦 Всего заказов: <b>{len(month_revenue_orders)}</b>\n"
         f"🟠 Ожидают оплаты: <b>{month_waiting_payment}</b>\n"
-        f"💵 Сумма: <b>${month_total:.2f}</b>\n\n"
+        f"💵 Сумма: <b>{format_rub(month_total)}</b>\n\n"
         "<b>Быстрые действия:</b>\n"
         "🟡 Новые заявки\n"
         "🔵 В работе\n"
@@ -4758,6 +4755,7 @@ def build_order_card_text(order: dict) -> str:
     recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
     region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
     amount = order_display_amount(order)
+    rub_note = "" if order_amount_rub(order) > 0 else "RUB-сумма: <b>не зафиксирована</b>\n"
     manager_comment = order.get("manager_comment") or order.get("admin_comment") or "—"
     issued_at = order.get("issued_at") or order.get("fulfilled_at") or "—"
     paid_at = order.get("paid_at") or order.get("payment_paid_at") or "—"
@@ -4791,6 +4789,7 @@ def build_order_card_text(order: dict) -> str:
         + "\n\n<b>Оплата</b>\n"
         f"Статус: <b>{html_escape(payment_status_label(order))}</b>\n"
         f"Сумма: <b>{html_escape(amount)}</b>\n"
+        f"{rub_note}"
         f"Метод: <b>{html_escape(str(payment_method))}</b>\n\n"
         "<b>Выполнение</b>\n"
         f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
@@ -4818,13 +4817,22 @@ def build_orders_stats_text() -> str:
     month_count, month_total = calc_stats(orders, today - datetime.timedelta(days=30))
     return (
         "📊 <b>Статистика заказов</b>\n\n"
-        f"За 7 дней: <b>{week_count}</b> / <b>${week_total:.2f}</b>\n"
-        f"За 30 дней: <b>{month_count}</b> / <b>${month_total:.2f}</b>"
+        f"За 7 дней: <b>{week_count}</b> / <b>{format_rub(week_total)}</b>\n"
+        f"За 30 дней: <b>{month_count}</b> / <b>{format_rub(month_total)}</b>"
     )
 
 
+NON_REVENUE_PAYMENT_STATUSES = {"pending_payment", "waiting_payment", "payment_failed", "cancelled", "refunded", "failed"}
+
+
 def is_revenue_order(order: dict) -> bool:
-    return normalize_order_status(order.get("status")) not in {"cancelled", "waiting_payment"}
+    explicit = str(order.get("payment_status") or "").strip()
+    if explicit:
+        return explicit == "paid"
+    status = normalize_order_status(order.get("status"))
+    if status in {"cancelled", "waiting_payment", "pending_payment", "payment_failed", "refunded", "failed", "new", "pending"}:
+        return False
+    return status in {"paid", "issued", "done", "in_progress", "processing"}
 
 
 def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
@@ -4834,10 +4842,40 @@ def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
     ]
 
 
+def analytics_paid_orders(orders: list[dict]) -> list[dict]:
+    return [order for order in orders if is_revenue_order(order)]
+
+
+def analytics_revenue_rub(orders: list[dict]) -> float:
+    return round(sum(order_amount_rub(order) for order in analytics_paid_orders(orders)), 2)
+
+
 def analytics_order_stats(orders: list) -> tuple[int, float]:
-    revenue_orders = [order for order in orders if is_revenue_order(order)]
-    revenue = round(sum(parse_price(order.get("price", "0")) for order in revenue_orders), 2)
-    return len(revenue_orders), revenue
+    revenue_orders = analytics_paid_orders(orders)
+    return len(revenue_orders), analytics_revenue_rub(revenue_orders)
+
+
+def analytics_by_category(orders: list[dict]) -> dict:
+    stats = {key: {"orders": 0, "revenue_rub": 0.0} for key in ("apple_id", "telegram_stars", "telegram_premium", "esim", "other")}
+    for order in analytics_paid_orders(orders):
+        key = order_category_key(order)
+        if key not in stats:
+            key = "other"
+        stats[key]["orders"] += 1
+        stats[key]["revenue_rub"] = round(stats[key]["revenue_rub"] + order_amount_rub(order), 2)
+    return stats
+
+
+def analytics_product_title(order: dict) -> str:
+    return str(order.get("product_title") or order.get("title") or order.get("gb") or order_category_label(order)).strip() or order_category_label(order)
+
+
+def analytics_top_products(orders: list[dict], limit: int = 5) -> list[tuple[str, int]]:
+    product_counts: dict[str, int] = {}
+    for order in analytics_paid_orders(orders):
+        title = analytics_product_title(order)
+        product_counts[title] = product_counts.get(title, 0) + 1
+    return sorted(product_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
 
 
 def parse_user_created_datetime(value: str | None) -> datetime.datetime | None:
@@ -4864,10 +4902,10 @@ def new_clients_count_for_date(users: dict, target_date: datetime.date) -> int:
     return count
 
 
-def top_countries_by_orders(orders: list, limit: int = 5) -> list[tuple[str, int]]:
+def top_esim_countries_by_orders(orders: list, limit: int = 5) -> list[tuple[str, int]]:
     country_counts: dict[str, int] = {}
-    for order in orders:
-        if not is_revenue_order(order):
+    for order in analytics_paid_orders(orders):
+        if order_category_key(order) != "esim":
             continue
         country = str(order.get("country") or "Россия").strip() or "Россия"
         country_counts[country] = country_counts.get(country, 0) + 1
@@ -4888,30 +4926,39 @@ def build_analytics_text() -> str:
     all_count, all_revenue = analytics_order_stats(orders)
     average_order = round(all_revenue / all_count, 2) if all_count else 0
     new_clients_today = new_clients_count_for_date(users, today)
-    top_countries = top_countries_by_orders(orders)
-    top_countries_text = (
-        "\n".join(f"{index}. {html_escape(country)} — <b>{count}</b>" for index, (country, count) in enumerate(top_countries, start=1))
-        if top_countries else "—"
+
+    category_stats = analytics_by_category(orders)
+    category_lines = []
+    for key in ("apple_id", "telegram_stars", "telegram_premium", "esim", "other"):
+        icon, title = ORDER_CATEGORY_META.get(key, ORDER_CATEGORY_META["other"])
+        stats = category_stats.get(key, {"orders": 0, "revenue_rub": 0})
+        category_lines.append(f"{icon} {title}: <b>{stats['orders']}</b> заказов / <b>{format_rub(stats['revenue_rub'])}</b>")
+
+    top_products = analytics_top_products(orders)
+    top_products_text = (
+        "\n".join(f"{index}. {html_escape(title)} — <b>{count}</b> заказов" for index, (title, count) in enumerate(top_products, start=1))
+        if top_products else "—"
     )
 
     return (
         "📊 <b>Аналитика</b>\n\n"
         "📅 <b>Сегодня</b>\n"
         f"• Заказов: <b>{today_count}</b>\n"
-        f"• Выручка: <b>{format_usd_cents(today_revenue)}</b>\n"
+        f"• Выручка: <b>{format_rub(today_revenue)}</b>\n"
         f"• Новых клиентов: <b>{new_clients_today}</b>\n\n"
         "📅 <b>Последние 7 дней</b>\n"
         f"• Заказов: <b>{week_count}</b>\n"
-        f"• Выручка: <b>{format_usd_cents(week_revenue)}</b>\n\n"
+        f"• Выручка: <b>{format_rub(week_revenue)}</b>\n\n"
         "📅 <b>Последние 30 дней</b>\n"
         f"• Заказов: <b>{month_count}</b>\n"
-        f"• Выручка: <b>{format_usd_cents(month_revenue)}</b>\n\n"
+        f"• Выручка: <b>{format_rub(month_revenue)}</b>\n\n"
         "💰 <b>Средний чек</b>\n"
-        f"<b>{format_usd_cents(average_order)}</b>\n\n"
-        "🌍 <b>Топ-5 стран по количеству заказов</b>\n"
-        f"{top_countries_text}"
+        f"<b>{format_rub(average_order)}</b>\n\n"
+        "📦 <b>Продажи по категориям</b>\n"
+        + "\n".join(category_lines)
+        + "\n\n🔥 <b>Топ товаров</b>\n"
+        + top_products_text
     )
-
 
 def analytics_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="admin_analytics_back")]])
@@ -5059,7 +5106,7 @@ def collect_clients() -> list[dict]:
         if not isinstance(profile, dict):
             continue
         user_orders = orders_by_user.get(str(user_id), [])
-        paid_orders_list = [order for order in user_orders if order_payment_status(order) == "paid"]
+        paid_orders_list = analytics_paid_orders(user_orders)
         cancelled_orders = sum(1 for order in user_orders if order_payment_status(order) == "cancelled" or order_fulfillment_status(order) == "cancelled")
         total_spent_rub = round(sum(order_amount_rub(order) for order in paid_orders_list), 2)
         order_dates = [date for date in (parse_order_datetime(order) for order in user_orders) if date]
@@ -5254,18 +5301,27 @@ def search_clients(query_text: str) -> list[dict]:
     return results[:20]
 
 
+def client_search_summary(client: dict) -> str:
+    if client["paid_orders"] == 0:
+        return "заказов нет"
+    if client["total_spent_rub"] > 0:
+        return format_rub(client["total_spent_rub"])
+    has_legacy_usd = any(is_revenue_order(order) and order_amount_rub(order) <= 0 and str(order.get("price") or "").strip() for order in client["orders"])
+    return "0 ₽ / есть старые USD-заказы" if has_legacy_usd else "0 ₽"
+
+
 def search_results_text(results: list[dict], query_text: str) -> str:
     if not results:
         return f"🔍 <b>Поиск клиента</b>\n\nПо запросу <b>{html_escape(query_text)}</b> ничего не найдено."
     lines = ["🔍 <b>Поиск клиента</b>", "", f"Найдено: <b>{len(results)}</b>", ""]
     for client in results:
-        lines.append(f"{html_escape(client_display_name(client['user_id'], client['profile']))} — <b>{format_usd_cents(client['total_spent'])}</b>")
+        lines.append(f"{html_escape(client_display_name(client['user_id'], client['profile']))} — <b>{html_escape(client_search_summary(client))}</b>")
     return "\n".join(lines)
 
 
 def search_results_keyboard(results: list[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"{client_display_name(client['user_id'], client['profile'])} — {format_usd(client['total_spent'])}", callback_data=f"client_card:{client['user_id']}:search")]
+        [InlineKeyboardButton(f"{client_display_name(client['user_id'], client['profile'])} — {client_search_summary(client)}"[:64], callback_data=f"client_card:{client['user_id']}:search")]
         for client in results
     ]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
@@ -8504,7 +8560,7 @@ def calc_stats(orders: list, since: datetime.date) -> tuple[int, float]:
     filtered = orders_by_period(orders, since)
     revenue_orders = [order for order in filtered if is_revenue_order(order)]
     count = len(revenue_orders)
-    total = sum(parse_price(o.get("price", "0")) for o in revenue_orders)
+    total = sum(order_amount_rub(o) for o in revenue_orders)
     return count, total
 
 
