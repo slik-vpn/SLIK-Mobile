@@ -609,10 +609,8 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         )),
     )
     record(
-        "Apple ID admin has FazerCards link and unlink callbacks",
-        "🔗 Привязать FazerCards товар" in bot_text
-        and "admin_apple_id_fazer_link:" in bot_text
-        and "❌ Отвязать FazerCards товар" in bot_text
+        "Apple ID FazerCards link and unlink callbacks are still routed",
+        "admin_apple_id_fazer_link:" in bot_text
         and "admin_apple_id_fazer_unlink:" in bot_text,
     )
     readonly_fetch_text = function_block(bot_text, "fetch_fazercards_products_readonly")
@@ -968,7 +966,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("default supplier_markup_percent = 40", '"supplier_markup_percent": 40' in bot_text)
     record("settings section active name is Настройки", "⚙️ Настройки" in bot_text and "💳 Оплата и курс" not in function_block(bot_text, "admin_panel_keyboard"))
     record("TMA/open app button hidden but TMA config remains", "def get_tma_url" in bot_text and "web_app=WebAppInfo" not in function_block(bot_text, "main_menu_keyboard"))
-    record("FazerCards bulk sync button exists", "🔗 Синхронизировать FazerCards" in bot_text and "admin_apple_id_fazer_sync" in bot_text)
+    record("Apple ID unified sync button exists", "🔄 Синхронизировать" in function_block(bot_text, "apple_id_catalog_keyboard") and "admin_apple_id_fazer_sync" in bot_text)
     record("bulk sync uses GET giftcards cards and not POST", "sync_apple_id_fazercards_bulk" in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bot_text and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bot_text and "client.post" not in function_block(bot_text, "sync_apple_id_fazercards_bulk"))
     bulk_sync_block = function_block(bot_text, "sync_apple_id_fazercards_bulk")
 
@@ -1139,6 +1137,23 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     stars_parser_block = function_block(bot_text, "extract_telegram_stars_nominal_from_text")
     premium_parser_block = function_block(bot_text, "extract_telegram_premium_duration_from_text")
     telegram_add_pending_block = function_block(bot_text, "add_telegram_pending_supplier_positions")
+
+    apple_catalog_text_block = function_block(bot_text, "apple_id_catalog_text")
+    apple_catalog_keyboard_block = function_block(bot_text, "apple_id_catalog_keyboard")
+    apple_card_block = function_block(bot_text, "apple_id_admin_product_text")
+    apple_card_keyboard_block = function_block(bot_text, "apple_id_admin_product_keyboard")
+    apple_sync_report_block = function_block(bot_text, "fazercards_bulk_sync_report_text")
+    record("Admin catalog buttons use unified Apple ID and Telegram names", "🍎 Apple ID каталог" in bot_text and "⭐ Telegram каталог" in bot_text and '"⭐ Telegram Stars", callback_data="admin_telegram_services"' not in bot_text and "Telegram услуги" not in bot_text)
+    record("Apple ID main screen has unified blocks", all(x in apple_catalog_text_block for x in ("<b>Статус</b>", "Последняя синхронизация", "Курс USD/RUB", "Наценка", "Каталог", "Ожидают добавления")))
+    record("Telegram main screen has unified blocks", all(x in telegram_main_text_block for x in ("<b>Статус</b>", "Последняя синхронизация", "Курс USD/RUB", "Наценка", "Каталог", "Ожидают добавления")))
+    record("Apple ID catalog actions are unified", all(x in apple_catalog_keyboard_block for x in ("🔄 Синхронизировать", "➕ Добавить найденные товары", "✏️ Наценка", "🔄 Пересчитать цены", "🧪 Диагностика sync", "◀️ Назад")))
+    record("Telegram catalog actions are unified", all(x in telegram_keyboard_block for x in ("⭐ Stars товары", "💎 Premium товары", "🔄 Синхронизировать", "➕ Добавить найденные товары", "✏️ Наценка", "🔄 Пересчитать цены", "🧪 Диагностика sync", "◀️ Назад")))
+    record("Apple ID admin card has unified blocks and finance", all(x in apple_card_block for x in ("<b>Статусы</b>", "<b>Поставщик</b>", "<b>Финансы</b>", "<b>Служебное</b>", "Себестоимость", "Курс", "Наценка", "Цена продажи", "Маржа", "точное количество поставщик не передаёт")))
+    record("Telegram admin card has unified supplier and finance", all(x in telegram_card_block for x in ("<b>Статусы</b>", "<b>Поставщик</b>", "<b>Финансы</b>", "<b>Служебное</b>", "Себестоимость", "Курс", "Наценка", "Цена продажи", "Маржа", "точное количество поставщик не передаёт")))
+    record("Apple ID card action buttons are real callbacks", all(x in apple_card_keyboard_block for x in ("admin_apple_id_toggle:", "admin_apple_id_price:", "admin_apple_id_pricing_markup:", "admin_apple_id_pricing_apply_confirm:")) and 'callback_data="admin_apple_id_catalog"' not in apple_card_keyboard_block)
+    record("Apple ID pending uses unified found products label", "➕ Добавить найденные товары" in apple_catalog_keyboard_block and "admin_apple_id_add_supplier_positions" in bot_text)
+    record("Apple ID short sync report hides raw technical fields", all(x not in apple_sync_report_block for x in ("raw sample", "raw keys", "HTTP status", "sample raw", "raw type")) and "Синхронизация Apple ID завершена" in apple_sync_report_block)
+
     record("Telegram Stars main button exists", "⭐ Купить Telegram Stars" in bot_text and "telegram_stars_start" in bot_text)
     record("Telegram section contains Stars and Premium choices", "⭐ Звёзды" in bot_text and "💎 Premium" in bot_text)
     record("Telegram product types exist", "telegram_stars" in bot_text and "telegram_premium" in bot_text)
