@@ -428,6 +428,7 @@ APPLE_ID_INPUT_MARKUP = "apple_id_markup"
 TELEGRAM_QUOTE_USERNAME_INPUT = "telegram_quote_username"
 TELEGRAM_PRODUCT_PRICE_INPUT = "telegram_product_price_input"
 TELEGRAM_PRODUCT_MARKUP_INPUT = "telegram_product_markup_input"
+TELEGRAM_GLOBAL_MARKUP_INPUT = "telegram_global_markup_input"
 FAZERCARDS_INPUT_API_KEY = "fazercards_api_key"
 ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
 ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
@@ -3575,7 +3576,10 @@ def telegram_fazercards_sync_diagnostics_text(report: dict | None = None) -> str
     for label, key in (("Samples Stars", "stars_samples"), ("Samples Premium", "premium_samples")):
         samples = report.get(key) or []
         lines.extend(["", f"{label}:", f"<code>{html_escape(str(samples[:10]))[:3000]}</code>"])
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if len(text) > 3500:
+        text = text[:3470].rstrip() + "\n…"
+    return text
 
 
 async def _sync_telegram_giftcards_fallback(kind: str, report: dict) -> tuple[dict, dict, bool]:
@@ -5616,6 +5620,7 @@ def admin_telegram_services_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔄 Синхронизировать", callback_data="admin_telegram_sync_all")],
         [InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_telegram_pending_products")],
         [InlineKeyboardButton("✏️ Наценка", callback_data="admin_telegram_markup")],
+        [InlineKeyboardButton("👤 Username для проверки цен", callback_data="admin_telegram_quote_username")],
         [InlineKeyboardButton("🧪 Диагностика sync", callback_data="admin_telegram_sync_diagnostics")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
@@ -7466,6 +7471,30 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("telegram_edit_kind", None)
         context.user_data.pop("telegram_edit_product_id", None)
         await msg.reply_text("✅ Цена обновлена\n\n" + telegram_admin_product_card_text(kind, product_id), parse_mode="HTML", reply_markup=telegram_admin_product_card_keyboard(kind, product_id))
+        return
+
+    if input_mode == TELEGRAM_GLOBAL_MARKUP_INPUT:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        kind = str(context.user_data.get("telegram_global_markup_kind") or "")
+        raw_markup = msg.text.strip().replace("%", "").replace(",", ".")
+        try:
+            markup = float(raw_markup)
+        except ValueError:
+            markup = -1
+        if kind not in {"stars", "premium"} or markup < 0 or markup > 500:
+            await msg.reply_text("Введите наценку числом от 0 до 500. Например: <code>40</code>.", parse_mode="HTML")
+            return
+        key = "stars_markup_percent" if kind == "stars" else "premium_markup_percent"
+        save_telegram_services_pricing_settings({key: round(markup, 4)})
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("telegram_global_markup_kind", None)
+        await msg.reply_text("✅ Глобальная наценка Telegram обновлена.\n\n" + telegram_markup_text(), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_telegram_recalculate_prices")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_markup")],
+        ]))
         return
 
     if input_mode == TELEGRAM_PRODUCT_MARKUP_INPUT:
@@ -9506,11 +9535,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data == "admin_telegram_markup":
         await query.answer()
         await edit_or_send(query, context, telegram_markup_text(), InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Изменить наценку Stars", callback_data="admin_telegram_services")],
-            [InlineKeyboardButton("✏️ Изменить наценку Premium", callback_data="admin_telegram_services")],
+            [InlineKeyboardButton("✏️ Изменить наценку Stars", callback_data="admin_telegram_stars_global_markup")],
+            [InlineKeyboardButton("✏️ Изменить наценку Premium", callback_data="admin_telegram_premium_global_markup")],
             [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_telegram_recalculate_prices")],
             [InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_services")],
         ]))
+    elif data in {"admin_telegram_stars_global_markup", "admin_telegram_premium_global_markup"}:
+        kind = "stars" if data == "admin_telegram_stars_global_markup" else "premium"
+        settings = telegram_services_pricing_settings()
+        current_markup = settings.get("stars_markup_percent" if kind == "stars" else "premium_markup_percent")
+        context.user_data["client_input"] = TELEGRAM_GLOBAL_MARKUP_INPUT
+        context.user_data["telegram_global_markup_kind"] = kind
+        await query.answer()
+        label = "Stars" if kind == "stars" else "Premium"
+        await edit_or_send(query, context, f"✏️ <b>Изменение глобальной наценки {label}</b>\n\nТекущая наценка: <b>{html_escape(str(current_markup))}%</b>\n\nВведите новую наценку в процентах.\nНапример: <code>40</code>\n\nЧтобы отменить — нажмите Назад.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_markup")]]))
     elif data == "admin_telegram_recalculate_prices":
         await query.answer()
         result = recalculate_all_telegram_prices(apply=True)
