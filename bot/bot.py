@@ -426,6 +426,8 @@ APPLE_ID_INPUT_ADD_AMOUNT = "apple_id_add_amount"
 APPLE_ID_INPUT_ADD_PRICE = "apple_id_add_price"
 APPLE_ID_INPUT_MARKUP = "apple_id_markup"
 TELEGRAM_QUOTE_USERNAME_INPUT = "telegram_quote_username"
+TELEGRAM_PRODUCT_PRICE_INPUT = "telegram_product_price_input"
+TELEGRAM_PRODUCT_MARKUP_INPUT = "telegram_product_markup_input"
 FAZERCARDS_INPUT_API_KEY = "fazercards_api_key"
 ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID = "admin_management_telegram_id"
 ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
@@ -2985,6 +2987,12 @@ TELEGRAM_QUOTE_USERNAME_PARAM = "username"
 TELEGRAM_STARS_AMOUNT_PARAM = "amount"
 TELEGRAM_PREMIUM_MONTHS_PARAM = "months"
 TELEGRAM_RAW_SAMPLE_LIMIT = 1000
+TELEGRAM_ADMIN_CARD_ACTION_CALLBACKS = (
+    "admin_telegram_stars_toggle:", "admin_telegram_premium_toggle:",
+    "admin_telegram_stars_price:", "admin_telegram_premium_price:",
+    "admin_telegram_stars_markup:", "admin_telegram_premium_markup:",
+    "admin_telegram_stars_recalc:", "admin_telegram_premium_recalc:",
+)
 
 
 def telegram_services_pricing_settings() -> dict:
@@ -3279,7 +3287,10 @@ def telegram_payment_amount_rub(plan: dict) -> int:
 
 def calculate_telegram_supplier_markup_price(product: dict, kind: str) -> dict:
     settings = telegram_services_pricing_settings()
-    markup = float(settings.get("stars_markup_percent" if kind == "stars" else "premium_markup_percent", 40) or 0)
+    markup_source = product.get("supplier_markup_percent")
+    if markup_source in (None, ""):
+        markup_source = settings.get("stars_markup_percent" if kind == "stars" else "premium_markup_percent", 40)
+    markup = float(markup_source or 0)
     supplier_price = product.get("supplier_price_usd") or product.get("fazercards_price_usd")
     try: supplier_price = float(supplier_price)
     except Exception: supplier_price = 0
@@ -3353,6 +3364,54 @@ def telegram_admin_compact_status_icon(product: dict) -> str:
     if product.get("supplier_status") != "found" or product.get("supplier_available") is not True:
         return "🔄"
     return "✅"
+
+
+
+def telegram_admin_products_by_kind(kind: str) -> list[dict]:
+    return telegram_stars_products() if kind == "stars" else telegram_premium_products()
+
+
+def telegram_admin_save_products_by_kind(kind: str, products: list[dict]) -> None:
+    if kind == "stars":
+        save_telegram_stars_products(products)
+    else:
+        save_telegram_premium_products(products)
+
+
+def telegram_admin_find_product(kind: str, product_id: str) -> tuple[list[dict], dict | None]:
+    products = telegram_admin_products_by_kind(kind)
+    product = next((p for p in products if str(p.get("id")) == str(product_id)), None)
+    return products, product
+
+
+def telegram_apply_supplier_match(existing: dict, match: dict, kind: str) -> None:
+    enabled = existing.get("enabled", True)
+    manual = existing.get("pricing_mode") == "manual"
+    manual_price = existing.get("price_rub")
+    existing.update(match)
+    existing["enabled"] = enabled
+    if manual:
+        existing["pricing_mode"] = "manual"
+        existing["price_rub"] = manual_price
+        try:
+            existing["estimated_margin_rub"] = round(float(manual_price) - float(existing.get("supplier_cost_rub") or 0), 2)
+        except Exception:
+            existing["estimated_margin_rub"] = None
+
+
+def telegram_admin_recalculate_product(product: dict, kind: str) -> tuple[bool, str]:
+    rec = calculate_telegram_supplier_markup_price(product, kind)
+    if rec.get("pricing_error"):
+        return False, "⚠️ Нельзя пересчитать: нет себестоимости поставщика."
+    if product.get("pricing_mode") == "manual":
+        product.update({"supplier_cost_rub": rec["supplier_cost_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+        try:
+            product["estimated_margin_rub"] = round(float(product.get("price_rub") or 0) - float(rec["supplier_cost_rub"]), 2)
+        except Exception:
+            product["estimated_margin_rub"] = None
+    else:
+        product.update({"supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "price_rub": rec["recommended_price_rub"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+    return True, "✅ Цена пересчитана"
 
 def telegram_product_plan(product: dict, product_type: str) -> dict:
     kind = "stars" if product_type == "telegram_stars" else "premium"
@@ -3665,7 +3724,7 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
         for p in catalog:
             match = found_stars.get(p.get("id"))
             if match:
-                enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1; report["updated_stars_count"] += 1
+                telegram_apply_supplier_match(p, match, "stars"); report["updated"] += 1; report["updated_stars_count"] += 1
             elif supplier_read_ok_stars:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_stars.items() if k not in ids]
@@ -3676,7 +3735,7 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
         for p in catalog:
             match = found_premium.get(p.get("id"))
             if match:
-                enabled = p.get("enabled", True); p.update(match); p["enabled"] = enabled; report["updated"] += 1; report["updated_premium_count"] += 1
+                telegram_apply_supplier_match(p, match, "premium"); report["updated"] += 1; report["updated_premium_count"] += 1
             elif supplier_read_ok_premium:
                 p.update({"supplier_available": False, "supplier_status": "not_found", "supplier_stock": 0, "supplier_last_seen": now_str()}); report["not_found"] += 1
         pending = [v for k, v in found_premium.items() if k not in ids]
@@ -5513,6 +5572,16 @@ def telegram_admin_product_card_text(kind: str, product_id: str) -> str:
         "", "supplier_price_usd / supplier_cost_rub / supplier_markup_percent / price_rub / estimated_margin_rub / supplier_last_seen",
     ])
 
+
+
+
+def telegram_admin_product_card_keyboard(kind: str, product_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅/❌ Вкл/Выкл", callback_data=f"admin_telegram_{kind}_toggle:{product_id}")],
+        [InlineKeyboardButton("✏️ Изменить цену", callback_data=f"admin_telegram_{kind}_price:{product_id}"), InlineKeyboardButton("✏️ Изменить наценку", callback_data=f"admin_telegram_{kind}_markup:{product_id}")],
+        [InlineKeyboardButton("🔄 Пересчитать", callback_data=f"admin_telegram_{kind}_recalc:{product_id}")],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_telegram_{kind}_catalog")],
+    ])
 
 def telegram_pending_products_text() -> str:
     stars = len(telegram_stars_pending_supplier_positions()); premium = len(telegram_premium_pending_supplier_positions())
@@ -7364,6 +7433,71 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         text = f"✅ Username для quote сохранён: <b>{html_escape('@' + username if username else 'не задан')}</b>"
         await msg.reply_text(text, parse_mode="HTML", reply_markup=admin_telegram_services_keyboard())
+        return
+
+    if input_mode == TELEGRAM_PRODUCT_PRICE_INPUT:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        kind = str(context.user_data.get("telegram_edit_kind") or "")
+        product_id = str(context.user_data.get("telegram_edit_product_id") or "")
+        raw_price = re.sub(r"[\s₽]", "", msg.text.strip())
+        if not raw_price.isdigit() or int(raw_price) <= 0:
+            await msg.reply_text("Введите цену числом, например <code>999</code>.", parse_mode="HTML")
+            return
+        products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("telegram_edit_kind", None)
+            context.user_data.pop("telegram_edit_product_id", None)
+            await msg.reply_text("Товар не найден.", reply_markup=admin_telegram_services_keyboard())
+            return
+        new_price = int(raw_price)
+        product["price_rub"] = new_price
+        product["pricing_mode"] = "manual"
+        if product.get("supplier_cost_rub") not in (None, ""):
+            try:
+                product["estimated_margin_rub"] = round(new_price - float(product.get("supplier_cost_rub") or 0), 2)
+            except Exception:
+                product["estimated_margin_rub"] = None
+        telegram_admin_save_products_by_kind(kind, products)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("telegram_edit_kind", None)
+        context.user_data.pop("telegram_edit_product_id", None)
+        await msg.reply_text("✅ Цена обновлена\n\n" + telegram_admin_product_card_text(kind, product_id), parse_mode="HTML", reply_markup=telegram_admin_product_card_keyboard(kind, product_id))
+        return
+
+    if input_mode == TELEGRAM_PRODUCT_MARKUP_INPUT:
+        if not has_catalog_admin_access(update.effective_user):
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⛔️ Недостаточно прав.")
+            return
+        kind = str(context.user_data.get("telegram_edit_kind") or "")
+        product_id = str(context.user_data.get("telegram_edit_product_id") or "")
+        raw_markup = msg.text.strip().replace("%", "").replace(",", ".")
+        try:
+            markup = float(raw_markup)
+        except ValueError:
+            markup = -1
+        if markup < 0 or markup > 500:
+            await msg.reply_text("Введите наценку числом от 0 до 500. Например: <code>40</code>.", parse_mode="HTML")
+            return
+        products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("telegram_edit_kind", None)
+            context.user_data.pop("telegram_edit_product_id", None)
+            await msg.reply_text("Товар не найден.", reply_markup=admin_telegram_services_keyboard())
+            return
+        product["supplier_markup_percent"] = round(markup, 4)
+        product["pricing_mode"] = "supplier_markup"
+        ok, message = telegram_admin_recalculate_product(product, kind)
+        telegram_admin_save_products_by_kind(kind, products)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("telegram_edit_kind", None)
+        context.user_data.pop("telegram_edit_product_id", None)
+        await msg.reply_text(("✅ Наценка обновлена" if ok else message) + "\n\n" + telegram_admin_product_card_text(kind, product_id), parse_mode="HTML", reply_markup=telegram_admin_product_card_keyboard(kind, product_id))
         return
 
     if input_mode == APPLE_ID_INPUT_PRICE:
@@ -9286,12 +9420,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         kind = "stars" if data.startswith("admin_telegram_stars_card:") else "premium"
         product_id = data.split(":", 1)[1]
-        await edit_or_send(query, context, telegram_admin_product_card_text(kind, product_id), InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅/❌ Вкл/Выкл", callback_data="admin_telegram_services")],
-            [InlineKeyboardButton("✏️ Изменить цену", callback_data="admin_telegram_services"), InlineKeyboardButton("✏️ Изменить наценку", callback_data="admin_telegram_markup")],
-            [InlineKeyboardButton("🔄 Пересчитать", callback_data="admin_telegram_recalculate_prices")],
-            [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_telegram_{kind}_catalog")],
-        ]))
+        await edit_or_send(query, context, telegram_admin_product_card_text(kind, product_id), telegram_admin_product_card_keyboard(kind, product_id))
+    elif re.match(r"^admin_telegram_(stars|premium)_toggle:", data):
+        kind = "stars" if data.startswith("admin_telegram_stars_toggle:") else "premium"
+        product_id = data.split(":", 1)[1]
+        products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            await query.answer("Товар не найден", show_alert=True)
+            return
+        product["enabled"] = not bool(product.get("enabled"))
+        telegram_admin_save_products_by_kind(kind, products)
+        await query.answer("Товар включён" if product.get("enabled") else "Товар выключен")
+        await edit_or_send(query, context, telegram_admin_product_card_text(kind, product_id), telegram_admin_product_card_keyboard(kind, product_id))
+    elif re.match(r"^admin_telegram_(stars|premium)_price:", data):
+        kind = "stars" if data.startswith("admin_telegram_stars_price:") else "premium"
+        product_id = data.split(":", 1)[1]
+        _products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            await query.answer("Товар не найден", show_alert=True)
+            return
+        context.user_data["client_input"] = TELEGRAM_PRODUCT_PRICE_INPUT
+        context.user_data["telegram_edit_kind"] = kind
+        context.user_data["telegram_edit_product_id"] = product_id
+        await query.answer()
+        await edit_or_send(query, context, "✏️ <b>Изменение цены</b>\n\n" f"Товар: <b>{html_escape(str(product.get('title') or product_id))}</b>\n" f"Текущая цена: <b>{format_rub(product.get('price_rub'))}</b>\n\n" "Введите новую цену продажи в рублях.\nНапример: <code>999</code>\n\nЧтобы отменить — нажмите Назад.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_telegram_{kind}_card:{product_id}")]]))
+    elif re.match(r"^admin_telegram_(stars|premium)_markup:", data):
+        kind = "stars" if data.startswith("admin_telegram_stars_markup:") else "premium"
+        product_id = data.split(":", 1)[1]
+        _products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            await query.answer("Товар не найден", show_alert=True)
+            return
+        context.user_data["client_input"] = TELEGRAM_PRODUCT_MARKUP_INPUT
+        context.user_data["telegram_edit_kind"] = kind
+        context.user_data["telegram_edit_product_id"] = product_id
+        await query.answer()
+        current_markup = product.get("supplier_markup_percent") if product.get("supplier_markup_percent") is not None else telegram_services_pricing_settings().get("stars_markup_percent" if kind == "stars" else "premium_markup_percent")
+        await edit_or_send(query, context, "✏️ <b>Изменение наценки</b>\n\n" f"Товар: <b>{html_escape(str(product.get('title') or product_id))}</b>\n" f"Текущая наценка: <b>{html_escape(str(current_markup))}%</b>\n\n" "Введите новую наценку в процентах.\nНапример: <code>35</code> или <code>40</code>\n\nЧтобы отменить — нажмите Назад.", InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"admin_telegram_{kind}_card:{product_id}")]]))
+    elif re.match(r"^admin_telegram_(stars|premium)_recalc:", data):
+        kind = "stars" if data.startswith("admin_telegram_stars_recalc:") else "premium"
+        product_id = data.split(":", 1)[1]
+        products, product = telegram_admin_find_product(kind, product_id)
+        if not product:
+            await query.answer("Товар не найден", show_alert=True)
+            return
+        ok, message = telegram_admin_recalculate_product(product, kind)
+        if ok:
+            telegram_admin_save_products_by_kind(kind, products)
+        await query.answer(message, show_alert=not ok)
+        await edit_or_send(query, context, telegram_admin_product_card_text(kind, product_id), telegram_admin_product_card_keyboard(kind, product_id))
     elif data in {"admin_telegram_sync_stars", "admin_telegram_sync_premium", "admin_telegram_sync_all"}:
         await query.answer("Синхронизирую FazerCards...")
         kind = "stars" if data.endswith("stars") else ("premium" if data.endswith("premium") else "all")
