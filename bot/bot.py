@@ -192,11 +192,11 @@ APPLE_ID_REGION_FLAGS = {"US": "🇺🇸", "TR": "🇹🇷", "RU": "🇷🇺"}
 
 FRIEND_REFERRAL_REWARD_USD = 1.0
 STATUS_LEVELS = [
-    (1000.0, "Ambassador", "👑", 10.0, 7),
+    (1000.0, "VIP", "👑", 10.0, 7),
     (300.0, "Premium", "💎", 5.0, 5),
-    (150.0, "Nomad", "🌎", 3.0, 3),
-    (50.0, "Explorer", "✈️", 2.0, 2),
-    (0.0, "Traveller", "🧳", 1.0, 1),
+    (150.0, "Regular", "🌎", 3.0, 3),
+    (50.0, "Buyer", "✈️", 2.0, 2),
+    (0.0, "New", "🧳", 1.0, 1),
 ]
 STATUS_META = {
     status: {
@@ -770,7 +770,7 @@ def default_user_profile(user) -> dict:
         "referrer": None,
         "referral_bonus_awarded": False,
         "new_client_notified": False,
-        "status": "Traveller",
+        "status": "New",
     }
 
 
@@ -1178,20 +1178,20 @@ def calculate_user_status(total_spent: float) -> str:
     for threshold, status, _icon, _reward, _cashback_percent in STATUS_LEVELS:
         if total_spent >= threshold:
             return status
-    return "Traveller"
+    return "New"
 
 
 def status_icon(status: str) -> str:
-    return STATUS_META.get(status, STATUS_META["Traveller"])["icon"]
+    return STATUS_META.get(status, STATUS_META["New"])["icon"]
 
 
 def format_status(status: str) -> str:
-    actual_status = status if status in STATUS_META else "Traveller"
+    actual_status = status if status in STATUS_META else "New"
     return f"{status_icon(actual_status)} {actual_status}"
 
 
 def referral_reward_for_status(status: str) -> float:
-    return STATUS_META.get(status, STATUS_META["Traveller"])["referral_reward"]
+    return STATUS_META.get(status, STATUS_META["New"])["referral_reward"]
 
 
 def referral_reward_for_profile(profile: dict) -> float:
@@ -1200,7 +1200,7 @@ def referral_reward_for_profile(profile: dict) -> float:
 
 
 def cashback_percent_for_status(status: str) -> int:
-    return int(STATUS_META.get(status, STATUS_META["Traveller"])["cashback_percent"])
+    return int(STATUS_META.get(status, STATUS_META["New"])["cashback_percent"])
 
 
 def cashback_percent_for_profile(profile: dict) -> int:
@@ -1239,7 +1239,7 @@ def order_sort_key(order: dict) -> tuple[int, str]:
 
 
 def status_rank(status: str) -> int:
-    return STATUS_ORDER.get(status, STATUS_ORDER["Traveller"])
+    return STATUS_ORDER.get(status, STATUS_ORDER["New"])
 
 
 def referral_entry_user_id(entry) -> str | None:
@@ -1504,7 +1504,7 @@ def record_user_order(user, order: dict) -> tuple[dict, str, str, float]:
     previous_status = calculate_user_status(previous_total)
 
     profile = update_profile_stats_from_orders(user.id, profile, all_user_orders)
-    current_status = profile.get("status", "Traveller")
+    current_status = profile.get("status", "New")
     cashback_amount = award_cashback_if_needed(profile, order)
     if cashback_amount > 0:
         save_order_cashback_fields(order)
@@ -4482,18 +4482,34 @@ async def send_order_list(message, orders: list, title: str):
 
 
 ORDER_LIST_FILTERS = {
-    "new": {"new"},
-    "in_progress": {"in_progress"},
-    "issued": {"issued"},
-    "cancelled": {"cancelled"},
-    "pending": {"new", "in_progress"},
+    "all": set(),
+    "apple_id": {"category:apple_id"},
+    "telegram_stars": {"category:telegram_stars"},
+    "telegram_premium": {"category:telegram_premium"},
+    "esim": {"category:esim"},
+    "pending_payment": {"payment:pending_payment"},
+    "paid": {"payment:paid"},
+    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:new"},
+    "issued": {"fulfillment:issued"},
+    "cancelled": {"payment:cancelled", "fulfillment:cancelled"},
+    "new": {"fulfillment:new"},
+    "in_progress": {"fulfillment:waiting_manual_issue"},
+    "pending": {"payment:pending_payment", "fulfillment:new", "fulfillment:waiting_manual_issue"},
 }
 ORDER_LIST_TITLES = {
-    "new": "🟡 Новые заявки",
-    "in_progress": "🔵 В работе",
-    "issued": "🟢 Выданные заявки",
-    "cancelled": "🔴 Отменённые заявки",
-    "pending": "🟡 Активные заявки",
+    "all": "🧾 Все заказы",
+    "apple_id": "🍎 Apple ID",
+    "telegram_stars": "⭐ Telegram Stars",
+    "telegram_premium": "💎 Telegram Premium",
+    "esim": "🌍 eSIM",
+    "pending_payment": "⏳ Ожидают оплаты",
+    "paid": "✅ Оплачены",
+    "waiting_issue": "📦 Ожидают выдачи",
+    "issued": "✅ Выданы",
+    "cancelled": "❌ Отменены",
+    "new": "🆕 Новые заказы",
+    "in_progress": "📦 Ожидают выдачи",
+    "pending": "🟡 Активные заказы",
 }
 STATUS_NOTIFICATION_TEXT = {
     "in_progress": "🔵 Ваш заказ {number} взят в работу.",
@@ -4503,8 +4519,22 @@ STATUS_NOTIFICATION_TEXT = {
 
 
 def filter_orders_by_status(orders: list, filter_key: str) -> list:
-    statuses = ORDER_LIST_FILTERS.get(filter_key, {filter_key})
-    return [order for order in orders if normalize_order_status(order.get("status")) in statuses]
+    filters = ORDER_LIST_FILTERS.get(filter_key, {filter_key})
+    if filter_key == "all" or not filters:
+        return list(orders)
+    result = []
+    for order in orders:
+        category = order_category_key(order)
+        payment_status = order_payment_status(order)
+        fulfillment_status = order_fulfillment_status(order)
+        if (
+            f"category:{category}" in filters
+            or f"payment:{payment_status}" in filters
+            or f"fulfillment:{fulfillment_status}" in filters
+            or normalize_order_status(order.get("status")) in filters
+        ):
+            result.append(order)
+    return result
 
 
 def order_number_plain(order: dict) -> str:
@@ -4512,19 +4542,127 @@ def order_number_plain(order: dict) -> str:
     return number if number.startswith("#") else f"#{number}"
 
 
+ORDER_CATEGORY_META = {
+    "apple_id": ("🍎", "Apple ID"),
+    "telegram_stars": ("⭐", "Telegram Stars"),
+    "telegram_premium": ("💎", "Telegram Premium"),
+    "esim": ("🌍", "eSIM"),
+    "other": ("📦", "Другое"),
+}
+PAYMENT_STATUS_LABELS = {
+    "pending_payment": "⏳ ожидает оплаты",
+    "paid": "✅ оплачено",
+    "payment_failed": "❌ ошибка оплаты",
+    "refunded": "↩️ возврат",
+    "cancelled": "❌ отменено",
+}
+FULFILLMENT_STATUS_LABELS = {
+    "new": "🆕 новый",
+    "waiting_manual_issue": "⏳ ожидает ручной выдачи",
+    "issued": "✅ выдан",
+    "failed": "❌ ошибка выдачи",
+    "cancelled": "❌ отменён",
+}
+CRM_STATUS_LABELS = {
+    "new": "🆕 Новый",
+    "active": "🟢 Активный",
+    "vip": "⭐ VIP",
+    "sleeping": "😴 Спящий",
+    "blocked": "🚫 Заблокирован",
+}
+VIP_ORDER_THRESHOLD = 5
+VIP_SPENT_THRESHOLD = 50000
+
+
+def order_category_key(order: dict) -> str:
+    category = str(order.get("category") or order.get("product_category") or "").strip().lower()
+    product_type = str(order.get("product_type") or "").strip().lower()
+    if category in ORDER_CATEGORY_META:
+        return category
+    if product_type in {"apple_id", "telegram_stars", "telegram_premium"}:
+        return product_type
+    if product_type in {"esim", "sim", "vpn"} or any(order.get(key) for key in ("country", "gb", "days")):
+        return "esim"
+    return "other"
+
+
+def order_category_label(order: dict) -> str:
+    icon, title = ORDER_CATEGORY_META.get(order_category_key(order), ORDER_CATEGORY_META["other"])
+    return f"{icon} {title}"
+
+
+def order_payment_status(order: dict) -> str:
+    explicit = str(order.get("payment_status") or "").strip()
+    if explicit in PAYMENT_STATUS_LABELS:
+        return explicit
+    status = normalize_order_status(order.get("status"))
+    if status == "waiting_payment":
+        return "pending_payment"
+    if status in {"cancelled"}:
+        return "cancelled"
+    if status in {"payment_failed", "failed"}:
+        return "payment_failed"
+    if status == "refunded":
+        return "refunded"
+    return "paid" if is_revenue_order(order) else "pending_payment"
+
+
+def order_fulfillment_status(order: dict) -> str:
+    explicit = str(order.get("fulfillment_status") or "").strip()
+    if explicit in FULFILLMENT_STATUS_LABELS:
+        return explicit
+    status = normalize_order_status(order.get("status"))
+    if status in {"issued", "done"}:
+        return "issued"
+    if status == "cancelled":
+        return "cancelled"
+    if status in {"failed", "payment_failed"}:
+        return "failed"
+    if status in {"in_progress", "processing"}:
+        return "waiting_manual_issue"
+    return "waiting_manual_issue" if order_payment_status(order) == "paid" else "new"
+
+
+def payment_status_label(order: dict) -> str:
+    return PAYMENT_STATUS_LABELS.get(order_payment_status(order), order_payment_status(order))
+
+
+def fulfillment_status_label(order: dict) -> str:
+    return FULFILLMENT_STATUS_LABELS.get(order_fulfillment_status(order), order_fulfillment_status(order))
+
+
+def order_amount_rub(order: dict) -> float:
+    """Return only a trusted RUB amount; never infer RUB from USD-looking price strings."""
+    for key in ("price_rub", "amount_rub", "rub_amount"):
+        if order.get(key) not in (None, ""):
+            return safe_float(order.get(key))
+    payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
+    if payment_details.get("rub_amount") not in (None, ""):
+        return safe_float(payment_details.get("rub_amount"))
+    price = str(order.get("price") or "").strip()
+    if "₽" in price or re.search(r"(?i)(^|\s)(rub|rur|руб\.?)(\s|$)", price):
+        return safe_float(re.sub(r"(?i)(₽|rub|rur|руб\.?)", "", price).replace(" ", ""))
+    return 0.0
+
+
+def order_display_amount(order: dict) -> str:
+    rub_amount = order_amount_rub(order)
+    if rub_amount > 0:
+        return format_rub(rub_amount)
+    price = str(order.get("price") or "").strip()
+    if price:
+        return price
+    return "—"
+
+
+def legacy_client_status(user: dict) -> str:
+    return str(user.get("traveler_status") or user.get("ambassador_status") or user.get("client_status") or "")
+
+
 def format_order_button_text(order: dict) -> str:
-    status = order_status_label(order.get("status", "new"))
-    if order.get("price"):
-        price = str(order.get("price"))
-    elif order.get("price_rub"):
-        price = format_rub(order.get("price_rub"))
-    else:
-        price = "—"
-    if order.get("product_type") == "apple_id":
-        title = str(order.get("product_title") or order.get("gb") or "Apple ID")
-    else:
-        title = f"eSIM {order.get('country', 'Россия')}"
-    return f"{order_number_plain(order)} · {title} · {price} · {status}"[:64]
+    title = str(order.get("product_title") or order.get("gb") or order_category_label(order))
+    price = order_display_amount(order)
+    return f"{order_number_plain(order)} · {title} · {price} · {payment_status_label(order)} / {fulfillment_status_label(order)}"[:64]
 
 
 def build_orders_dashboard() -> str:
@@ -4569,10 +4707,12 @@ def build_orders_dashboard() -> str:
 
 def orders_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟡 Новые", callback_data="orders_list:new")],
-        [InlineKeyboardButton("🔵 В работе", callback_data="orders_list:in_progress")],
-        [InlineKeyboardButton("🟢 Выданные", callback_data="orders_list:issued")],
-        [InlineKeyboardButton("🔴 Отменённые", callback_data="orders_list:cancelled")],
+        [InlineKeyboardButton("🧾 Все заказы", callback_data="orders_list:all")],
+        [InlineKeyboardButton("🍎 Apple ID", callback_data="orders_list:apple_id"), InlineKeyboardButton("⭐ Stars", callback_data="orders_list:telegram_stars")],
+        [InlineKeyboardButton("💎 Premium", callback_data="orders_list:telegram_premium"), InlineKeyboardButton("🌍 eSIM", callback_data="orders_list:esim")],
+        [InlineKeyboardButton("⏳ Ожидают оплаты", callback_data="orders_list:pending_payment"), InlineKeyboardButton("✅ Оплачены", callback_data="orders_list:paid")],
+        [InlineKeyboardButton("📦 Ожидают выдачи", callback_data="orders_list:waiting_issue"), InlineKeyboardButton("✅ Выданы", callback_data="orders_list:issued")],
+        [InlineKeyboardButton("❌ Отменены", callback_data="orders_list:cancelled"), InlineKeyboardButton("🔎 Поиск", callback_data="orders_list:all")],
         [InlineKeyboardButton("📊 Статистика", callback_data="orders_stats")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
     ])
@@ -4609,79 +4749,58 @@ def find_order(order_id: int) -> dict | None:
 
 
 def build_order_card_text(order: dict) -> str:
-    payment_provider = order.get("payment_provider") or "card"
-    payment_method = payment_provider_label(payment_provider)
-    payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
-    card_lines = ""
-    if payment_provider == "card":
-        rate = float(payment_details.get("usd_rub_rate") or 0)
-        markup = float(payment_details.get("markup_percent") or 0)
-        final_rate = float(payment_details.get("final_usd_rub_rate") or 0)
-        rate_checked_at = payment_details.get("rate_checked_at") or "—"
-        card_lines = (
-            f"💳 К оплате: <b>{html_escape(format_rub(payment_details.get('rub_amount')))}</b>\n"
-            f"Курс: <b>{rate:.2f} ₽</b>\n"
-            f"Проверка курса: <b>{html_escape(rate_checked_at)}</b>\n"
-            f"Комиссия: <b>{markup:g}%</b>\n"
-            f"Итоговый курс: <b>{final_rate:.4f} ₽</b>\n"
-        )
-    username = order.get("tg_handle") or "—"
-    if order.get("product_type") in {"telegram_stars", "telegram_premium"}:
-        is_stars = order.get("product_type") == "telegram_stars"
-        title = "⭐ <b>Заказ Telegram Stars</b>" if is_stars else "💎 <b>Заказ Telegram Premium</b>"
-        qty_line = f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>" if is_stars else f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>"
-        return (
-            f"{title}\n\n"
-            f"Номер: <b>{html_escape(order_number_plain(order))}</b>\n"
-            f"Клиент: <b>{html_escape(order.get('name', '—'))}</b> / <code>{html_escape(order.get('user_id', '—'))}</code>\n"
-            f"Получатель: <b>{html_escape(order.get('telegram_recipient_username', '—'))}</b>\n"
-            f"{qty_line}\n"
-            f"Цена: <b>{html_escape(order.get('price', '—'))}</b>\n"
-            f"Оплата: <b>{html_escape(payment_method)}</b>\n"
-            f"Поставщик:\n- статус: <b>{html_escape(order.get('supplier_status', order.get('status', '—')))}</b>\n- stock: <b>{html_escape(order.get('supplier_stock', '—'))}</b>\n- card_id: <code>{html_escape(order.get('fazercards_card_id', '—'))}</code>\n- закуп: <b>{html_escape(format_usd(order.get('supplier_price_usd')))}</b>\n"
-            f"Маржа: <b>{html_escape(format_rub(order.get('estimated_margin_rub')))}</b>\n"
-            f"Статус: нужна ручная выдача / <b>{html_escape(order_status_with_icon(order.get('status')))}</b>"
-        )
-    if order.get("product_type") == "apple_id":
-        amount = order.get("amount", "—")
-        currency = order.get("currency", "")
-        nominal = apple_id_product_nominal_label({"amount": amount, "currency": currency})
-        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region", "—"))
-        return (
-            f"🍎 <b>Заказ Apple ID {html_escape(order_number_plain(order))}</b>\n\n"
-            f"👤 Клиент: <b>{html_escape(order.get('name', '—'))}</b>\n"
-            f"🆔 Telegram ID: <code>{html_escape(order.get('user_id', '—'))}</code>\n"
-            f"Username: <b>{html_escape(username)}</b>\n\n"
-            f"Тип товара: <b>Apple ID</b>\n"
-            f"Регион: <b>{html_escape(region)}</b>\n"
-            f"Номинал: <b>{html_escape(nominal)}</b>\n"
-            f"Товар: <b>{html_escape(order.get('product_title', order.get('gb', '—')))}</b>\n"
-            f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n\n"
-            "<b>Способ оплаты:</b>\n"
-            f"{html_escape(payment_method)}\n\n"
-            f"{card_lines}"
-            "<b>Статус:</b>\n"
-            f"{html_escape(order_status_with_icon(order.get('status')))}\n\n"
-            "<b>Дата:</b>\n"
-            f"{html_escape(format_order_date(order))}"
-        )
-    return (
-        f"📦 <b>Заказ {html_escape(order_number_plain(order))}</b>\n\n"
-        f"👤 Клиент: <b>{html_escape(order.get('name', '—'))}</b>\n"
-        f"🆔 Telegram ID: <code>{html_escape(order.get('user_id', '—'))}</code>\n"
-        f"Username: <b>{html_escape(username)}</b>\n\n"
-        f"🌍 Страна: <b>{html_escape(order.get('country', 'Россия'))}</b>\n"
-        f"📦 Тариф: <b>{html_escape(order.get('gb', '—'))}</b>\n"
-        f"💵 Цена: <b>{html_escape(order.get('price', '—'))}</b>\n\n"
-        "<b>Способ оплаты:</b>\n"
-        f"{html_escape(payment_method)}\n\n"
-        f"{card_lines}"
-        "<b>Статус:</b>\n"
-        f"{html_escape(order_status_with_icon(order.get('status')))}\n\n"
-        "<b>Дата:</b>\n"
-        f"{html_escape(format_order_date(order))}"
-    )
+    # Supports telegram_stars / Заказ Telegram Stars and telegram_premium / Заказ Telegram Premium with payment_method details.
+    payment_provider = order.get("payment_provider") or order.get("payment_method") or "card"
+    payment_method = payment_provider_label(payment_provider) if payment_provider else "—"
+    username = order.get("tg_handle") or order.get("username") or "—"
+    category = order_category_key(order)
+    product = order.get("product_title") or order.get("title") or order.get("gb") or order_category_label(order)
+    recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
+    region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
+    amount = order_display_amount(order)
+    manager_comment = order.get("manager_comment") or order.get("admin_comment") or "—"
+    issued_at = order.get("issued_at") or order.get("fulfilled_at") or "—"
+    paid_at = order.get("paid_at") or order.get("payment_paid_at") or "—"
 
+    product_lines = [
+        f"Категория: <b>{html_escape(order_category_label(order))}</b>",
+        f"Товар: <b>{html_escape(str(product))}</b>",
+    ]
+    if category == "apple_id":
+        product_lines.append(f"Регион: <b>{html_escape(str(region))}</b>")
+    elif category in {"telegram_stars", "telegram_premium"}:
+        product_lines.append(f"Получатель: <b>{html_escape(str(recipient))}</b>")
+        if category == "telegram_stars":
+            product_lines.append(f"Количество: <b>{html_escape(str(order.get('amount', '—')))} ⭐</b>")
+        else:
+            product_lines.append(f"Срок: <b>{html_escape(str(order.get('duration_months', '—')))} {html_escape(month_word(order.get('duration_months')))}</b>")
+    elif category == "esim":
+        product_lines.extend([
+            f"Страна: <b>{html_escape(str(order.get('country', 'Россия')))}</b>",
+            f"Пакет: <b>{html_escape(str(order.get('gb', '—')))}</b>",
+            f"Дни: <b>{html_escape(str(order.get('days', '—')))}</b>",
+        ])
+
+    return (
+        f"🧾 <b>Заказ {html_escape(order_number_plain(order))}</b>\n\n"
+        "<b>Клиент</b>\n"
+        f"{html_escape(str(username))}\n"
+        f"ID: <code>{html_escape(order.get('user_id', '—'))}</code>\n\n"
+        "<b>Товар</b>\n"
+        + "\n".join(product_lines)
+        + "\n\n<b>Оплата</b>\n"
+        f"Статус: <b>{html_escape(payment_status_label(order))}</b>\n"
+        f"Сумма: <b>{html_escape(amount)}</b>\n"
+        f"Метод: <b>{html_escape(str(payment_method))}</b>\n\n"
+        "<b>Выполнение</b>\n"
+        f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
+        "Тип выдачи: <b>ручная</b>\n"
+        f"Комментарий менеджера: <b>{html_escape(str(manager_comment))}</b>\n\n"
+        "<b>Даты</b>\n"
+        f"Создан: <b>{html_escape(str(order.get('created_at') or format_order_date(order)))}</b>\n"
+        f"Оплачен: <b>{html_escape(str(paid_at))}</b>\n"
+        f"Выдан: <b>{html_escape(str(issued_at))}</b>"
+    )
 
 def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -4799,25 +4918,36 @@ def analytics_keyboard() -> InlineKeyboardMarkup:
 
 
 CLIENT_CATEGORY_TITLES = {
-    "no_orders": "🆕 Без покупок",
+    "new": "🆕 Новые",
+    "active": "🟢 Активные",
+    "vip": "⭐ VIP",
+    "sleeping": "😴 Спящие",
+    "blocked": "🚫 Заблокированные",
+    "apple_id": "🍎 Apple ID",
+    "telegram_stars": "⭐ Stars",
+    "telegram_premium": "💎 Premium",
+    "esim": "🌍 eSIM",
     "buyers": "💰 Покупатели",
-    "return": "🔄 Вернуть клиентов",
-    "top": "💎 Топ клиенты",
+    "no_orders": "🆕 Новые",
+    "return": "😴 Спящие",
+    "top": "⭐ VIP",
 }
 CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
+CLIENT_INPUT_TAGS = "client_tags"
+CLIENT_INPUT_COMMENT = "client_comment"
 CLIENT_INPUT_SEARCH = "client_search"
 BROADCAST_INPUT_MESSAGE = "broadcast_message"
 NOTIFICATION_CHAT_INPUT = "notification_chat"
 BROADCAST_CATEGORIES = {
     "all": "👥 Все клиенты",
-    "no_orders": "🆕 Без заказов",
+    "no_orders": "🆕 Новые",
     "buyers": "💳 С заказами",
     "balance": "💰 С балансом",
-    "vip": "👑 VIP / Premium / Ambassador",
-    "regular": "🧳 Traveller / Explorer / Nomad",
+    "vip": "⭐ VIP",
+    "regular": "🟢 Активные",
     "referrers": "👥 Рефереры",
-    "inactive": "😴 Неактивные",
+    "inactive": "😴 Спящие",
 }
 
 
@@ -4877,6 +5007,44 @@ def client_display_name(user_id: str, profile: dict) -> str:
     return f"ID {user_id}"
 
 
+def normalize_client_tags(profile: dict, categories: set[str] | None = None) -> list[str]:
+    tags = profile.get("tags") or profile.get("crm_tags") or []
+    if isinstance(tags, str):
+        tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
+    if not isinstance(tags, list):
+        tags = []
+    result = [str(tag).strip() for tag in tags if str(tag).strip()]
+    category_tags = {
+        "apple_id": "Apple ID",
+        "telegram_stars": "Telegram Stars",
+        "telegram_premium": "Premium",
+        "esim": "eSIM",
+    }
+    for category in sorted(categories or set()):
+        label = category_tags.get(category)
+        if label and label not in result:
+            result.append(label)
+    return result
+
+
+def client_crm_status(profile: dict, paid_orders: int, total_spent_rub: float, last_paid_order_at: datetime.datetime | None) -> str:
+    if profile.get("blocked") is True or str(profile.get("crm_status") or "").lower() == "blocked":
+        return "blocked"
+    if profile.get("vip_manual") is True:
+        return "vip"
+    if paid_orders >= VIP_ORDER_THRESHOLD or total_spent_rub >= VIP_SPENT_THRESHOLD:
+        return "vip"
+    if paid_orders == 0:
+        return "new"
+    if last_paid_order_at:
+        inactive_days = (datetime.datetime.now(tz=TZ).date() - last_paid_order_at.astimezone(TZ).date()).days
+        if inactive_days <= 60:
+            return "active"
+        if inactive_days >= 90 or inactive_days > 60:
+            return "sleeping"
+    return "active"
+
+
 def collect_clients() -> list[dict]:
     users = load_users()
     orders = load_orders()
@@ -4891,85 +5059,73 @@ def collect_clients() -> list[dict]:
         if not isinstance(profile, dict):
             continue
         user_orders = orders_by_user.get(str(user_id), [])
-        active_orders = [order for order in user_orders if is_revenue_order(order)]
-        total_spent = round(sum(parse_price(order.get("price", "0")) for order in active_orders), 2)
-        order_dates = [date for date in (parse_order_datetime(order) for order in active_orders) if date]
+        paid_orders_list = [order for order in user_orders if order_payment_status(order) == "paid"]
+        cancelled_orders = sum(1 for order in user_orders if order_payment_status(order) == "cancelled" or order_fulfillment_status(order) == "cancelled")
+        total_spent_rub = round(sum(order_amount_rub(order) for order in paid_orders_list), 2)
+        order_dates = [date for date in (parse_order_datetime(order) for order in user_orders) if date]
+        paid_order_dates = [date for date in (parse_order_datetime(order) for order in paid_orders_list) if date]
+        first_order_at = min(order_dates, default=None)
         last_order_at = max(order_dates, default=None)
-        orders_count = len(active_orders)
-        status = calculate_user_status(total_spent)
-        created_at = parse_iso_datetime(str(profile.get("created_at") or ""))
-        if created_at is None:
-            for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
-                try:
-                    created_at = datetime.datetime.strptime(str(profile.get("created_at") or ""), fmt).replace(tzinfo=TZ)
-                    break
-                except ValueError:
-                    pass
+        last_paid_order_at = max(paid_order_dates, default=None)
+        categories_used = {order_category_key(order) for order in paid_orders_list}
+        paid_orders = len(paid_orders_list)
+        average_order_value = round(total_spent_rub / paid_orders, 2) if paid_orders else 0
+        crm_status = client_crm_status(profile, paid_orders, total_spent_rub, last_paid_order_at)
+        created_at = parse_user_created_datetime(str(profile.get("created_at") or ""))
         clients.append({
             "user_id": str(user_id),
             "profile": profile,
-            "orders": sorted(active_orders, key=order_sort_key, reverse=True),
-            "orders_count": orders_count,
-            "total_spent": total_spent,
+            "orders": sorted(user_orders, key=order_sort_key, reverse=True),
+            "total_orders": len(user_orders),
+            "paid_orders": paid_orders,
+            "cancelled_orders": cancelled_orders,
+            "orders_count": paid_orders,
+            "total_spent": total_spent_rub,
+            "total_spent_rub": total_spent_rub,
+            "average_order_value": average_order_value,
             "last_order_at": last_order_at,
+            "last_paid_order_at": last_paid_order_at,
+            "first_order_at": first_order_at,
             "created_at": created_at or datetime.datetime.min.replace(tzinfo=TZ),
-            "status": status,
+            "status": crm_status,
+            "crm_status": crm_status,
+            "categories_used": categories_used,
+            "tags": normalize_client_tags(profile, categories_used),
         })
     return clients
 
 
 def client_category_items(category: str) -> list[dict]:
     clients = collect_clients()
-    now_date = datetime.datetime.now(tz=TZ).date()
-    if category == "no_orders":
-        items = [client for client in clients if client["orders_count"] == 0]
-        return sorted(items, key=lambda client: client["created_at"], reverse=True)[:20]
-    if category == "buyers":
-        items = [client for client in clients if client["orders_count"] > 0]
-        return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
-    if category == "return":
-        items = [
-            client for client in clients
-            if client["orders_count"] > 0
-            and client["last_order_at"]
-            and (now_date - client["last_order_at"].astimezone(TZ).date()).days > 30
-        ]
-        return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
-    if category == "top":
-        items = [client for client in clients if client["orders_count"] > 0]
-        return sorted(items, key=lambda client: client["total_spent"], reverse=True)[:20]
-    return []
+    aliases = {"no_orders": "new", "return": "sleeping", "top": "vip", "buyers": "buyers"}
+    category = aliases.get(category, category)
+    if category in CRM_STATUS_LABELS:
+        items = [client for client in clients if client["crm_status"] == category]
+    elif category in ORDER_CATEGORY_META:
+        items = [client for client in clients if category in client["categories_used"]]
+    elif category == "buyers":
+        items = [client for client in clients if client["paid_orders"] > 0]
+    else:
+        items = clients
+    return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
 
 
 def clients_dashboard_text() -> str:
     clients = collect_clients()
-    now_date = datetime.datetime.now(tz=TZ).date()
-    no_orders = sum(1 for client in clients if client["orders_count"] == 0)
-    buyers = sum(1 for client in clients if client["orders_count"] > 0)
-    return_clients = sum(
-        1 for client in clients
-        if client["orders_count"] > 0
-        and client["last_order_at"]
-        and (now_date - client["last_order_at"].astimezone(TZ).date()).days > 30
-    )
-    premium = sum(1 for client in clients if client["status"] in {"Premium", "Ambassador"})
-    return (
-        "👥 <b>Клиенты</b>\n"
-        f"Всего клиентов: <b>{len(clients)}</b>\n"
-        f"🆕 Без покупок: <b>{no_orders}</b>\n"
-        f"💰 Покупатели: <b>{buyers}</b>\n"
-        f"🔄 Не покупали более 30 дней: <b>{return_clients}</b>\n"
-        f"💎 Premium/VIP: <b>{premium}</b>"
-    )
+    counts = {key: sum(1 for client in clients if client["crm_status"] == key) for key in CRM_STATUS_LABELS}
+    lines = ["👥 <b>Клиенты</b>", "", f"Всего клиентов: <b>{len(clients)}</b>"]
+    lines.extend(f"{CRM_STATUS_LABELS[key]}: <b>{counts[key]}</b>" for key in ("new", "active", "vip", "sleeping", "blocked"))
+    return "\n".join(lines)
 
 
 def clients_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Без покупок", callback_data="clients_cat:no_orders")],
-        [InlineKeyboardButton("💰 Покупатели", callback_data="clients_cat:buyers")],
-        [InlineKeyboardButton("🔄 Вернуть клиентов", callback_data="clients_cat:return")],
-        [InlineKeyboardButton("💎 Топ клиенты", callback_data="clients_cat:top")],
-        [InlineKeyboardButton("🔍 Найти клиента", callback_data="clients_search")],
+        [InlineKeyboardButton("🆕 Новые", callback_data="clients_cat:new"), InlineKeyboardButton("🟢 Активные", callback_data="clients_cat:active")],
+        [InlineKeyboardButton("⭐ VIP", callback_data="clients_cat:vip"), InlineKeyboardButton("😴 Спящие", callback_data="clients_cat:sleeping")],
+        [InlineKeyboardButton("🚫 Заблокированные", callback_data="clients_cat:blocked")],
+        [InlineKeyboardButton("🍎 Apple ID", callback_data="clients_cat:apple_id"), InlineKeyboardButton("⭐ Stars", callback_data="clients_cat:telegram_stars")],
+        [InlineKeyboardButton("💎 Premium", callback_data="clients_cat:telegram_premium"), InlineKeyboardButton("🌍 eSIM", callback_data="clients_cat:esim")],
+        [InlineKeyboardButton("🔎 Поиск", callback_data="clients_search")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
     ])
 
@@ -4979,9 +5135,18 @@ def client_list_text(category: str) -> str:
     items = client_category_items(category)
     if not items:
         return f"{title}\n\nКлиентов в этой категории нет."
-    lines = [title, "", "Последние 20 клиентов:" if category != "top" else "ТОП-20 клиентов:", ""]
+    lines = [f"👥 <b>Клиенты</b> — {title}", ""]
     for client in items:
-        lines.append(f"{html_escape(client_display_name(client['user_id'], client['profile']))} — <b>{format_usd_cents(client['total_spent'])}</b>")
+        name = html_escape(client_display_name(client["user_id"], client["profile"]))
+        status = CRM_STATUS_LABELS.get(client["crm_status"], client["crm_status"])
+        tags = ", ".join(client["tags"][:3]) or "—"
+        if client["paid_orders"] == 0:
+            summary = "заказов нет"
+        elif client["crm_status"] == "sleeping":
+            summary = f"последний заказ {days_ago_text(client['last_paid_order_at'])}"
+        else:
+            summary = f"{client['paid_orders']} заказов / {format_rub(client['total_spent_rub'])} / {html_escape(tags)}"
+        lines.append(f"{status} {name} — {summary}")
     return "\n".join(lines)
 
 
@@ -4989,7 +5154,7 @@ def client_list_keyboard(category: str) -> InlineKeyboardMarkup:
     rows = []
     for client in client_category_items(category):
         name = client_display_name(client["user_id"], client["profile"])
-        rows.append([InlineKeyboardButton(f"{name} — {format_usd(client['total_spent'])}", callback_data=f"client_card:{client['user_id']}:{category}")])
+        rows.append([InlineKeyboardButton(f"{CRM_STATUS_LABELS.get(client['crm_status'], '')} {name}"[:64], callback_data=f"client_card:{client['user_id']}:{category}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
     return InlineKeyboardMarkup(rows)
 
@@ -5006,31 +5171,46 @@ def client_card_text(user_id: str) -> str:
     username = str(profile.get("username") or "").strip().lstrip("@")
     username_text = f"@{username}" if username else "—"
     referral_stats = referral_analytics_for_profile(profile)
+    categories = {key: 0 for key in ("apple_id", "telegram_stars", "telegram_premium", "esim")}
+    for order in client["orders"]:
+        if order_payment_status(order) == "paid" and order_category_key(order) in categories:
+            categories[order_category_key(order)] += 1
     return (
-        f"👤 <b>{html_escape(client_display_name(user_id, profile))}</b>\n"
-        f"🆔 Telegram ID: <code>{html_escape(user_id)}</code>\n"
-        "Username:\n"
-        f"{html_escape(username_text)}\n"
-        f"📦 Заказов: <b>{client['orders_count']}</b>\n"
-        "💰 Потрачено:\n"
-        f"<b>{format_usd_cents(client['total_spent'])}</b>\n"
-        "💵 SLIK Balance:\n"
-        f"<b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
-        "🏅 Статус:\n"
-        f"<b>{html_escape(format_status(client['status']))}</b>\n"
-        "👥 Реферальная аналитика:\n"
-        f"Переходов: <b>{referral_stats['clicks']}</b>\n"
-        f"Купили: <b>{referral_stats['bought']}</b>\n"
-        f"Не купили: <b>{referral_stats['not_bought']}</b>\n"
-        f"Бонусов начислено: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n"
-        "📅 Последний заказ:\n"
-        f"<b>{html_escape(days_ago_text(client['last_order_at']))}</b>"
+        "👤 <b>Клиент</b>\n\n"
+        f"ID Telegram: <code>{html_escape(user_id)}</code>\n"
+        f"@username: <b>{html_escape(username_text)}</b>\n"
+        f"Имя: <b>{html_escape(profile.get('full_name') or '—')}</b>\n"
+        f"Телефон: <b>{html_escape(profile.get('phone') or '—')}</b>\n\n"
+        "<b>Активность</b>\n"
+        f"Всего заказов: <b>{client['total_orders']}</b>\n"
+        f"Успешных заказов: <b>{client['paid_orders']}</b>\n"
+        f"Отменённых заказов: <b>{client['cancelled_orders']}</b>\n"
+        f"Последний заказ: <b>{html_escape(days_ago_text(client['last_order_at']))}</b>\n"
+        f"Первый заказ: <b>{html_escape(days_ago_text(client['first_order_at']))}</b>\n\n"
+        "<b>Покупки по категориям</b>\n"
+        f"🍎 Apple ID: <b>{categories['apple_id']}</b>\n"
+        f"⭐ Telegram Stars: <b>{categories['telegram_stars']}</b>\n"
+        f"💎 Telegram Premium: <b>{categories['telegram_premium']}</b>\n"
+        f"🌍 eSIM: <b>{categories['esim']}</b>\n\n"
+        "<b>Финансы</b>\n"
+        f"Сумма покупок: <b>{format_rub(client['total_spent_rub'])}</b>\n"
+        f"Средний чек: <b>{format_rub(client['average_order_value'])}</b>\n"
+        f"Баланс SLIK: <b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
+        f"Бонусы / cashback: <b>{format_usd_cents(profile.get('bonus_balance', 0))}</b>\n"
+        f"Реферальные начисления: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
+        "<b>CRM</b>\n"
+        f"Статус клиента: <b>{CRM_STATUS_LABELS.get(client['crm_status'], client['crm_status'])}</b>\n"
+        f"Комментарий менеджера: <b>{html_escape(profile.get('manager_comment') or profile.get('admin_comment') or '—')}</b>\n"
+        f"🏷 Теги: <b>{html_escape(', '.join(client['tags']) or '—')}</b>"
     )
 
 
 def client_card_keyboard(user_id: str, back: str = "buyers", user=None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("📦 Заказы клиента", callback_data=f"client_orders:{user_id}")]]
+    rows = [[InlineKeyboardButton("📦 История заказов", callback_data=f"client_orders:{user_id}")]]
     if get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}:
+        rows.append([InlineKeyboardButton("🏷 Изменить теги", callback_data=f"client_tags:{user_id}"), InlineKeyboardButton("📝 Комментарий", callback_data=f"client_comment:{user_id}")])
+        rows.append([InlineKeyboardButton("🚫 Заблокировать / Разблокировать", callback_data=f"client_block:{user_id}")])
+        rows.append([InlineKeyboardButton("⭐ VIP / снять VIP", callback_data=f"client_vip:{user_id}")])
         rows.append([InlineKeyboardButton("💰 Изменить баланс", callback_data=f"client_balance:{user_id}")])
         rows.append([InlineKeyboardButton("✉️ Написать клиенту", callback_data=f"client_message:{user_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"clients_cat:{back}" if back in CLIENT_CATEGORY_TITLES else "admin_clients")])
@@ -5042,8 +5222,8 @@ def client_orders_text(user_id: str) -> str:
     if not client:
         return "Клиент не найден."
     if not client["orders"]:
-        return f"📦 <b>Заказы клиента</b>\n\nУ клиента {html_escape(client_display_name(user_id, client['profile']))} пока нет заказов."
-    return f"📦 <b>Заказы клиента</b>\n\n{html_escape(client_display_name(user_id, client['profile']))}: <b>{len(client['orders'])}</b>"
+        return f"📦 <b>История заказов</b>\n\nУ клиента {html_escape(client_display_name(user_id, client['profile']))} пока нет заказов."
+    return f"📦 <b>История заказов</b>\n\n{html_escape(client_display_name(user_id, client['profile']))}: <b>{len(client['orders'])}</b>"
 
 
 def client_orders_keyboard(user_id: str) -> InlineKeyboardMarkup:
@@ -5127,8 +5307,8 @@ def broadcast_recipients(category: str) -> list[dict]:
         "no_orders": lambda client: client["orders_count"] == 0,
         "buyers": lambda client: client["orders_count"] > 0,
         "balance": has_positive_balance,
-        "vip": lambda client: client["status"] in {"Premium", "Ambassador"},
-        "regular": lambda client: client["status"] in {"Traveller", "Explorer", "Nomad"},
+        "vip": lambda client: client["crm_status"] == "vip",
+        "regular": lambda client: client["crm_status"] == "active",
         "referrers": is_referrer,
         "inactive": is_inactive,
     }
@@ -6506,7 +6686,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Имя: <b>{html_escape(profile.get('full_name') or user.full_name or '—')}</b>\n"
         f"Telegram ID: <code>{user.id}</code>\n\n"
         "Текущий статус:\n"
-        f"<b>{html_escape(format_status(profile.get('status', 'Traveller')))}</b>\n\n"
+        f"<b>{html_escape(format_status(profile.get('status', 'New')))}</b>\n\n"
         f"Потрачено: <b>{format_usd_cents(total_spent)}</b>\n\n"
         f"{progress_text}\n\n"
         f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
@@ -6630,7 +6810,7 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
-    status = profile.get("status", "Traveller")
+    status = profile.get("status", "New")
     referral_reward = referral_reward_for_profile(profile)
     referral_stats = referral_analytics_for_profile(profile)
     username = await get_bot_username(context)
@@ -6656,7 +6836,7 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
     referral_stats = referral_analytics_for_profile(profile)
-    status = profile.get("status", "Traveller")
+    status = profile.get("status", "New")
     referral_reward = referral_reward_for_profile(profile)
     text = (
         "💰 <b>SLIK Balance</b>\n\n"
@@ -7816,6 +7996,53 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         await msg.reply_text("Клиент не найден.")
         return
 
+    if input_mode == CLIENT_INPUT_TAGS:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может менять теги.")
+            return
+        tags = [tag.strip() for tag in msg.text.split(",") if tag.strip()]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await msg.reply_text("Клиент не найден.")
+            return
+        profile["tags"] = tags
+        users[user_id] = profile
+        save_users(users)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text(
+            "✅ Теги сохранены.\n\n" + client_card_text(user_id),
+            parse_mode="HTML",
+            reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user),
+        )
+        return
+
+    if input_mode == CLIENT_INPUT_COMMENT:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может менять комментарий.")
+            return
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await msg.reply_text("Клиент не найден.")
+            return
+        profile["manager_comment"] = msg.text.strip()
+        users[user_id] = profile
+        save_users(users)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text(
+            "✅ Комментарий сохранён.\n\n" + client_card_text(user_id),
+            parse_mode="HTML",
+            reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user),
+        )
+        return
+
     if input_mode == CLIENT_INPUT_BALANCE:
         if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
             context.user_data.pop("client_input", None)
@@ -8466,7 +8693,7 @@ def set_stored_user_role(user_id: str, role: str) -> None:
             "referrer": None,
             "referral_bonus_awarded": False,
             "new_client_notified": False,
-            "status": "Traveller",
+            "status": "New",
         }
     profile["telegram_id"] = int(user_id)
     profile["role"] = role
@@ -9285,6 +9512,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "client_order_card:",
         "client_balance:",
         "client_message:",
+        "client_tags:",
+        "client_comment:",
+        "client_block:",
+        "client_vip:",
         "payment_method:",
         "payment_toggle:",
         "payment_instructions:",
@@ -9356,6 +9587,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "💰 <b>Изменить баланс</b>\n\nВведите сумму.\nПримеры:\n<code>+5</code>\n<code>-3</code>\n<code>+10.5</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
         )
+    elif data.startswith("client_tags:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять теги.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        if not find_client(user_id):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        context.user_data["client_input"] = CLIENT_INPUT_TAGS
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "🏷 <b>Изменение тегов</b>\n\nВведите теги через запятую:\nApple ID, Stars, VIP",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("client_comment:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять комментарий.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        if not find_client(user_id):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        context.user_data["client_input"] = CLIENT_INPUT_COMMENT
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "📝 <b>Комментарий менеджера</b>\n\nВведите комментарий для клиента.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("client_block:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять блокировку.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        profile["blocked"] = not bool(profile.get("blocked", False))
+        users[user_id] = profile
+        save_users(users)
+        await query.answer("Клиент заблокирован" if profile["blocked"] else "Клиент разблокирован", show_alert=True)
+        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
+    elif data.startswith("client_vip:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять VIP.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        profile["vip_manual"] = not bool(profile.get("vip_manual", False))
+        users[user_id] = profile
+        save_users(users)
+        await query.answer("VIP включён" if profile["vip_manual"] else "VIP снят", show_alert=True)
+        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
     elif data.startswith("client_message:"):
         if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
             await query.answer("MANAGER не может писать клиентам.", show_alert=True)
