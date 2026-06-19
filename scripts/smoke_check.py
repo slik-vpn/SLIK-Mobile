@@ -78,6 +78,29 @@ def check_systemd_user_docs(unit_texts: dict[str, str], readme_text: str) -> Non
     )
 
 
+
+def check_multiservice_crm(bot_text: str) -> None:
+    admin_block = "\n".join([
+        function_block(bot_text, "clients_dashboard_text"),
+        function_block(bot_text, "clients_dashboard_keyboard"),
+        function_block(bot_text, "client_list_text"),
+        function_block(bot_text, "client_card_text"),
+        function_block(bot_text, "build_order_card_text"),
+        function_block(bot_text, "orders_dashboard_keyboard"),
+    ])
+    for legacy in ("Traveler", "Ambassador", "Путешественник", "Амбасадор"):
+        record(f"admin UI hides legacy status {legacy}", legacy not in admin_block)
+    record("legacy user status helper keeps compatibility", "def legacy_client_status" in bot_text and "traveler_status" in bot_text and "ambassador_status" in bot_text and "client_status" in bot_text)
+    record("CRM statuses exist", all(x in bot_text for x in ("Новый", "Активный", "VIP", "Спящий", "Заблокирован")))
+    record("blocked has manual priority", 'profile.get("blocked") is True' in bot_text and 'return "blocked"' in function_block(bot_text, "client_crm_status"))
+    record("VIP supports manual and automatic", "vip_manual" in bot_text and "VIP_ORDER_THRESHOLD" in bot_text and "VIP_SPENT_THRESHOLD" in bot_text)
+    client_card_block = function_block(bot_text, "client_card_text")
+    record("client card shows universal CRM metrics", all(x in client_card_block for x in ("Всего заказов", "Успешных заказов", "Сумма покупок", "Последний заказ", "Покупки по категориям", "Теги", "Комментарий менеджера")))
+    order_card_block = function_block(bot_text, "build_order_card_text")
+    record("order card shows universal product and status fields", all(x in order_card_block for x in ("Категория", "Товар", "Статус:", "Статус выдачи", "Сумма", "Получатель", "Регион", "Пакет")))
+    record("order category and status filters exist", all(x in bot_text for x in ("orders_list:apple_id", "orders_list:telegram_stars", "orders_list:telegram_premium", "orders_list:esim", "orders_list:pending_payment", "orders_list:paid", "orders_list:waiting_issue", "orders_list:issued", "orders_list:cancelled")))
+    record("customer category filters exist", all(x in bot_text for x in ("clients_cat:new", "clients_cat:active", "clients_cat:vip", "clients_cat:sleeping", "clients_cat:blocked", "clients_cat:apple_id", "clients_cat:telegram_stars", "clients_cat:telegram_premium", "clients_cat:esim")))
+
 def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
         "buy_esim",
@@ -1272,6 +1295,7 @@ def main() -> int:
         readme_text,
     )
     check_bot_contract(bot_text, env_example_text)
+    check_multiservice_crm(bot_text)
     check_apple_id_rub_market_pricing(bot_text)
     check_run_mvp_contract(run_mvp_text)
     for needle in [
