@@ -8676,7 +8676,7 @@ def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_apple_id_add_supplier_positions")],
         [InlineKeyboardButton("✏️ Наценка", callback_data="admin_apple_id_global_markup")],
         [InlineKeyboardButton("🔄 Пересчитать цены", callback_data="admin_apple_id_recalc_all")],
-        [InlineKeyboardButton("🧪 Диагностика sync", callback_data="admin_apple_id_supplier_found_disabled")],
+        [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_apple_id_supplier_found_disabled")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
 
@@ -8743,6 +8743,9 @@ def apple_id_admin_product_keyboard(product: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅/❌ Вкл/Выкл", callback_data=f"admin_apple_id_toggle:{product['id']}")],
         [InlineKeyboardButton("✏️ Изменить цену", callback_data=f"admin_apple_id_price:{product['id']}"), InlineKeyboardButton("✏️ Изменить наценку", callback_data=f"admin_apple_id_pricing_markup:{product['id']}")],
         [InlineKeyboardButton("🔄 Пересчитать", callback_data=f"admin_apple_id_pricing_apply_confirm:{product['id']}")],
+        [InlineKeyboardButton("🔗 Привязать FazerCards товар", callback_data=f"admin_apple_id_fazer_link:{product['id']}")],
+        [InlineKeyboardButton("❌ Отвязать FazerCards товар", callback_data=f"admin_apple_id_fazer_unlink:{product['id']}")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_apple_id_delete:{product['id']}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_region:{product['region']}")],
     ])
 
