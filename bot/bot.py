@@ -4632,12 +4632,27 @@ def fulfillment_status_label(order: dict) -> str:
 
 
 def order_amount_rub(order: dict) -> float:
-    if order.get("price_rub") is not None:
-        return safe_float(order.get("price_rub"))
+    """Return only a trusted RUB amount; never infer RUB from USD-looking price strings."""
+    for key in ("price_rub", "amount_rub", "rub_amount"):
+        if order.get(key) not in (None, ""):
+            return safe_float(order.get(key))
     payment_details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
-    if payment_details.get("rub_amount") is not None:
+    if payment_details.get("rub_amount") not in (None, ""):
         return safe_float(payment_details.get("rub_amount"))
-    return parse_price(order.get("price", "0"))
+    price = str(order.get("price") or "").strip()
+    if "₽" in price or re.search(r"(?i)(^|\s)(rub|rur|руб\.?)(\s|$)", price):
+        return safe_float(re.sub(r"(?i)(₽|rub|rur|руб\.?)", "", price).replace(" ", ""))
+    return 0.0
+
+
+def order_display_amount(order: dict) -> str:
+    rub_amount = order_amount_rub(order)
+    if rub_amount > 0:
+        return format_rub(rub_amount)
+    price = str(order.get("price") or "").strip()
+    if price:
+        return price
+    return "—"
 
 
 def legacy_client_status(user: dict) -> str:
@@ -4646,7 +4661,7 @@ def legacy_client_status(user: dict) -> str:
 
 def format_order_button_text(order: dict) -> str:
     title = str(order.get("product_title") or order.get("gb") or order_category_label(order))
-    price = format_rub(order_amount_rub(order)) if order_amount_rub(order) else str(order.get("price") or "—")
+    price = order_display_amount(order)
     return f"{order_number_plain(order)} · {title} · {price} · {payment_status_label(order)} / {fulfillment_status_label(order)}"[:64]
 
 
@@ -4742,7 +4757,7 @@ def build_order_card_text(order: dict) -> str:
     product = order.get("product_title") or order.get("title") or order.get("gb") or order_category_label(order)
     recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
     region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
-    amount = format_rub(order_amount_rub(order)) if order_amount_rub(order) else str(order.get("price") or "—")
+    amount = order_display_amount(order)
     manager_comment = order.get("manager_comment") or order.get("admin_comment") or "—"
     issued_at = order.get("issued_at") or order.get("fulfilled_at") or "—"
     paid_at = order.get("paid_at") or order.get("payment_paid_at") or "—"
@@ -4919,6 +4934,8 @@ CLIENT_CATEGORY_TITLES = {
 }
 CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
+CLIENT_INPUT_TAGS = "client_tags"
+CLIENT_INPUT_COMMENT = "client_comment"
 CLIENT_INPUT_SEARCH = "client_search"
 BROADCAST_INPUT_MESSAGE = "broadcast_message"
 NOTIFICATION_CHAT_INPUT = "notification_chat"
@@ -7979,6 +7996,53 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         await msg.reply_text("Клиент не найден.")
         return
 
+    if input_mode == CLIENT_INPUT_TAGS:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может менять теги.")
+            return
+        tags = [tag.strip() for tag in msg.text.split(",") if tag.strip()]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await msg.reply_text("Клиент не найден.")
+            return
+        profile["tags"] = tags
+        users[user_id] = profile
+        save_users(users)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text(
+            "✅ Теги сохранены.\n\n" + client_card_text(user_id),
+            parse_mode="HTML",
+            reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user),
+        )
+        return
+
+    if input_mode == CLIENT_INPUT_COMMENT:
+        if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            context.user_data.pop("client_input", None)
+            context.user_data.pop("client_target_id", None)
+            await msg.reply_text("⛔ MANAGER не может менять комментарий.")
+            return
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await msg.reply_text("Клиент не найден.")
+            return
+        profile["manager_comment"] = msg.text.strip()
+        users[user_id] = profile
+        save_users(users)
+        context.user_data.pop("client_input", None)
+        context.user_data.pop("client_target_id", None)
+        await msg.reply_text(
+            "✅ Комментарий сохранён.\n\n" + client_card_text(user_id),
+            parse_mode="HTML",
+            reply_markup=client_card_keyboard(user_id, "buyers", update.effective_user),
+        )
+        return
+
     if input_mode == CLIENT_INPUT_BALANCE:
         if get_user_role(update.effective_user) not in {ROLE_OWNER, ROLE_ADMIN}:
             context.user_data.pop("client_input", None)
@@ -9448,6 +9512,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "client_order_card:",
         "client_balance:",
         "client_message:",
+        "client_tags:",
+        "client_comment:",
+        "client_block:",
+        "client_vip:",
         "payment_method:",
         "payment_toggle:",
         "payment_instructions:",
@@ -9519,6 +9587,68 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "💰 <b>Изменить баланс</b>\n\nВведите сумму.\nПримеры:\n<code>+5</code>\n<code>-3</code>\n<code>+10.5</code>",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
         )
+    elif data.startswith("client_tags:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять теги.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        if not find_client(user_id):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        context.user_data["client_input"] = CLIENT_INPUT_TAGS
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "🏷 <b>Изменение тегов</b>\n\nВведите теги через запятую:\nApple ID, Stars, VIP",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("client_comment:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять комментарий.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        if not find_client(user_id):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        context.user_data["client_input"] = CLIENT_INPUT_COMMENT
+        context.user_data["client_target_id"] = user_id
+        await query.answer()
+        await edit_or_send(
+            query, context,
+            "📝 <b>Комментарий менеджера</b>\n\nВведите комментарий для клиента.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
+        )
+    elif data.startswith("client_block:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять блокировку.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        profile["blocked"] = not bool(profile.get("blocked", False))
+        users[user_id] = profile
+        save_users(users)
+        await query.answer("Клиент заблокирован" if profile["blocked"] else "Клиент разблокирован", show_alert=True)
+        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
+    elif data.startswith("client_vip:"):
+        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
+            await query.answer("MANAGER не может менять VIP.", show_alert=True)
+            return
+        user_id = data.split(":", 1)[1]
+        users = load_users()
+        profile = users.get(user_id)
+        if not isinstance(profile, dict):
+            await query.answer("Клиент не найден.", show_alert=True)
+            return
+        profile["vip_manual"] = not bool(profile.get("vip_manual", False))
+        users[user_id] = profile
+        save_users(users)
+        await query.answer("VIP включён" if profile["vip_manual"] else "VIP снят", show_alert=True)
+        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
     elif data.startswith("client_message:"):
         if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
             await query.answer("MANAGER не может писать клиентам.", show_alert=True)
