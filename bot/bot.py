@@ -3294,6 +3294,18 @@ def telegram_payment_amount_rub(plan: dict) -> int:
     except Exception: return 0
 
 
+def telegram_stars_client_button_label(product: dict) -> str:
+    amount = int(product.get("amount") or 0)
+    price = telegram_payment_amount_rub(product)
+    return f"{amount} ⭐ — {format_rub(price)}"  # format_rub adds ₽
+
+
+def telegram_premium_client_button_label(product: dict) -> str:
+    months = int(product.get("duration_months") or 0)
+    price = telegram_payment_amount_rub(product)
+    return f"💎 {months} {month_word(months)} — {format_rub(price)}"  # format_rub adds ₽
+
+
 def calculate_telegram_supplier_markup_price(product: dict, kind: str) -> dict:
     settings = telegram_services_pricing_settings()
     markup_source = product.get("supplier_markup_percent")
@@ -5518,15 +5530,15 @@ def telegram_services_start_keyboard() -> InlineKeyboardMarkup:
 
 
 def telegram_stars_catalog_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(f"{p['amount']} ⭐", callback_data=f"telegram_stars_product:{p['id']}") for p in telegram_stars_products() if is_visible_telegram_stars_product(p, enabled_only=True)]
-    rows = build_grid_keyboard(buttons, 3)
+    buttons = [InlineKeyboardButton(telegram_stars_client_button_label(p), callback_data=f"telegram_stars_product:{p['id']}") for p in telegram_stars_products() if is_visible_telegram_stars_product(p, enabled_only=True)]
+    rows = build_grid_keyboard(buttons, 2)
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="telegram_stars_start")])
     return InlineKeyboardMarkup(rows)
 
 
 def telegram_premium_catalog_keyboard() -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(f"{p['duration_months']} {month_word(p['duration_months'])}", callback_data=f"telegram_premium_product:{p['id']}") for p in telegram_premium_products() if is_visible_telegram_premium_product(p, enabled_only=True)]
-    rows = build_grid_keyboard(buttons, 2)
+    buttons = [InlineKeyboardButton(telegram_premium_client_button_label(p), callback_data=f"telegram_premium_product:{p['id']}") for p in telegram_premium_products() if is_visible_telegram_premium_product(p, enabled_only=True)]
+    rows = build_grid_keyboard(buttons, 1)
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="telegram_stars_start")])
     return InlineKeyboardMarkup(rows)
 
