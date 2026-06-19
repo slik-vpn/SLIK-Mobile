@@ -29,5 +29,6 @@
   "telegram_stars_products": [],
   "telegram_premium_products": [],
   "telegram_stars_pending_supplier_positions": [],
-  "telegram_premium_pending_supplier_positions": []
+  "telegram_premium_pending_supplier_positions": [],
+  "telegram_services_last_sync_report": {}
 }
