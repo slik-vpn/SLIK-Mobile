@@ -2866,21 +2866,29 @@ def fazercards_bulk_sync_report_text(report: dict) -> str:
     if report.get("sync_failed"):
         error = html_escape(str(report.get("error") or "giftcards_fetch_failed"))
         return (
-            "⚠️ <b>Синхронизация FazerCards не выполнена</b>\n\n"
-            "Не удалось получить список категорий /giftcards или Apple-карты поставщика.\n"
-            "Каталог Apple ID не изменён.\n"
-            "Проверьте API-ключ FazerCards или повторите позже.\n\n"
+            "⚠️ <b>Синхронизация Apple ID не выполнена</b>\n\n"
+            "Каталог Apple ID не изменён. Проверьте API-ключ FazerCards или повторите позже.\n\n"
             f"Ошибка: <code>{error}</code>"
         )
-    lines = ["🔗 <b>Синхронизация FazerCards завершена</b>", "", f"Найдено категорий Apple: {report['categories']}", f"Найдено позиций у поставщика: {report['supplier_items']}", f"Привязано товаров: {report['linked']}", f"Обновлено закупочных цен: {report['updated_prices']}", f"Нет exact match: {report['not_found']}", f"Новые позиции у поставщика: {report['new_supplier_positions']}", f"Ошибки: {report['errors']}", ""]
-    lines.extend(report.get("lines", [])[:30])
-    return "\n".join(lines)
-
+    updated_at = report.get("updated_at") or now_str()
+    found = report.get("supplier_items", 0)
+    new_count = report.get("new_supplier_positions", 0)
+    updated = report.get("updated_prices", 0) or report.get("linked", 0)
+    return "\n".join([
+        "🔄 <b>Синхронизация Apple ID завершена</b>", "",
+        "🍎 Apple ID:",
+        f"✅ Найдено: {found}",
+        f"➕ Новых: {new_count}",
+        f"🔄 Обновлено: {updated}", "",
+        f"Ошибки: {report.get('errors', 0)}",
+        "Fallback: нет", "",
+        f"Обновлено: {html_escape(str(updated_at))}",
+    ])
 
 def fazercards_bulk_sync_report_keyboard(report: dict) -> InlineKeyboardMarkup:
     rows = []
     if report.get("new_supplier_positions_list"):
-        rows.append([InlineKeyboardButton("➕ Добавить новые позиции", callback_data="admin_apple_id_add_supplier_positions")])
+        rows.append([InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_apple_id_add_supplier_positions")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
     return InlineKeyboardMarkup(rows)
 
@@ -3305,6 +3313,49 @@ def calculate_telegram_supplier_markup_price(product: dict, kind: str) -> dict:
 
 
 
+def admin_product_status_badge(product: dict) -> str:
+    return "✅ Включён" if product.get("enabled", True) is True else "❌ Выключен вручную"
+
+
+def admin_supplier_status_badge(product: dict) -> str:
+    status = str(product.get("supplier_status") or "").strip().lower()
+    if product.get("supplier_available") is True or status == "found":
+        return "✅ Синхронизирован"
+    if status == "not_found":
+        return "❌ Не найден у поставщика"
+    if status == "out_of_stock" or product.get("supplier_available") is False:
+        return "⚠️ Нет у поставщика"
+    return "🔄 Нужно синхронизировать"
+
+
+def admin_price_status_badge(product: dict) -> str:
+    if not (product.get("supplier_price_usd") or product.get("fazercards_price_usd") or product.get("price_usd")):
+        return "⚠️ Нет себестоимости"
+    try:
+        price = int(float(product.get("price_rub") or 0))
+    except (TypeError, ValueError):
+        price = 0
+    return "✅ Цена рассчитана" if price > 0 else "⚠️ Цена не рассчитана"
+
+
+def admin_sync_age_badge(product: dict) -> str:
+    value = product.get("supplier_last_seen") or product.get("fazercards_last_seen")
+    if not value:
+        return "🔄 Не синхронизировался"
+    try:
+        dt = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.date() == local_date():
+            return "✅ Обновлено сегодня"
+    except Exception:
+        if str(local_date()) in str(value):
+            return "✅ Обновлено сегодня"
+    return "⚠️ Нужно обновить"
+
+
+def admin_supplier_availability_text(product: dict, service: str = "") -> str:
+    return "ℹ️ точное количество поставщик не передаёт"
+
+
 def telegram_admin_product_status_badge(product: dict) -> str:
     return "✅ Включён" if isinstance(product, dict) and product.get("enabled") is True else "❌ Выключен вручную"
 
@@ -3530,7 +3581,7 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
     updated_at = report.get("updated_at") or now_str()
     new_total = int(report.get("pending_stars_count", 0) or 0) + int(report.get("pending_premium_count", 0) or 0)
     lines = [
-        "🔄 <b>Синхронизация завершена</b>", "",
+        "🔄 <b>Синхронизация Telegram завершена</b>", "",
         "⭐ <b>Stars</b>",
         f"✅ Найдено: {report.get('stars_candidates_found', 0)}",
         f"➕ Новых: {report.get('pending_stars_count', 0)}",
@@ -5562,6 +5613,11 @@ def telegram_admin_product_card_text(kind: str, product_id: str) -> str:
         f"Поставщик: {telegram_admin_supplier_status_badge(p)}",
         f"Цена: {telegram_admin_price_status_badge(p)}",
         f"Sync: {telegram_admin_sync_age_badge(p)}", "",
+        "<b>Поставщик</b>",
+        f"Статус: {'✅ доступно' if p.get('supplier_available') is True or p.get('supplier_status') == 'found' else '⚠️ нет у поставщика'}",
+        f"Остаток: {admin_supplier_availability_text(p, kind)}",  # точное количество поставщик не передаёт
+        (f"Диапазон: 50–10000 Stars" if kind == "stars" else f"План: {html_escape(str(p.get('duration_months') or '—'))} месяца"),
+        f"Обновлено: {html_escape(str(p.get('supplier_last_seen') or '—'))}", "",
         "<b>Финансы</b>",
         f"Себестоимость: {html_escape(str(supplier_price_text))}",
         f"Курс: {float(rate or 0):.2f} ₽",
@@ -5590,8 +5646,8 @@ def telegram_admin_product_card_keyboard(kind: str, product_id: str) -> InlineKe
 def telegram_pending_products_text() -> str:
     stars = len(telegram_stars_pending_supplier_positions()); premium = len(telegram_premium_pending_supplier_positions())
     if not stars and not premium:
-        return "➕ <b>Найденные товары</b>\n\nНовых товаров нет. Выполните синхронизацию."
-    return f"➕ <b>Найденные товары</b>\n\n⭐ Stars: {stars} новых\n💎 Premium: {premium} новых\n\nВыберите, что добавить:"
+        return "➕ <b>Найденные Telegram товары</b>\n\n⭐ Stars: 0 новых\n💎 Premium: 0 новых\n\nНовых товаров нет. Выполните синхронизацию."
+    return f"➕ <b>Найденные Telegram товары</b>\n\n⭐ Stars: {stars} новых\n💎 Premium: {premium} новых\n\nВыберите, что добавить:"
 
 
 def telegram_markup_text() -> str:
@@ -5615,11 +5671,12 @@ def recalculate_all_telegram_prices(apply: bool = False) -> dict:
 
 def admin_telegram_services_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ Stars каталог", callback_data="admin_telegram_stars_catalog")],
-        [InlineKeyboardButton("💎 Premium каталог", callback_data="admin_telegram_premium_catalog")],
+        [InlineKeyboardButton("⭐ Stars товары", callback_data="admin_telegram_stars_catalog")],
+        [InlineKeyboardButton("💎 Premium товары", callback_data="admin_telegram_premium_catalog")],
         [InlineKeyboardButton("🔄 Синхронизировать", callback_data="admin_telegram_sync_all")],
         [InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_telegram_pending_products")],
         [InlineKeyboardButton("✏️ Наценка", callback_data="admin_telegram_markup")],
+        [InlineKeyboardButton("🔄 Пересчитать цены", callback_data="admin_telegram_recalculate_prices")],
         [InlineKeyboardButton("👤 Username для проверки цен", callback_data="admin_telegram_quote_username")],
         [InlineKeyboardButton("🧪 Диагностика sync", callback_data="admin_telegram_sync_diagnostics")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
@@ -5632,7 +5689,7 @@ def admin_telegram_services_text() -> str:
     report = telegram_last_sync_report()
     last_sync = report.get("updated_at") or max([p.get("supplier_last_seen") for p in stars + premium if p.get("supplier_last_seen")], default="—")
     rate, source = get_final_usd_rub_rate()
-    return ("⭐ <b>Telegram Stars / Premium</b>\n\n"
+    return ("⭐ <b>Telegram каталог</b>\n\n"
             "<b>Статус</b>\n"
             f"⭐ Stars: {telegram_sync_status_label(stars)}\n"
             f"💎 Premium: {telegram_sync_status_label(premium)}\n\n"
@@ -5693,7 +5750,7 @@ def admin_payment_sections_keyboard(user=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💳 Платёжные способы", callback_data="admin_payments")],
         [InlineKeyboardButton("💱 Курс USD/RUB", callback_data="admin_usd_rub")],
         [InlineKeyboardButton("🍎 Apple ID каталог", callback_data="admin_apple_id_catalog")],
-        [InlineKeyboardButton("⭐ Telegram Stars", callback_data="admin_telegram_services")],
+        [InlineKeyboardButton("⭐ Telegram каталог", callback_data="admin_telegram_services")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")],
     ])
 
@@ -8294,12 +8351,13 @@ def admin_business_sections_text(user) -> str:
 def admin_payment_sections_text(user) -> str:
     return (
         "⚙️ <b>Настройки</b>\n\n"
-        "Здесь можно управлять оплатой, курсом USD/RUB, Apple ID каталогом, "
+        "Здесь можно управлять оплатой, курсом USD/RUB, Apple ID каталогом, Telegram каталогом, "
         "глобальной наценкой, FazerCards, чатами уведомлений и сервисными параметрами.\n\n"
         "Выберите раздел:\n"
         "• 💳 Платёжные способы\n"
         "• 💱 Курс USD/RUB\n"
-        "• 🍎 Apple ID каталог"
+        "• 🍎 Apple ID каталог\n"
+        "• ⭐ Telegram каталог"
     )
 
 
@@ -8574,23 +8632,51 @@ def apple_id_supplier_found_disabled_keyboard() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_apple_id_catalog")])
     return InlineKeyboardMarkup(rows)
 
+def _apple_id_admin_catalog_counts() -> tuple[int, dict[str, int]]:
+    catalog = get_apple_id_products()
+    counts = {region: len(catalog.get(region, [])) for region in APPLE_ID_REGION_TITLES}
+    return sum(counts.values()), counts
+
+
 def apple_id_catalog_text() -> str:
-    return (
-        "🍎 <b>Apple ID каталог</b>\n\n"
-        "Здесь можно управлять товарами Apple Gift Card.\n\n"
-        "Регионы:\n🇺🇸 USA\n🇹🇷 Turkey\n🇷🇺 Russia\n\nВыберите регион:"
-    )
+    total, counts = _apple_id_admin_catalog_counts()
+    pricing = get_apple_id_pricing_settings()
+    rate, source = get_final_usd_rub_rate()
+    pending = len(get_apple_id_pending_supplier_positions())
+    last_seen = "—"
+    seen_values = [p.get("supplier_last_seen") or p.get("fazercards_last_seen") for items in get_apple_id_products().values() for p in items if p.get("supplier_last_seen") or p.get("fazercards_last_seen")]
+    if seen_values:
+        last_seen = max(str(v) for v in seen_values)
+    supplier_status = "✅ синхронизирован" if seen_values else "🔄 нужно синхронизировать"
+    return "\n".join([
+        "🍎 <b>Apple ID каталог</b>", "",
+        "<b>Статус</b>",
+        f"Поставщик: {supplier_status}",
+        f"Товары: {total}", "",
+        "<b>Последняя синхронизация</b>",
+        html_escape(str(last_seen)), "",
+        "<b>Курс USD/RUB</b>",
+        f"{float(rate or 0):.2f} ₽",
+        f"Источник: {html_escape(str(source))}", "",
+        "<b>Наценка</b>",
+        f"{float(pricing.get('supplier_markup_percent', 40) or 0):g}%", "",
+        "<b>Каталог</b>",
+        f"🇺🇸 USA: {counts.get('US', 0)} товаров",
+        f"🇹🇷 Turkey: {counts.get('TR', 0)} товаров",
+        f"🇷🇺 Russia: {counts.get('RU', 0)} товаров", "",
+        "<b>Ожидают добавления</b>",
+        f"Новых товаров: {pending}",
+    ])
 
 
 def apple_id_catalog_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US")],
-        [InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR")],
-        [InlineKeyboardButton("🇷🇺 Russia", callback_data="admin_apple_id_region:RU")],
-        [InlineKeyboardButton("🔗 Синхронизировать FazerCards", callback_data="admin_apple_id_fazer_sync")],
+        [InlineKeyboardButton("🇺🇸 USA", callback_data="admin_apple_id_region:US"), InlineKeyboardButton("🇹🇷 Turkey", callback_data="admin_apple_id_region:TR"), InlineKeyboardButton("🇷🇺 Russia", callback_data="admin_apple_id_region:RU")],
+        [InlineKeyboardButton("🔄 Синхронизировать", callback_data="admin_apple_id_fazer_sync")],
+        [InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_apple_id_add_supplier_positions")],
+        [InlineKeyboardButton("✏️ Наценка", callback_data="admin_apple_id_global_markup")],
+        [InlineKeyboardButton("🔄 Пересчитать цены", callback_data="admin_apple_id_recalc_all")],
         [InlineKeyboardButton("🔎 Найдены у поставщика, но выключены", callback_data="admin_apple_id_supplier_found_disabled")],
-        [InlineKeyboardButton("🔄 Пересчитать все цены", callback_data="admin_apple_id_recalc_all")],
-        [InlineKeyboardButton("✏️ Изменить глобальную наценку %", callback_data="admin_apple_id_global_markup")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_payment_sections")],
     ])
 
@@ -8603,9 +8689,9 @@ def apple_id_admin_region_text(region: str) -> str:
     if not products:
         lines.append("— товаров нет")
     for product in products:
-        status = "✅" if product.get("enabled", True) else "⛔️"
-        mapping = "FazerCards ✅" if product.get("fazercards_product_id") else "не привязан"
-        lines.append(f"{status} {html_escape(apple_nominal_text(product))} — {html_escape(format_apple_id_client_price(product))} — {mapping}")
+        rec = calculate_apple_id_supplier_markup_price(product)
+        status = "✅ доступно" if product.get("supplier_available") is True or product.get("supplier_status") == "found" else "⚠️ нет у поставщика"
+        lines.append(f"{flag} {html_escape(apple_nominal_text(product))} — себ. {html_escape(format_usd(rec.get('supplier_price_usd') or product.get('fazercards_price_usd') or product.get('price_usd')))} → {html_escape(format_apple_id_client_price(product))} / маржа {format_rub(rec.get('estimated_margin_rub'))} / {status}")
     return "\n".join(lines)
 
 
@@ -8620,50 +8706,48 @@ def apple_id_admin_region_keyboard(region: str) -> InlineKeyboardMarkup:
 
 def apple_id_admin_product_text(product: dict) -> str:
     region = product.get("region", "")
-    supplier_text = (
-        "Поставщик:\n"
-        f"Статус: {html_escape(apple_id_supplier_status_label(product.get('supplier_status')))}\n"
-        f"Остаток: {html_escape(str(product.get('supplier_stock') if product.get('supplier_stock') is not None else '—'))}\n"
-        f"FazerCards card_id: <code>{html_escape(str(product.get('fazercards_card_id') or '—'))}</code>\n"
-        f"Последняя синхронизация: {html_escape(str(product.get('supplier_last_seen') or product.get('fazercards_last_seen') or '—'))}"
-    )
-    manual_disabled_note = "\n\n✅ Товар найден у поставщика, но выключен вручную." if product.get("enabled") is False and product.get("supplier_available") is True else ""
-    if product.get("fazercards_product_id"):
-        mapping_text = (
-            "FazerCards:\n"
-            "✅ Привязан\n"
-            f"ID: <code>{html_escape(str(product.get('fazercards_product_id') or ''))}</code>\n"
-            f"Название: {html_escape(str(product.get('fazercards_product_name') or '—'))}\n"
-            f"Последняя проверка: {html_escape(str(product.get('fazercards_last_seen') or '—'))}"
-        )
-    else:
-        mapping_text = "FazerCards:\n⚠️ Не привязан"
-    return (
-        f"🍎 <b>{html_escape(product.get('title', 'Apple Gift Card'))}</b>\n\n"
-        f"Регион: {html_escape(APPLE_ID_REGION_TITLES.get(region, region))}\n"
-        f"Номинал: {html_escape(apple_nominal_text(product))}\n"
-        f"Валюта номинала: {html_escape(str(product.get('currency', '')))}\n"
-        f"Цена продажи: {html_escape(format_apple_id_client_price(product))}\n"
-        f"Статус: {'включён' if product.get('enabled', True) else 'выключен'}\n\n"
-        f"{mapping_text}\n\n"
-        f"{supplier_text}"
-        f"{manual_disabled_note}"
-    )
+    rec = calculate_apple_id_supplier_markup_price(product)
+    rate = rec.get("usd_rub_rate_used") or get_final_usd_rub_rate()[0]
+    title = apple_id_display_title_with_nominal(product)
+    supplier_price = rec.get("supplier_price_usd") or product.get("fazercards_price_usd") or product.get("price_usd")
+    supplier_status = "✅ доступно" if product.get("supplier_available") is True or product.get("supplier_status") == "found" else "⚠️ нет у поставщика"
+    return "\n".join([
+        f"🍎 <b>{html_escape(title)}</b>", "",
+        "<b>Статусы</b>",
+        f"Товар: {admin_product_status_badge(product)}",
+        f"Поставщик: {admin_supplier_status_badge(product)}",
+        f"Цена: {admin_price_status_badge(product)}",
+        f"Sync: {admin_sync_age_badge(product)}", "",
+        "<b>Поставщик</b>",
+        f"Статус: {supplier_status}",
+        f"Остаток: {admin_supplier_availability_text(product, 'apple_id')}",  # точное количество поставщик не передаёт
+        f"Регион: {html_escape(APPLE_ID_REGION_TITLES.get(region, region))}",
+        f"Номинал: {html_escape(apple_nominal_text(product))}",
+        f"Обновлено: {html_escape(str(product.get('supplier_last_seen') or product.get('fazercards_last_seen') or '—'))}", "",
+        "<b>Финансы</b>",
+        f"Себестоимость: {html_escape(format_usd(supplier_price))}",
+        f"Курс: {float(rate or 0):.2f} ₽",
+        f"Себестоимость в ₽: {format_rub(rec.get('supplier_cost_rub'))}",
+        f"Наценка: {float(rec.get('supplier_markup_percent') or 0):g}%",
+        f"Цена продажи: {html_escape(format_apple_id_client_price(product))}",
+        f"Маржа: {format_rub(rec.get('estimated_margin_rub'))}", "",
+        "<b>Служебное</b>",
+        f"ID: {html_escape(str(product.get('id') or '—'))}",
+        f"FazerCards ID: {html_escape(str(product.get('fazercards_product_id') or product.get('fazercards_card_id') or '—'))}",
+        *( ["", "✅ Товар найден у поставщика, но выключен вручную."] if product.get("enabled") is False and product.get("supplier_available") is True else [] ),
+    ])
 
 
 def apple_id_admin_product_keyboard(product: dict) -> InlineKeyboardMarkup:
-    toggle = "🔴 Выключить товар" if product.get("enabled", True) else "🟢 Включить товар"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Изменить цену", callback_data=f"admin_apple_id_price:{product['id']}")],
-        [InlineKeyboardButton("💰 Ценообразование", callback_data=f"admin_apple_id_pricing:{product['id']}")],
+        [InlineKeyboardButton("✅/❌ Вкл/Выкл", callback_data=f"admin_apple_id_toggle:{product['id']}")],
+        [InlineKeyboardButton("✏️ Изменить цену", callback_data=f"admin_apple_id_price:{product['id']}"), InlineKeyboardButton("✏️ Изменить наценку", callback_data=f"admin_apple_id_pricing_markup:{product['id']}")],
+        [InlineKeyboardButton("🔄 Пересчитать", callback_data=f"admin_apple_id_pricing_apply_confirm:{product['id']}")],
         [InlineKeyboardButton("🔗 Привязать FazerCards товар", callback_data=f"admin_apple_id_fazer_link:{product['id']}")],
         [InlineKeyboardButton("❌ Отвязать FazerCards товар", callback_data=f"admin_apple_id_fazer_unlink:{product['id']}")],
-        [InlineKeyboardButton(toggle, callback_data=f"admin_apple_id_toggle:{product['id']}")],
-        *([[InlineKeyboardButton("✅ Включить товар", callback_data=f"admin_apple_id_enable:{product['id']}")]] if product.get("enabled") is False and product.get("supplier_available") is True else []),
         [InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_apple_id_delete:{product['id']}")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"admin_apple_id_region:{product['region']}")],
     ])
-
 
 def apple_id_pricing_text(product: dict) -> str:
     rec = calculate_apple_id_supplier_markup_price(product)
@@ -9504,8 +9588,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         report = await sync_telegram_fazercards_bulk(kind)
         await edit_or_send(query, context, telegram_fazercards_sync_report_text(report), InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Добавить найденные товары", callback_data="admin_telegram_pending_products")],
-            [InlineKeyboardButton("⭐ Stars каталог", callback_data="admin_telegram_stars_catalog")],
-            [InlineKeyboardButton("💎 Premium каталог", callback_data="admin_telegram_premium_catalog")],
+            [InlineKeyboardButton("⭐ Stars товары", callback_data="admin_telegram_stars_catalog")],
+            [InlineKeyboardButton("💎 Premium товары", callback_data="admin_telegram_premium_catalog")],
             [InlineKeyboardButton("🧪 Диагностика sync", callback_data="admin_telegram_sync_diagnostics")],
             [InlineKeyboardButton("◀️ Назад", callback_data="admin_telegram_services")],
         ]))
