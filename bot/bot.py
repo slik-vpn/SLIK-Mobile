@@ -2975,7 +2975,8 @@ def recalculate_all_apple_id_prices(apply: bool = False) -> tuple[dict, dict]:
 # ─── Telegram Stars / Premium catalog ─────────────────────────────────────────
 
 TELEGRAM_PREMIUM_SUPPORTED_DURATIONS = {1, 3, 6, 12}
-TELEGRAM_STARS_STANDARD_PACKAGES = (50, 100, 200, 250, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000)
+TELEGRAM_STARS_DEFAULT_PACKAGES = (50, 100, 200, 250, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000)
+TELEGRAM_STARS_STANDARD_PACKAGES = TELEGRAM_STARS_DEFAULT_PACKAGES
 TELEGRAM_PREMIUM_STANDARD_DURATIONS = (1, 3, 6, 12)
 TELEGRAM_QUOTE_USERNAME_PARAM = "username"
 TELEGRAM_STARS_AMOUNT_PARAM = "amount"
@@ -3044,6 +3045,54 @@ def telegram_api_item_price_usd(item: dict) -> float | None:
             continue
     return None
 
+
+
+def telegram_stars_price_per_star_payload(raw: dict) -> tuple[float | None, int | None, int | None]:
+    if not isinstance(raw, dict):
+        return None, None, None
+    source = raw
+    for field in ("data", "result", "payload"):
+        if isinstance(source.get(field), dict) and "price_per_star" in source[field]:
+            source = source[field]
+            break
+    value = source.get("price_per_star")
+    if value in (None, "") or isinstance(value, bool):
+        return None, None, None
+    try:
+        price_per_star = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None, None, None
+    if price_per_star <= 0:
+        return None, None, None
+    def as_int(field: str) -> int | None:
+        raw_value = source.get(field)
+        if raw_value in (None, "") or isinstance(raw_value, bool):
+            return None
+        try:
+            return int(float(str(raw_value).replace(",", ".")))
+        except (TypeError, ValueError):
+            return None
+    return price_per_star, as_int("min_amount"), as_int("max_amount")
+
+
+def telegram_stars_price_per_star_supplier_positions(raw: dict) -> list[dict]:
+    price_per_star, min_amount, max_amount = telegram_stars_price_per_star_payload(raw)
+    if price_per_star is None:
+        return []
+    min_amount = 50 if min_amount is None else min_amount
+    max_amount = 10000 if max_amount is None else max_amount
+    positions = []
+    for amount in TELEGRAM_STARS_DEFAULT_PACKAGES:
+        if not (min_amount <= amount <= max_amount):
+            continue
+        supplier_price_usd = round(amount * price_per_star, 6)
+        product_id = f"telegram_stars_{amount}"
+        result = {"id": f"tgstars_{amount}", "title": f"Telegram Stars {amount} ⭐", "amount": amount, "currency": "XTR", "enabled": True, "pricing_mode": "supplier_markup", "supplier_available": True, "supplier_stock": 1, "supplier_status": "found", "supplier_last_seen": now_str(), "fazercards_telegram_product_id": product_id, "fazercards_card_id": product_id, "fazercards_price_usd": supplier_price_usd, "supplier_price_usd": supplier_price_usd}
+        rec = calculate_telegram_supplier_markup_price(result, "stars")
+        if not rec.get("pricing_error"):
+            result.update({"price_rub": rec["recommended_price_rub"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"]})
+        positions.append(result)
+    return positions
 
 def telegram_api_item_stock(item: dict) -> int | None:
     for field in ("stock", "quantity", "available", "count", "in_stock", "inStock", "is_available", "isAvailable"):
@@ -3351,6 +3400,10 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         f"Stars mode: {html_escape(str(report.get('stars_mode') or 'unknown'))}",
         f"Premium mode: {html_escape(str(report.get('premium_mode') or 'unknown'))}",
         f"Stars items checked: {report.get('stars_items_scanned', 0)}",
+        f"Stars price per star: {html_escape(str(report.get('stars_price_per_star') or '—'))}",
+        f"Stars min amount: {html_escape(str(report.get('stars_min_amount') if report.get('stars_min_amount') is not None else '—'))}",
+        f"Stars max amount: {html_escape(str(report.get('stars_max_amount') if report.get('stars_max_amount') is not None else '—'))}",
+        f"Stars packages generated: {report.get('stars_packages_generated', 0)}",
         f"Premium items checked: {report.get('premium_items_scanned', 0)}",
         f"Stars quotes requested: {report.get('stars_quotes_requested', 0)}",
         f"Premium quotes requested: {report.get('premium_quotes_requested', 0)}",
@@ -3364,11 +3417,11 @@ def telegram_fazercards_sync_report_text(report: dict) -> str:
         f"Errors: {report.get('errors', 0)}",
         f"Fallback giftcards: {'yes' if report.get('fallback_used') else 'no'}",
     ]
-    if report.get("stars_requires_params"):
-        lines.append(f"Stars requires params: {html_escape(str(report.get('stars_requires_params')))}")
+    lines.append(f"Stars requires params: {html_escape(str(report.get('stars_requires_params') or 'no'))}")
     if report.get("premium_requires_params"):
         lines.append(f"Premium requires params: {html_escape(str(report.get('premium_requires_params')))}")
-    lines.append(f"Quote test username: {'задан' if report.get('quote_test_username_set') else 'не задан'}")
+    if report.get("stars_mode") != "price_per_star" or report.get("premium_requires_params"):
+        lines.append(f"Quote test username: {'задан' if report.get('quote_test_username_set') else 'не задан'}")
     for label, key in (("Stars", "stars_raw_diag"), ("Premium", "premium_raw_diag")):
         diag = report.get(key) or {}
         lines.extend([
@@ -3424,7 +3477,7 @@ async def _sync_telegram_giftcards_fallback(kind: str, report: dict) -> tuple[di
 
 
 async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
-    report = {"ok": True, "telegram_stars_endpoint_ok": None, "telegram_premium_endpoint_ok": None, "stars_items_scanned": 0, "premium_items_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "stars_samples": [], "premium_samples": [], "fallback_used": False, "error": "", "stars_mode": "unknown", "premium_mode": "unknown", "stars_quotes_requested": 0, "premium_quotes_requested": 0, "stars_requires_params": "", "premium_requires_params": "", "quote_test_username_set": bool(normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))), "stars_raw_diag": {}, "premium_raw_diag": {}}
+    report = {"ok": True, "telegram_stars_endpoint_ok": None, "telegram_premium_endpoint_ok": None, "stars_items_scanned": 0, "premium_items_scanned": 0, "stars_candidates_found": 0, "premium_candidates_found": 0, "pending_stars_count": 0, "pending_premium_count": 0, "updated": 0, "not_found": 0, "unsupported": 0, "errors": 0, "stars_samples": [], "premium_samples": [], "fallback_used": False, "error": "", "stars_mode": "unknown", "premium_mode": "unknown", "stars_quotes_requested": 0, "premium_quotes_requested": 0, "stars_requires_params": "", "premium_requires_params": "", "quote_test_username_set": bool(normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))), "stars_raw_diag": {}, "premium_raw_diag": {}, "stars_price_per_star": None, "stars_min_amount": None, "stars_max_amount": None, "stars_packages_generated": 0}
     found_stars, found_premium = {}, {}
     stars_ok = premium_ok = True
     if kind in ("all", "stars"):
@@ -3444,25 +3497,39 @@ async def sync_telegram_fazercards_bulk(kind: str = "all") -> dict:
                     found_stars[pos["id"]] = pos
                     report["stars_candidates_found"] += 1
             if not items:
-                username = normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))
-                report["stars_requires_params"] = f"{TELEGRAM_QUOTE_USERNAME_PARAM}, {TELEGRAM_STARS_AMOUNT_PARAM}"
-                if not username:
-                    report["errors"] += 1
-                    report["error"] = report.get("error") or "Для Telegram Stars quote нужен test username. Укажите его в конфиге/админке."
+                price_per_star, min_amount, max_amount = telegram_stars_price_per_star_payload(stars_payload.get("raw"))
+                if price_per_star is not None:
+                    report["stars_mode"] = "price_per_star"
+                    report["stars_requires_params"] = "no"
+                    report["stars_price_per_star"] = price_per_star
+                    report["stars_min_amount"] = min_amount
+                    report["stars_max_amount"] = max_amount
+                    for pos in telegram_stars_price_per_star_supplier_positions(stars_payload.get("raw")):
+                        found_stars[pos["id"]] = pos
+                        report["stars_candidates_found"] += 1
+                        report["stars_packages_generated"] += 1
+                        if len(report["stars_samples"]) < 10:
+                            report["stars_samples"].append({"id": pos["id"], "text": pos["title"], "amount": pos.get("amount"), "price_usd": pos.get("supplier_price_usd"), "stock": 1})
                 else:
-                    for amount in TELEGRAM_STARS_STANDARD_PACKAGES:
-                        quote = await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_STARS_ENDPOINT, "stars", {TELEGRAM_QUOTE_USERNAME_PARAM: username, TELEGRAM_STARS_AMOUNT_PARAM: amount})
-                        report["stars_quotes_requested"] += 1
-                        if quote.get("raw_diag"):
-                            report["stars_raw_diag"] = quote.get("raw_diag")
-                        if not quote.get("ok"):
-                            continue
-                        pos = _telegram_quote_supplier_position(quote.get("raw"), "stars", amount)
-                        if pos:
-                            found_stars[pos["id"]] = pos
-                            report["stars_candidates_found"] += 1
-                            if len(report["stars_samples"]) < 10:
-                                report["stars_samples"].append({"id": pos["id"], "text": pos["title"], "amount": amount, "price_usd": pos.get("supplier_price_usd"), "stock": 1})
+                    username = normalize_telegram_quote_username(telegram_services_pricing_settings().get("quote_test_username", ""))
+                    report["stars_requires_params"] = f"{TELEGRAM_QUOTE_USERNAME_PARAM}, {TELEGRAM_STARS_AMOUNT_PARAM}"
+                    if not username:
+                        report["errors"] += 1
+                        report["error"] = report.get("error") or "Для Telegram Stars quote нужен test username. Укажите его в конфиге/админке."
+                    else:
+                        for amount in TELEGRAM_STARS_STANDARD_PACKAGES:
+                            quote = await fetch_fazercards_telegram_endpoint_readonly(FAZERCARDS_TELEGRAM_STARS_ENDPOINT, "stars", {TELEGRAM_QUOTE_USERNAME_PARAM: username, TELEGRAM_STARS_AMOUNT_PARAM: amount})
+                            report["stars_quotes_requested"] += 1
+                            if quote.get("raw_diag"):
+                                report["stars_raw_diag"] = quote.get("raw_diag")
+                            if not quote.get("ok"):
+                                continue
+                            pos = _telegram_quote_supplier_position(quote.get("raw"), "stars", amount)
+                            if pos:
+                                found_stars[pos["id"]] = pos
+                                report["stars_candidates_found"] += 1
+                                if len(report["stars_samples"]) < 10:
+                                    report["stars_samples"].append({"id": pos["id"], "text": pos["title"], "amount": amount, "price_usd": pos.get("supplier_price_usd"), "stock": 1})
         else:
             report["errors"] += 1; report["error"] = stars_payload.get("error") or report["error"]
     if kind in ("all", "premium"):
