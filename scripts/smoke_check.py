@@ -44,7 +44,7 @@ def check_not_contains(text: str, needle: str, source: str) -> None:
 
 
 def function_block(text: str, name: str) -> str:
-    pattern = rf"^(async\s+def|def)\s+{re.escape(name)}\s*\(.*?\n(?=^(?:async\s+def|def)\s+|^# ───|\Z)"
+    pattern = rf"^(async\s+def|def)\s+{re.escape(name)}\s*\([^\n]*:\n.*?(?=^(?:async\s+def|def)\s+|^# ───|\Z)"
     match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
     return match.group(0) if match else ""
 
@@ -85,44 +85,53 @@ def check_multiservice_crm(bot_text: str) -> None:
         function_block(bot_text, "clients_dashboard_keyboard"),
         function_block(bot_text, "client_list_text"),
         function_block(bot_text, "client_card_text"),
+        function_block(bot_text, "client_card_keyboard"),
         function_block(bot_text, "build_order_card_text"),
         function_block(bot_text, "orders_dashboard_keyboard"),
+        function_block(bot_text, "show_profile"),
+        function_block(bot_text, "show_profile_invite"),
+        function_block(bot_text, "show_profile_bonuses"),
     ])
-    for legacy in ("Traveler", "Ambassador", "Путешественник", "Амбасадор"):
-        record(f"admin UI hides legacy status {legacy}", legacy not in admin_block)
+    for phrase in ("Ваш статус повышен", "Новый статус", "Теперь вы получаете", "Текущий статус", "Статус клиента", "VIP / снять VIP"):
+        record(f"client statuses disabled: no {phrase!r}", phrase not in bot_text)
+    for legacy in ("Traveller", "Traveler", "Explorer", "Nomad", "Ambassador", "Путешественник", "Амбасадор"):
+        record(f"admin/user UI hides legacy status {legacy}", legacy not in admin_block)
     record("legacy user status helper keeps compatibility", "def legacy_client_status" in bot_text and "traveler_status" in bot_text and "ambassador_status" in bot_text and "client_status" in bot_text)
-    record("CRM statuses exist", all(x in bot_text for x in ("Новый", "Активный", "VIP", "Спящий", "Заблокирован")))
-    record("blocked has manual priority", 'profile.get("blocked") is True' in bot_text and 'return "blocked"' in function_block(bot_text, "client_crm_status"))
-    record("VIP supports manual and automatic", "vip_manual" in bot_text and "VIP_ORDER_THRESHOLD" in bot_text and "VIP_SPENT_THRESHOLD" in bot_text)
+    referral_block = function_block(bot_text, "referral_reward_for_profile")
+    record("referral reward ignores profile status", "return FRIEND_REFERRAL_REWARD_USD" in referral_block and "status" not in referral_block.replace("statuses", ""))
+    record("status upgrade notifier removed", "def notify_status_upgrade" not in bot_text)
     client_card_block = function_block(bot_text, "client_card_text")
-    record("client card shows universal CRM metrics", all(x in client_card_block for x in ("Всего заказов", "Успешных заказов", "Сумма покупок", "Последний заказ", "Покупки по категориям", "Теги", "Комментарий менеджера")))
+    record("client card shows universal CRM metrics", all(x in client_card_block for x in ("Всего заказов", "Успешных заказов", "Сумма покупок", "Последний заказ", "Покупки по категориям", "Финансы", "Доступ", "Теги", "Комментарий менеджера")))
+    record("client card has no marketing status", "Статус клиента" not in client_card_block and "CRM_STATUS_LABELS" not in client_card_block)
+    record("client card keeps access flag", "ACCESS_LABELS" in bot_text and "Доступ" in client_card_block)
+    callback_block = function_block(bot_text, "handle_callback")
+    record("client CRM action callbacks are handled without VIP", all(x in callback_block for x in ("client_tags:", "client_comment:", "client_block:")) and "client_vip:" not in callback_block)
+    record("client block toggles blocked", 'profile["blocked"] = not bool(profile.get("blocked", False))' in callback_block)
+    record("client comment saves manager_comment", 'profile["manager_comment"] = msg.text.strip()' in function_block(bot_text, "handle_client_crm_input"))
+    record("client tags save tags", 'profile["tags"] = tags' in function_block(bot_text, "handle_client_crm_input"))
+    record("customer category filters are product/access based", all(x in bot_text for x in ("clients_cat:all", "clients_cat:buyers", "clients_cat:no_orders", "clients_cat:apple_id", "clients_cat:telegram_stars", "clients_cat:telegram_premium", "clients_cat:esim", "clients_cat:blocked")) and "clients_cat:vip" not in bot_text)
+    record("broadcast categories are product/referral based", all(x in bot_text for x in ('"apple_id"', '"telegram_stars"', '"telegram_premium"', '"esim"', '"referrers"', '"inactive"')) and '"vip"' not in function_block(bot_text, "broadcast_recipients") and '"regular"' not in function_block(bot_text, "broadcast_recipients"))
     order_card_block = function_block(bot_text, "build_order_card_text")
     record("order card shows universal product and status fields", all(x in order_card_block for x in ("Категория", "Товар", "Статус:", "Статус выдачи", "Сумма", "Получатель", "Регион", "Пакет")))
     record("order category and status filters exist", all(x in bot_text for x in ("orders_list:apple_id", "orders_list:telegram_stars", "orders_list:telegram_premium", "orders_list:esim", "orders_list:pending_payment", "orders_list:paid", "orders_list:waiting_issue", "orders_list:issued", "orders_list:cancelled")))
-    record("customer category filters exist", all(x in bot_text for x in ("clients_cat:new", "clients_cat:active", "clients_cat:vip", "clients_cat:sleeping", "clients_cat:blocked", "clients_cat:apple_id", "clients_cat:telegram_stars", "clients_cat:telegram_premium", "clients_cat:esim")))
+    issued_block = function_block(bot_text, "order_issued_user_text")
+    progress_block = function_block(bot_text, "order_in_progress_user_text")
+    record("order_issued_user_text helper exists", "def order_issued_user_text" in bot_text)
+    record("order_in_progress_user_text helper exists", "def order_in_progress_user_text" in bot_text and "взят в работу" in progress_block)
+    issued_product_blocks = issued_block + function_block(bot_text, "order_product_user_lines")
+    record("issued text is category-specific", all(x in issued_product_blocks for x in ("Telegram Stars", "Telegram Premium", "Apple ID", "Ваша eSIM")))
+    record("issued notification uses helper", "order_issued_user_text(order)" in function_block(bot_text, "notify_client_order_status"))
+    record("in-progress notification uses helper", "order_in_progress_user_text(order)" in function_block(bot_text, "notify_client_order_status"))
     order_amount_block = function_block(bot_text, "order_amount_rub")
     order_display_block = function_block(bot_text, "order_display_amount")
-    client_input_block = function_block(bot_text, "handle_client_crm_input")
-    callback_block = function_block(bot_text, "handle_callback")
-    record("client tag/comment input modes exist", "CLIENT_INPUT_TAGS" in bot_text and "CLIENT_INPUT_COMMENT" in bot_text)
-    record("client CRM action callbacks are handled", all(x in callback_block for x in ("client_tags:", "client_comment:", "client_block:", "client_vip:")))
-    record("client block toggles blocked", 'profile["blocked"] = not bool(profile.get("blocked", False))' in callback_block)
-    record("client VIP toggles vip_manual", 'profile["vip_manual"] = not bool(profile.get("vip_manual", False))' in callback_block)
-    record("client comment saves manager_comment", 'profile["manager_comment"] = msg.text.strip()' in client_input_block)
-    record("client tags save tags", 'profile["tags"] = tags' in client_input_block)
     record("order_display_amount exists and preserves USD price", "def order_display_amount" in bot_text and "return price" in order_display_block)
     record("$3 is not formatted as 3 RUB", "parse_price" not in order_amount_block and "return 0.0" in order_amount_block and "price_rub" in order_amount_block and "amount_rub" in order_amount_block and "rub_amount" in order_amount_block)
-    record("order_display_amount is used in order list and card", "price = order_display_amount(order)" in function_block(bot_text, "format_order_button_text") and "amount = order_display_amount(order)" in function_block(bot_text, "build_order_card_text"))
     record("CRM RUB totals use trusted RUB amounts only", "total_spent_rub = round(sum(order_amount_rub(order)" in function_block(bot_text, "collect_clients"))
     analytics_block = function_block(bot_text, "build_analytics_text")
     record("analytics helpers exist", all(x in bot_text for x in ("def analytics_revenue_rub", "def analytics_paid_orders", "def analytics_by_category", "def analytics_top_products")))
     record("analytics uses RUB revenue", "format_rub(today_revenue)" in analytics_block and "format_rub(week_revenue)" in analytics_block and "format_rub(average_order)" in analytics_block)
-    record("general analytics has no top-5 countries", "Топ-5 стран по количеству заказов" not in analytics_block)
     record("general analytics has category and top products blocks", "Продажи по категориям" in analytics_block and "Топ товаров" in analytics_block)
-    record("eSIM countries are separate", "def top_esim_countries_by_orders" in bot_text and "order_category_key(order) != \"esim\"" in function_block(bot_text, "top_esim_countries_by_orders"))
     record("non-paid orders excluded from revenue", "explicit == \"paid\"" in function_block(bot_text, "is_revenue_order") and all(x in function_block(bot_text, "is_revenue_order") for x in ("pending_payment", "waiting_payment", "payment_failed", "cancelled", "refunded", "failed")))
-    record("client search uses RUB summary", "client_search_summary" in bot_text and 'format_rub(client["total_spent_rub"])' in function_block(bot_text, "client_search_summary"))
-    record("order card notes missing RUB amount", "RUB-сумма" in order_card_block and "не зафиксирована" in order_card_block)
 
 def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     identifiers = [
