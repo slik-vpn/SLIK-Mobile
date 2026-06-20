@@ -308,7 +308,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         'TECH_ALERTS_CHAT_ID',
         'RATE_CHAT_ID',
         '"rate": ""',
-        '💱 Курс',
+        '🔄 Синхронизация',
         'CommandHandler("chatid",          cmd_chatid)',
         'get_client_activity_chat_id()',
         'get_new_clients_chat_id()',
@@ -322,7 +322,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
 
 
     record("notification_chats contains rate key", '"rate": ""' in bot_text)
-    record("rate notification UI contains курс item", "💱 Курс" in bot_text and "курс" in bot_text.lower())
+    record("notification chat UI shows sync item", "🔄 Синхронизация" in bot_text and "💱 Курс" not in function_block(bot_text, "notification_chats_keyboard"))
     record("rate chat save uses common notification input", "set_notification_chat_id(kind, chat_id)" in function_block(bot_text, "handle_client_crm_input") and "rate" in bot_text)
 
     record(
@@ -989,17 +989,21 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("no market diagnostics buttons", "Диагностика" not in pricing_ui and "admin_apple_id_pricing_debug" not in pricing_ui)
     record("no source refresh buttons", "Обновить Ozon" not in pricing_ui and "admin_apple_id_pricing_refresh" not in pricing_ui)
 
-    record("USD/RUB auto refresh sends rate notification after success", "format_usd_rub_update_notification" in auto_loop_block and "await notify_rate_chat" in auto_loop_block)
+    record("USD/RUB auto refresh sends sync notification after success", "format_usd_rub_update_notification" in auto_loop_block and "await notify_rate_chat" in auto_loop_block and "notify_sync_chat" in bot_text)
     record("rate notification contains previous auto rate", "Авто-курс был" in function_block(bot_text, "format_usd_rub_update_notification"))
     record("rate notification contains new auto rate", "Авто-курс стал" in function_block(bot_text, "format_usd_rub_update_notification"))
     record("rate notification contains rub delta", "+.2f} ₽" in function_block(bot_text, "format_rate_delta"))
     record("rate notification contains percent delta", "+.2f}%" in function_block(bot_text, "format_rate_delta"))
     record("rate notification contains final calculation rate", "Финальный курс для расчётов" in function_block(bot_text, "format_usd_rub_update_notification"))
     record("rate notification accounts for manual priority", "manual_rate is not None" in auto_loop_block and "Ручной курс активен" in function_block(bot_text, "format_usd_rub_update_notification"))
-    record("rate notification send failure does not crash bot", 'logger.warning("USD/RUB rate notification failed' in function_block(bot_text, "notify_rate_chat"))
+    record("sync notification send failure does not crash bot", 'logger.warning("Sync notification failed' in function_block(bot_text, "notify_sync_chat"))
 
     record("USD/RUB auto refresh interval exists and defaults to 3600", 'USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS = env_int("USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS", 3600)' in bot_text)
     record("background USD/RUB refresh task exists", "def schedule_usd_rub_auto_refresh" in bot_text and "usd_rub_auto_refresh_loop" in bot_text and "schedule_usd_rub_auto_refresh(app)" in bot_text)
+    record("supplier price refresh helpers exist", all(x in bot_text for x in ("async def refresh_supplier_prices_readonly", "async def refresh_supplier_prices_if_stale", "SUPPLIER_PRICE_REFRESH_TTL_SECONDS = 600", "SUPPLIER_SYNC_ERROR_NOTICE_COOLDOWN_SECONDS = 10800")))
+    record("hourly job refreshes supplier prices and notifies sync chat", "refresh_supplier_prices_readonly(reason=\"hourly\")" in auto_loop_block and "notify_supplier_sync_report" in auto_loop_block)
+    record("supplier refresh state persists last run and ok", "last_run_at" in function_block(bot_text, "refresh_supplier_prices_readonly") and "last_ok_at" in function_block(bot_text, "refresh_supplier_prices_readonly"))
+    record("client catalogs refresh supplier prices if stale", "refresh_supplier_prices_if_stale(reason=\"client_catalog_apple_id\")" in bot_text and "refresh_supplier_prices_if_stale(reason=\"client_catalog_telegram\")" in bot_text and "showing saved prices" in bot_text)
     record("manual USD/RUB rate remains priority over auto rate", "manual_rate = get_manual_usd_rub_rate()" in get_rate_block and 'return round(manual_rate, 4), "manual"' in get_rate_block)
     record("auto refresh does not overwrite manual rate", "manual_rate=round" not in refresh_block and "market_usd_rub_rate" in refresh_block and "final_usd_rub_rate" in refresh_block)
     record("price_rub changes only after apply confirm", "set_apple_id_product" not in apply_block and '"price_rub": rec["recommended_price_rub"]' in confirm_block)
@@ -1011,6 +1015,8 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("Apple ID payment amount uses price_rub and not parse_price", 'plan.get("price_rub")' in payment_amount_block and "parse_price" not in payment_amount_block)
     record("Apple ID payment amount cannot be 0 if price_rub > 0", "if amount > 0:" in payment_amount_block and "return amount" in payment_amount_block)
     record("no client.post in FazerCards connection", "client.post" not in function_block(bot_text, "check_fazercards_connection"))
+    record("FazerCards check uses Apple ID exact sync matching", "apple_id_exact_fazercards_match" in function_block(bot_text, "check_fazercards_connection") and "fetch_fazercards_giftcards_cards_readonly" in function_block(bot_text, "check_fazercards_connection"))
+    record("admin supplier price refresh button exists", "🔄 Обновить цены поставщика" in bot_text and "admin_fazercards_refresh_prices" in bot_text)
     record("no /giftcards/order", "/giftcards/order" not in bot_text)
     record("eSIM logic present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text and "await get_usd_rub_rate()" in bot_text)
     record("cashback disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
@@ -1339,6 +1345,7 @@ def main() -> int:
         check_contains(env_example_text, needle, ".env.example notification routing")
     check_contains(config_example_text, '"notification_chats"', "bot/config.example.json")
     check_contains(config_example_text, '"rate"', "bot/config.example.json")
+    check_contains(config_example_text, '"supplier_price_refresh"', "bot/config.example.json")
     check_contains(config_example_text, '"new_clients"', "bot/config.example.json")
     check_contains(config_example_text, '"supplier_markup_percent": 40', "bot/config.example.json")
     check_contains(readme_text, "Разделение уведомлений по чатам", "README.md")

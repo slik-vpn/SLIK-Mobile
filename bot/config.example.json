@@ -30,5 +30,14 @@
   "telegram_premium_products": [],
   "telegram_stars_pending_supplier_positions": [],
   "telegram_premium_pending_supplier_positions": [],
-  "telegram_services_last_sync_report": {}
+  "telegram_services_last_sync_report": {},
+  "supplier_price_refresh": {
+    "last_run_at": "",
+    "last_ok_at": "",
+    "last_reason": "",
+    "last_error": "",
+    "last_report": {},
+    "last_notice_at": "",
+    "last_error_notice_at": ""
+  }
 }
