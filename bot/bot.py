@@ -76,6 +76,10 @@ APPLE_ID_PRICE_MAX_RUB = 100000
 DEFAULT_APPLE_ID_PRICING = {"supplier_markup_percent": 40, "rounding_mode": "up_to_9", "pricing_mode": "supplier_markup"}
 DEFAULT_TELEGRAM_SERVICES_PRICING = {"stars_markup_percent": 40, "premium_markup_percent": 40, "rounding": 1, "quote_test_username": ""}
 APPLE_ID_ORDER_PAGE_SIZE = 5
+SYNC_NOTIFICATION_CHAT_KEY = "rate"
+SUPPLIER_PRICE_REFRESH_TTL_SECONDS = 600
+SUPPLIER_SYNC_ERROR_NOTICE_COOLDOWN_SECONDS = 10800
+
 
 def env_float(name: str, default: float, min_value: float | None = None, max_value: float | None = None) -> float:
     try:
@@ -526,6 +530,12 @@ def load_config() -> dict:
     fazercards.setdefault("last_balance", "")
     fazercards.setdefault("last_products_count", None)
     fazercards.setdefault("apple_products_found", [])
+    supplier_refresh = data.get("supplier_price_refresh")
+    if not isinstance(supplier_refresh, dict):
+        supplier_refresh = {}
+        data["supplier_price_refresh"] = supplier_refresh
+    for key, value in {"last_run_at": "", "last_ok_at": "", "last_reason": "", "last_error": "", "last_report": {}, "last_notice_at": "", "last_error_notice_at": ""}.items():
+        supplier_refresh.setdefault(key, value)
     # Safety invariant: diagnostics must never enable FazerCards auto issue.
     fazercards["auto_issue_enabled"] = False
     return data
@@ -541,7 +551,7 @@ NOTIFICATION_CHAT_META = {
     "new_clients": ("Новые клиенты", "NEW_CLIENTS_CHAT_ID", "чат новых клиентов"),
     "payments": ("Оплаты", "PAYMENTS_CHAT_ID", "чат оплат"),
     "tech_alerts": ("Техника", "TECH_ALERTS_CHAT_ID", "технический чат"),
-    "rate": ("💱 Курс", "RATE_CHAT_ID", "чат курса"),
+    SYNC_NOTIFICATION_CHAT_KEY: ("🔄 Синхронизация", "RATE_CHAT_ID", "чат синхронизации"),
 }
 
 
@@ -606,13 +616,17 @@ def get_tech_alerts_chat_id() -> int | None:
     return get_notification_chat_id("tech_alerts")
 
 
-def get_rate_chat_id() -> int | None:
+def sync_notification_chat_id() -> int | None:
     cfg = load_config()
     chats = cfg.get("notification_chats") if isinstance(cfg.get("notification_chats"), dict) else {}
-    config_id = _parse_chat_id(chats.get("rate"))
+    config_id = _parse_chat_id(chats.get(SYNC_NOTIFICATION_CHAT_KEY))
     if config_id is not None:
         return config_id
     return _parse_chat_id(os.environ.get("RATE_CHAT_ID", ""))
+
+
+def get_rate_chat_id() -> int | None:
+    return sync_notification_chat_id()
 
 
 def set_notification_chat_id(kind: str, chat_id: str) -> None:
@@ -1052,14 +1066,22 @@ def format_usd_rub_update_notification(previous: dict, current: dict, final_rate
     return "\n".join(lines)
 
 
-async def notify_rate_chat(bot, text: str) -> None:
-    chat_id = get_rate_chat_id()
+async def notify_sync_chat(bot, text: str) -> None:
+    chat_id = sync_notification_chat_id()
     if chat_id is None:
+        logger.info("Sync notification skipped: chat is not configured")
         return
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
     except Exception as exc:
-        logger.warning("USD/RUB rate notification failed for chat %s: %s", chat_id, exc)
+        logger.warning("Sync notification failed for chat %s: %s", chat_id, exc)
+
+
+async def notify_rate_chat(bot, text: str) -> None:
+    try:
+        await notify_sync_chat(bot, text)
+    except Exception as exc:
+        logger.warning("USD/RUB rate notification failed: %s", exc)
 
 async def refresh_usd_rub_rate_check() -> tuple[float, str]:
     rate, source, diagnostics = await check_market_usd_rub_rate_with_diagnostics()
@@ -2797,7 +2819,14 @@ async def sync_apple_id_fazercards_bulk() -> dict:
             product.update(updates)
             if price_usd > 0:
                 rec = calculate_apple_id_supplier_markup_price(product)
-                product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
+                if product.get("pricing_mode") == "manual":
+                    product.update({"recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"]})
+                    try:
+                        product["estimated_margin_rub"] = round(float(product.get("price_rub") or 0) - float(rec["supplier_cost_rub"]), 2)
+                    except Exception:
+                        product["estimated_margin_rub"] = None
+                else:
+                    product.update({"price_rub": rec["recommended_price_rub"], "recommended_price_rub": rec["recommended_price_rub"], "usd_rub_rate_used": rec["usd_rub_rate_used"], "usd_rub_rate_source": rec["usd_rub_rate_source"], "supplier_cost_rub": rec["supplier_cost_rub"], "supplier_markup_percent": rec["supplier_markup_percent"], "estimated_margin_rub": rec["estimated_margin_rub"], "pricing_mode": "supplier_markup"})
             seen_products.add(product.get("id"))
             report["linked"] += 1
             if str(old_price) != str(price_usd):
@@ -3808,6 +3837,98 @@ def add_telegram_pending_supplier_positions(kind: str) -> dict:
         cfg["telegram_premium_pending_supplier_positions"] = []; save_config(cfg); save_telegram_premium_products(catalog)
     return report
 
+def supplier_price_refresh_state() -> dict:
+    state = load_config().get("supplier_price_refresh")
+    return state if isinstance(state, dict) else {}
+
+
+def save_supplier_price_refresh_state(**updates) -> None:
+    cfg = load_config()
+    state = cfg.setdefault("supplier_price_refresh", {})
+    state.update(updates)
+    save_config(cfg)
+
+
+def _parse_dt(value: str | None):
+    try:
+        return datetime.datetime.strptime(str(value or ""), "%d.%m.%Y %H:%M")
+    except Exception:
+        return None
+
+
+def apple_id_fazercards_match_diagnostics() -> dict:
+    catalog = get_apple_id_products()
+    return {region: sum(1 for p in catalog.get(region, []) if p.get("fazercards_card_id") or p.get("supplier_last_seen")) for region in ("US", "TR", "RU")}
+
+
+async def refresh_supplier_prices_readonly(reason: str = "manual") -> dict:
+    updated_at = now_str()
+    report = {"ok": True, "reason": reason, "apple_updated": 0, "telegram_stars_updated": 0, "telegram_premium_updated": 0, "pending_new": 0, "errors": 0, "skipped": 0, "updated_at": updated_at}
+    save_supplier_price_refresh_state(last_run_at=updated_at, last_reason=reason)
+    try:
+        apple = await sync_apple_id_fazercards_bulk()
+        telegram = await sync_telegram_fazercards_bulk("all")
+        report.update({
+            "apple_updated": int(apple.get("linked") or 0),
+            "telegram_stars_updated": int(telegram.get("updated_stars_count") or 0),
+            "telegram_premium_updated": int(telegram.get("updated_premium_count") or 0),
+            "pending_new": int(apple.get("new_supplier_positions") or 0) + int(telegram.get("pending") or 0),
+            "errors": int(apple.get("errors") or 0) + int(telegram.get("errors") or 0),
+        })
+        if apple.get("sync_failed") or (telegram.get("ok") is False and report["errors"]):
+            report["ok"] = False
+            report["error"] = apple.get("error") or telegram.get("error") or "supplier_sync_error"
+            report["catalog_preserved"] = True
+        save_supplier_price_refresh_state(last_ok_at=updated_at if report["ok"] else supplier_price_refresh_state().get("last_ok_at", ""), last_error="" if report["ok"] else report.get("error", ""), last_report=report)
+        return report
+    except Exception as exc:
+        safe_error = fazercards_api_error(exc)
+        logger.warning("Supplier price refresh failed; catalog preserved: %s", safe_error)
+        report.update({"ok": False, "errors": max(1, report.get("errors", 0)), "error": safe_error, "catalog_preserved": True})
+        save_supplier_price_refresh_state(last_error=safe_error, last_report=report)
+        return report
+
+
+async def refresh_supplier_prices_if_stale(reason: str = "client_catalog") -> dict:
+    state = supplier_price_refresh_state()
+    last = _parse_dt(state.get("last_run_at"))
+    if last and (datetime.datetime.now() - last).total_seconds() < SUPPLIER_PRICE_REFRESH_TTL_SECONDS:
+        return {"ok": True, "skipped": 1, "reason": reason, "updated_at": state.get("last_run_at", ""), "last_report": state.get("last_report", {})}
+    return await refresh_supplier_prices_readonly(reason=reason)
+
+
+def format_supplier_sync_notification(report: dict) -> str:
+    ok = bool(report.get("ok"))
+    lines = ["🔄 <b>Синхронизация поставщика завершена</b>" if ok else "⚠️ <b>Синхронизация поставщика с ошибками</b>", "", f"🍎 Apple ID обновлено: {report.get('apple_updated', 0)}", f"⭐ Stars обновлено: {report.get('telegram_stars_updated', 0)}", f"💎 Premium обновлено: {report.get('telegram_premium_updated', 0)}", "", f"Новых найдено: {report.get('pending_new', 0)}", f"Ошибки: {report.get('errors', 0)}"]
+    if not ok:
+        lines.extend([f"Причина: {html_escape(str(report.get('error') or 'unknown'))}", "", "Каталог не очищался.", "Товары не выключались."])
+    lines.extend(["", f"Время: {html_escape(str(report.get('updated_at') or now_str()))}"])
+    return "\n".join(lines)
+
+
+def should_send_supplier_sync_notice(report: dict) -> bool:
+    state = supplier_price_refresh_state()
+    if report.get("ok"):
+        return True
+    last_error = str(state.get("last_error") or "")
+    current_error = str(report.get("error") or "")
+    last_notice = _parse_dt(state.get("last_error_notice_at"))
+    if current_error == last_error and last_notice and (datetime.datetime.now() - last_notice).total_seconds() < SUPPLIER_SYNC_ERROR_NOTICE_COOLDOWN_SECONDS:
+        return False
+    return True
+
+
+async def notify_supplier_sync_report(bot, report: dict) -> None:
+    if not should_send_supplier_sync_notice(report):
+        return
+    await notify_sync_chat(bot, format_supplier_sync_notification(report))
+    now = now_str()
+    if report.get("ok"):
+        save_supplier_price_refresh_state(last_notice_at=now)
+    else:
+        save_supplier_price_refresh_state(last_error_notice_at=now)
+
+
 def summarize_fazercards_products(products_payload: dict) -> tuple[int, list[str]]:
     items = products_payload.get("items") if isinstance(products_payload, dict) else []
     if not isinstance(items, list):
@@ -3833,18 +3954,27 @@ async def check_fazercards_connection() -> dict:
     try:
         async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
             balance_payload, products_payload = await asyncio.gather(fetch_fazercards_balance(client, api_key), fetch_fazercards_products(client, api_key))
-        products_count, apple_products = summarize_fazercards_products(products_payload)
+        stars_payload, premium_payload = await asyncio.gather(fetch_fazercards_telegram_stars_readonly(), fetch_fazercards_telegram_premium_readonly())
+        categories = [item for item in fazercards_items_from_payload(products_payload) if is_apple_fazercards_category(item)]
+        region_counts = {"US": 0, "TR": 0, "RU": 0}
+        catalog = get_apple_id_products()
+        flat_products = [p for items in catalog.values() for p in items]
+        for category in categories:
+            payload = await fetch_fazercards_giftcards_cards_readonly(fazercards_category_id_value(category))  # GET /giftcards/cards
+            for card in fazercards_cards_from_payload(payload):
+                matched_regions = {str(product.get("region")) for product in flat_products if apple_id_exact_fazercards_match(product, category, card)}
+                if not matched_regions:
+                    names = " ".join(str(x or "") for x in (category.get("name"), category.get("title"), card.get("name"), card.get("title")))
+                    matched_regions = {region for region in region_counts if fazercards_name_has_region(names, region)}
+                for region in matched_regions:
+                    if region in region_counts:
+                        region_counts[region] += 1
+        products_count = len(fazercards_items_from_payload(products_payload))
         balance = str(balance_payload.get("balance") or "")
         currency = str(balance_payload.get("currency") or "USD")
-        save_fazercards_settings({
-            "last_check_at": checked_at,
-            "last_check_status": "success",
-            "last_check_error": "",
-            "last_balance": f"{balance} {currency}".strip(),
-            "last_products_count": products_count,
-            "apple_products_found": apple_products,
-        })
-        return {"ok": True, "checked_at": checked_at, "balance": balance, "currency": currency, "products_count": products_count, "apple_products": apple_products, "masked_api_key": mask_secret(api_key)}
+        apple_found = sum(region_counts.values()) > 0
+        save_fazercards_settings({"last_check_at": checked_at, "last_check_status": "success" if apple_found else "warning", "last_check_error": "" if apple_found else "apple_id_not_found", "last_balance": f"{balance} {currency}".strip(), "last_products_count": products_count, "apple_products_found": categories[:10]})
+        return {"ok": True, "apple_found": apple_found, "checked_at": checked_at, "balance": balance, "currency": currency, "products_count": products_count, "apple_region_counts": region_counts, "giftcards_ok": bool(products_payload.get("ok", True)), "telegram_stars_ok": bool(stars_payload.get("ok")), "telegram_premium_ok": bool(premium_payload.get("ok")), "masked_api_key": mask_secret(api_key), "supplier_refresh": supplier_price_refresh_state()}
     except Exception as exc:
         safe_error = fazercards_api_error(exc)
         logger.warning("FazerCards API check failed: %s", safe_error)
@@ -6399,6 +6529,10 @@ async def show_apple_id_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def show_apple_id_region(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+    try:
+        await refresh_supplier_prices_if_stale(reason="client_catalog_apple_id")
+    except Exception as exc:
+        logger.warning("Apple ID catalog supplier refresh failed; showing saved prices: %s", exc)
     region = query.data.split(":", 1)[1]
     if region not in APPLE_ID_REGION_TITLES:
         await query.answer("Регион не найден.", show_alert=True)
@@ -9336,33 +9470,22 @@ def fazercards_api_text() -> str:
 
 def fazercards_connection_result_text(result: dict) -> str:
     if result.get("ok"):
-        apple_products = result.get("apple_products") or []
-        apple_block = ""
-        if apple_products:
-            apple_block = "\nApple / Gift Card товары:\n" + "\n".join(f"• {html_escape(str(name))} — доступно" for name in apple_products[:5]) + "\n"
-        else:
-            apple_block = "\n⚠️ Подключение успешно, но Apple Gift Card USA/Turkey не найдены в списке продуктов.\n"
-        return (
-            "🔑 <b>FazerCards API</b>\n\n"
-            "✅ Подключение успешно\n\n"
-            f"Баланс: {html_escape(str(result.get('balance') or '—'))} {html_escape(str(result.get('currency') or 'USD'))}\n"
-            f"Товаров найдено: {html_escape(str(result.get('products_count') or 0))}\n"
-            f"{apple_block}\n"
-            f"Проверено: {html_escape(str(result.get('checked_at') or ''))}"
-        )
-    return (
-        "🔑 <b>FazerCards API</b>\n\n"
-        "❌ Не удалось проверить подключение.\n\n"
-        "Причина:\n"
-        f"{html_escape(str(result.get('error') or 'unknown error'))}\n\n"
-        f"API key: <code>{html_escape(str(result.get('masked_api_key') or 'не подключён'))}</code>\n\n"
-        f"Проверено: {html_escape(str(result.get('checked_at') or ''))}"
-    )
+        state = result.get("supplier_refresh") or {}
+        last_report = state.get("last_report") if isinstance(state.get("last_report"), dict) else {}
+        status = "OK" if last_report.get("ok") else ("ERROR" if last_report else "—")
+        counts = result.get("apple_region_counts") or {}
+        header = "✅ <b>FazerCards подключение работает</b>" if result.get("apple_found") else "⚠️ <b>API работает, но Apple ID товары не найдены</b>"
+        lines = [header, "", "Аккаунт: OK", f"Баланс: {'OK' if result.get('balance') != '' else 'OK'}", f"Gift cards categories: {'OK' if result.get('giftcards_ok') else 'ERROR'}", f"Apple ID товары: {'найдены' if result.get('apple_found') else '0'}", f"Telegram Stars: {'OK' if result.get('telegram_stars_ok') else 'ERROR'}", f"Telegram Premium: {'OK' if result.get('telegram_premium_ok') else 'ERROR'}", "", "🍎 Apple ID:", f"🇺🇸 USA: найдено {counts.get('US', 0)}", f"🇹🇷 Turkey: найдено {counts.get('TR', 0)}", f"🇷🇺 Russia: найдено {counts.get('RU', 0)}", "", "⭐ Telegram:", f"Stars endpoint: {'OK' if result.get('telegram_stars_ok') else 'ERROR'}", f"Premium endpoint: {'OK' if result.get('telegram_premium_ok') else 'ERROR'}", "", "Последнее обновление цен:", f"Статус: {status}", f"Время: {html_escape(str(state.get('last_run_at') or '—'))}", f"Причина: {html_escape(str(state.get('last_reason') or '—'))}", "", f"Проверено: {html_escape(str(result.get('checked_at') or ''))}"]
+        if not result.get("apple_found"):
+            lines.extend(["", "Проверьте категории /giftcards и /giftcards/cards.", "Каталог не изменён."])
+        return "\n".join(lines)
+    return ("🔑 <b>FazerCards API</b>\n\n❌ Не удалось проверить подключение.\n\nПричина:\n" + f"{html_escape(str(result.get('error') or 'unknown error'))}\n\n" + f"API key: <code>{html_escape(str(result.get('masked_api_key') or 'не подключён'))}</code>\n\n" + f"Проверено: {html_escape(str(result.get('checked_at') or ''))}")
 
 
 def fazercards_api_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Проверить подключение", callback_data="admin_fazercards_check")],
+        [InlineKeyboardButton("🔄 Обновить цены поставщика", callback_data="admin_fazercards_refresh_prices")],
         [InlineKeyboardButton("✏️ Указать API key", callback_data="admin_fazercards_set")],
         [InlineKeyboardButton("🧹 Удалить API key", callback_data="admin_fazercards_clear")],
         [InlineKeyboardButton("◀️ Назад", callback_data="admin_service_sections")],
@@ -10412,6 +10535,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Проверяю подключение...")
         result = await check_fazercards_connection()
         await edit_or_send(query, context, fazercards_connection_result_text(result), fazercards_api_keyboard())
+    elif data == "admin_fazercards_refresh_prices":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer("Обновляю цены поставщика...")
+        report = await refresh_supplier_prices_readonly(reason="admin_manual")
+        text = "🔄 <b>Обновление цен поставщика</b>\n\n" + f"Apple ID обновлено: {report.get('apple_updated', 0)}\n" + f"Telegram Stars обновлено: {report.get('telegram_stars_updated', 0)}\n" + f"Telegram Premium обновлено: {report.get('telegram_premium_updated', 0)}\n\n" + f"Новых найдено: {report.get('pending_new', 0)}\n" + f"Ошибки: {report.get('errors', 0)}\n" + f"Обновлено: {html_escape(str(report.get('updated_at') or now_str()))}"
+        await edit_or_send(query, context, text, fazercards_api_keyboard())
     elif data == "admin_fazercards_clear":
         if not has_owner_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
@@ -10645,11 +10776,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await edit_or_send(query, context, "⭐ <b>Telegram Stars</b>\n\nВыберите, что хотите купить:", telegram_services_start_keyboard())
     elif data == "telegram_stars_catalog":
         await query.answer()
+        try:
+            await refresh_supplier_prices_if_stale(reason="client_catalog_telegram")
+        except Exception as exc:
+            logger.warning("Telegram Stars catalog supplier refresh failed; showing saved prices: %s", exc)
         products = [p for p in telegram_stars_products() if is_visible_telegram_stars_product(p, enabled_only=True)]
         text = "⭐ <b>Telegram Stars</b>\n\nВыберите количество звёзд:" if products else "⭐ <b>Telegram Stars</b>\n\nТовар временно недоступен."
         await edit_or_send(query, context, text, telegram_stars_catalog_keyboard())
     elif data == "telegram_premium_catalog":
         await query.answer()
+        try:
+            await refresh_supplier_prices_if_stale(reason="client_catalog_telegram")
+        except Exception as exc:
+            logger.warning("Telegram Premium catalog supplier refresh failed; showing saved prices: %s", exc)
         products = [p for p in telegram_premium_products() if is_visible_telegram_premium_product(p, enabled_only=True)]
         text = "💎 <b>Telegram Premium</b>\n\nВыберите срок подписки:" if products else "💎 <b>Telegram Premium</b>\n\nТовар временно недоступен."
         await edit_or_send(query, context, text, telegram_premium_catalog_keyboard())
@@ -10724,7 +10863,9 @@ async def usd_rub_auto_refresh_loop(app: Application) -> None:
                 str(current.get("rate_checked_at") or now_str()),
             )
             await notify_rate_chat(app.bot, text)
-            logger.info("USD/RUB auto refresh completed")
+            supplier_report = await refresh_supplier_prices_readonly(reason="hourly")
+            await notify_supplier_sync_report(app.bot, supplier_report)
+            logger.info("USD/RUB and supplier price auto refresh completed")
         except Exception as exc:
             logger.warning("USD/RUB auto refresh failed; keeping last successful rate: %s", exc)
         await asyncio.sleep(USD_RUB_AUTO_REFRESH_INTERVAL_SECONDS)
