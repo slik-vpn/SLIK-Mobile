@@ -10,6 +10,7 @@ import asyncio
 import zipfile
 import math
 import re
+from decimal import Decimal, ROUND_CEILING, InvalidOperation
 from urllib.parse import quote, urljoin, urlparse
 from html import escape, unescape as html_unescape
 from pathlib import Path
@@ -826,9 +827,13 @@ def format_crypto_amount(amount, decimals: int = 2) -> str:
     return f"{value:.{decimals}f}"
 
 
-def round_crypto_amount_up(value: float, decimals: int = 2) -> float:
-    factor = 10 ** decimals
-    return math.ceil(float(value) * factor) / factor
+def round_crypto_amount_up(value, decimals: int = 2) -> float:
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        decimal_value = Decimal("0")
+    quant = Decimal("1").scaleb(-decimals)
+    return float(decimal_value.quantize(quant, rounding=ROUND_CEILING))
 
 
 async def cryptobot_invoice_amount_from_rub(price_rub: float, asset: str = "USDT") -> dict:
@@ -879,10 +884,17 @@ def cryptobot_order_product_title(order: dict, plan: dict | None = None) -> str:
     return str(data.get("product_title") or data.get("gb") or data.get("title") or "—")
 
 
-async def notify_cryptobot_invoice_created(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
+async def notify_payments_chat(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     chat_id = get_payments_chat_id()
     if not chat_id:
         return
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("Payments chat notification failed: %s", exc)
+
+
+async def notify_cryptobot_invoice_created(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
     username = user_tag(user)
     text = (
         "🧾 <b>Создан CryptoBot invoice</b>\n\n"
@@ -894,13 +906,10 @@ async def notify_cryptobot_invoice_created(context: ContextTypes.DEFAULT_TYPE, o
         f"Курс: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
         "Статус: ожидает оплату"
     )
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    await notify_payments_chat(context, text)
 
 
 async def notify_cryptobot_invoice_paid(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
-    chat_id = get_payments_chat_id()
-    if not chat_id:
-        return
     text = (
         "✅ <b>CryptoBot оплата получена</b>\n\n"
         f"Заказ: {html_escape((order or {}).get('number', '—'))}\n"
@@ -911,7 +920,7 @@ async def notify_cryptobot_invoice_paid(context: ContextTypes.DEFAULT_TYPE, orde
         f"Курс расчёта: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
         "Дальше: автовыдача / ручная выдача"
     )
-    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    await notify_payments_chat(context, text)
 
 
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
