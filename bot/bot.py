@@ -191,27 +191,7 @@ APPLE_ID_REGION_TITLES = {"US": "USA", "TR": "Turkey", "RU": "Russia"}
 APPLE_ID_REGION_FLAGS = {"US": "🇺🇸", "TR": "🇹🇷", "RU": "🇷🇺"}
 
 FRIEND_REFERRAL_REWARD_USD = 1.0
-STATUS_LEVELS = [
-    (1000.0, "VIP", "👑", 10.0, 7),
-    (300.0, "Premium", "💎", 5.0, 5),
-    (150.0, "Regular", "🌎", 3.0, 3),
-    (50.0, "Buyer", "✈️", 2.0, 2),
-    (0.0, "New", "🧳", 1.0, 1),
-]
-STATUS_META = {
-    status: {
-        "threshold": threshold,
-        "icon": icon,
-        "referral_reward": reward,
-        "cashback_percent": cashback_percent,
-    }
-    for threshold, status, icon, reward, cashback_percent in STATUS_LEVELS
-}
-STATUS_ORDER = {
-    status: index
-    for index, (_, status, _, _, _) in enumerate(reversed(STATUS_LEVELS))
-}
-STATUS_LEVELS_ASC = list(reversed(STATUS_LEVELS))
+# Client marketing statuses are disabled. Legacy user JSON fields remain for compatibility only.
 ORDER_STATUS_LABELS = {
     "new": "Новый",
     "waiting_payment": "Ожидает оплаты",
@@ -1175,43 +1155,42 @@ def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> di
 
 
 def calculate_user_status(total_spent: float) -> str:
-    for threshold, status, _icon, _reward, _cashback_percent in STATUS_LEVELS:
-        if total_spent >= threshold:
-            return status
-    return "New"
+    """Compatibility stub: client marketing statuses are disabled."""
+    return ""
 
 
 def status_icon(status: str) -> str:
-    return STATUS_META.get(status, STATUS_META["New"])["icon"]
+    """Compatibility stub: client marketing statuses are disabled."""
+    return ""
 
 
 def format_status(status: str) -> str:
-    actual_status = status if status in STATUS_META else "New"
-    return f"{status_icon(actual_status)} {actual_status}"
+    """Compatibility stub: client marketing statuses are disabled."""
+    return ""
 
 
 def referral_reward_for_status(status: str) -> float:
-    return STATUS_META.get(status, STATUS_META["New"])["referral_reward"]
+    """Compatibility stub: referral rewards are fixed and status-independent."""
+    return FRIEND_REFERRAL_REWARD_USD
 
 
 def referral_reward_for_profile(profile: dict) -> float:
-    status = calculate_user_status(float(profile.get("total_spent") or 0))
-    return referral_reward_for_status(status)
+    """Return the fixed referral reward, ignoring legacy profile statuses."""
+    return FRIEND_REFERRAL_REWARD_USD
 
 
 def cashback_percent_for_status(status: str) -> int:
-    return int(STATUS_META.get(status, STATUS_META["New"])["cashback_percent"])
+    """Compatibility stub: status-based cashback is disabled."""
+    return 0
 
 
 def cashback_percent_for_profile(profile: dict) -> int:
-    status = calculate_user_status(float(profile.get("total_spent") or 0))
-    return cashback_percent_for_status(status)
+    """Compatibility stub: status-based cashback is disabled."""
+    return 0
 
 
 def next_status_progress(total_spent: float) -> tuple[str, float] | None:
-    for threshold, status, _icon, _reward, _cashback_percent in STATUS_LEVELS_ASC:
-        if total_spent < threshold:
-            return status, round(threshold - total_spent, 2)
+    """Compatibility stub: client marketing statuses are disabled."""
     return None
 
 
@@ -1239,7 +1218,8 @@ def order_sort_key(order: dict) -> tuple[int, str]:
 
 
 def status_rank(status: str) -> int:
-    return STATUS_ORDER.get(status, STATUS_ORDER["New"])
+    """Compatibility stub: client marketing statuses are disabled."""
+    return 0
 
 
 def referral_entry_user_id(entry) -> str | None:
@@ -1399,7 +1379,6 @@ def update_profile_stats_from_orders(user_id: int, profile: dict, orders: list |
     active_orders = [order for order in user_orders if is_revenue_order(order)]
     profile["orders_count"] = len(active_orders)
     profile["total_spent"] = round(sum(order_amount_rub(order) for order in active_orders), 2)
-    profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
     profile.setdefault("slik_balance", profile.get("bonus_balance", 0))
     profile["bonus_balance"] = profile.get("slik_balance", 0)
     return profile
@@ -1417,8 +1396,7 @@ def award_cashback_if_needed(profile: dict, order: dict) -> float:
     if order_amount <= 0:
         return 0.0
 
-    status = profile.get("status") or calculate_user_status(float(profile.get("total_spent") or 0))
-    cashback_percent = cashback_percent_for_status(status)
+    cashback_percent = cashback_percent_for_profile(profile)
     cashback_amount = round(order_amount * cashback_percent / 100, 2)
     if cashback_amount <= 0:
         return 0.0
@@ -1467,7 +1445,6 @@ def ensure_user_profile(user) -> dict:
         profile.setdefault("referrer", None)
         profile.setdefault("referral_bonus_awarded", False)
         profile.setdefault("new_client_notified", False)
-        profile["status"] = calculate_user_status(float(profile.get("total_spent") or 0))
         profile["username"] = user.username or ""
         profile["full_name"] = user.full_name or ""
     users[key] = profile
@@ -1501,10 +1478,10 @@ def record_user_order(user, order: dict) -> tuple[dict, str, str, float]:
         ),
         2,
     )
-    previous_status = calculate_user_status(previous_total)
+    previous_status = ""
 
     profile = update_profile_stats_from_orders(user.id, profile, all_user_orders)
-    current_status = profile.get("status", "New")
+    current_status = ""
     cashback_amount = award_cashback_if_needed(profile, order)
     if cashback_amount > 0:
         save_order_cashback_fields(order)
@@ -4563,15 +4540,7 @@ FULFILLMENT_STATUS_LABELS = {
     "failed": "❌ ошибка выдачи",
     "cancelled": "❌ отменён",
 }
-CRM_STATUS_LABELS = {
-    "new": "🆕 Новый",
-    "active": "🟢 Активный",
-    "vip": "⭐ VIP",
-    "sleeping": "😴 Спящий",
-    "blocked": "🚫 Заблокирован",
-}
-VIP_ORDER_THRESHOLD = 5
-VIP_SPENT_THRESHOLD = 50000
+ACCESS_LABELS = {False: "✅ активен", True: "🚫 заблокирован"}
 
 
 def order_category_key(order: dict) -> str:
@@ -4589,6 +4558,55 @@ def order_category_key(order: dict) -> str:
 def order_category_label(order: dict) -> str:
     icon, title = ORDER_CATEGORY_META.get(order_category_key(order), ORDER_CATEGORY_META["other"])
     return f"{icon} {title}"
+
+
+def order_product_user_lines(order: dict) -> list[str]:
+    category = order_category_key(order)
+    if category == "telegram_stars":
+        return [
+            "⭐ Telegram Stars",
+            f"Количество: {html_escape(str(order.get('amount', '—')))} ⭐",
+            f"Получатель: {html_escape(str(order.get('telegram_recipient_username') or order.get('recipient') or '—'))}",
+        ]
+    if category == "telegram_premium":
+        months = order.get("duration_months", "—")
+        return [
+            "💎 Telegram Premium",
+            f"Срок: {html_escape(str(months))} {html_escape(month_word(months))}",
+            f"Получатель: {html_escape(str(order.get('telegram_recipient_username') or order.get('recipient') or '—'))}",
+        ]
+    if category == "apple_id":
+        nominal = apple_id_product_nominal_label({"amount": order.get("amount"), "currency": order.get("currency")})
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
+        return [
+            "🍎 Apple ID",
+            f"Регион: {html_escape(str(region))}",
+            f"Номинал: {html_escape(str(nominal))}",
+        ]
+    return [
+        "🌍 eSIM",
+        f"Страна: {html_escape(str(order.get('country') or 'Россия'))}",
+        f"Пакет: {html_escape(str(order.get('gb') or '—'))}",
+        f"Срок: {html_escape(str(order.get('days') or '—'))} дней",
+    ]
+
+
+def order_issued_user_text(order: dict) -> str:
+    number = order_number_plain(order)
+    category = order_category_key(order)
+    lines = order_product_user_lines(order)
+    if category == "telegram_stars":
+        return f"✅ Ваш заказ {number} выдан.\n\n" + "\n".join(lines) + "\n\nЕсли Stars не поступили в течение нескольких минут, напишите менеджеру."
+    if category == "telegram_premium":
+        return f"✅ Ваш заказ {number} выдан.\n\n" + "\n".join(lines) + "\n\nЕсли Premium не активировался, напишите менеджеру."
+    if category == "apple_id":
+        return f"✅ Ваш заказ {number} выдан.\n\n" + "\n".join(lines) + "\n\nКод / инструкция отправлены менеджером."
+    return f"✅ Ваша eSIM по заказу {number} выдана.\n\n" + "\n".join(lines) + "\n\nИнструкция по установке отправлена."
+
+
+def order_in_progress_user_text(order: dict) -> str:
+    number = order_number_plain(order)
+    return f"🔵 Ваш заказ {number} взят в работу.\n\n" + "\n".join(order_product_user_lines(order))
 
 
 def order_payment_status(order: dict) -> str:
@@ -4965,19 +4983,15 @@ def analytics_keyboard() -> InlineKeyboardMarkup:
 
 
 CLIENT_CATEGORY_TITLES = {
-    "new": "🆕 Новые",
-    "active": "🟢 Активные",
-    "vip": "⭐ VIP",
-    "sleeping": "😴 Спящие",
-    "blocked": "🚫 Заблокированные",
+    "all": "👥 Все клиенты",
+    "buyers": "💳 С заказами",
+    "no_orders": "🆕 Без заказов",
     "apple_id": "🍎 Apple ID",
     "telegram_stars": "⭐ Stars",
     "telegram_premium": "💎 Premium",
     "esim": "🌍 eSIM",
-    "buyers": "💰 Покупатели",
-    "no_orders": "🆕 Новые",
-    "return": "😴 Спящие",
-    "top": "⭐ VIP",
+    "blocked": "🚫 Заблокированные",
+    "inactive_60": "😴 Без заказов 60+ дней",
 }
 CLIENT_INPUT_BALANCE = "client_balance"
 CLIENT_INPUT_MESSAGE = "client_message"
@@ -4988,13 +5002,15 @@ BROADCAST_INPUT_MESSAGE = "broadcast_message"
 NOTIFICATION_CHAT_INPUT = "notification_chat"
 BROADCAST_CATEGORIES = {
     "all": "👥 Все клиенты",
-    "no_orders": "🆕 Новые",
     "buyers": "💳 С заказами",
+    "no_orders": "🆕 Без заказов",
     "balance": "💰 С балансом",
-    "vip": "⭐ VIP",
-    "regular": "🟢 Активные",
     "referrers": "👥 Рефереры",
-    "inactive": "😴 Спящие",
+    "inactive": "😴 Неактивные",
+    "apple_id": "🍎 Apple ID",
+    "telegram_stars": "⭐ Telegram Stars",
+    "telegram_premium": "💎 Telegram Premium",
+    "esim": "🌍 eSIM",
 }
 
 
@@ -5074,23 +5090,13 @@ def normalize_client_tags(profile: dict, categories: set[str] | None = None) -> 
     return result
 
 
-def client_crm_status(profile: dict, paid_orders: int, total_spent_rub: float, last_paid_order_at: datetime.datetime | None) -> str:
-    if profile.get("blocked") is True or str(profile.get("crm_status") or "").lower() == "blocked":
-        return "blocked"
-    if profile.get("vip_manual") is True:
-        return "vip"
-    if paid_orders >= VIP_ORDER_THRESHOLD or total_spent_rub >= VIP_SPENT_THRESHOLD:
-        return "vip"
-    if paid_orders == 0:
-        return "new"
-    if last_paid_order_at:
-        inactive_days = (datetime.datetime.now(tz=TZ).date() - last_paid_order_at.astimezone(TZ).date()).days
-        if inactive_days <= 60:
-            return "active"
-        if inactive_days >= 90 or inactive_days > 60:
-            return "sleeping"
-    return "active"
+def client_access_blocked(profile: dict) -> bool:
+    return profile.get("blocked") is True or str(profile.get("crm_status") or "").lower() == "blocked"
 
+
+def client_crm_status(profile: dict, paid_orders: int, total_spent_rub: float, last_paid_order_at: datetime.datetime | None) -> str:
+    """Compatibility helper: only access blocking remains, no marketing CRM statuses."""
+    return "blocked" if client_access_blocked(profile) else "active"
 
 def collect_clients() -> list[dict]:
     users = load_users()
@@ -5136,6 +5142,7 @@ def collect_clients() -> list[dict]:
             "created_at": created_at or datetime.datetime.min.replace(tzinfo=TZ),
             "status": crm_status,
             "crm_status": crm_status,
+            "blocked": client_access_blocked(profile),
             "categories_used": categories_used,
             "tags": normalize_client_tags(profile, categories_used),
         })
@@ -5144,14 +5151,21 @@ def collect_clients() -> list[dict]:
 
 def client_category_items(category: str) -> list[dict]:
     clients = collect_clients()
-    aliases = {"no_orders": "new", "return": "sleeping", "top": "vip", "buyers": "buyers"}
-    category = aliases.get(category, category)
-    if category in CRM_STATUS_LABELS:
-        items = [client for client in clients if client["crm_status"] == category]
+    now_date = datetime.datetime.now(tz=TZ).date()
+    if category == "blocked":
+        items = [client for client in clients if client["blocked"]]
     elif category in ORDER_CATEGORY_META:
         items = [client for client in clients if category in client["categories_used"]]
     elif category == "buyers":
         items = [client for client in clients if client["paid_orders"] > 0]
+    elif category == "no_orders":
+        items = [client for client in clients if client["paid_orders"] == 0]
+    elif category == "inactive_60":
+        items = [
+            client for client in clients
+            if client["paid_orders"] == 0
+            or (client["last_paid_order_at"] and (now_date - client["last_paid_order_at"].astimezone(TZ).date()).days >= 60)
+        ]
     else:
         items = clients
     return sorted(items, key=lambda client: client["last_order_at"] or client["created_at"], reverse=True)[:20]
@@ -5159,23 +5173,30 @@ def client_category_items(category: str) -> list[dict]:
 
 def clients_dashboard_text() -> str:
     clients = collect_clients()
-    counts = {key: sum(1 for client in clients if client["crm_status"] == key) for key in CRM_STATUS_LABELS}
-    lines = ["👥 <b>Клиенты</b>", "", f"Всего клиентов: <b>{len(clients)}</b>"]
-    lines.extend(f"{CRM_STATUS_LABELS[key]}: <b>{counts[key]}</b>" for key in ("new", "active", "vip", "sleeping", "blocked"))
+    buyers = sum(1 for client in clients if client["paid_orders"] > 0)
+    no_orders = sum(1 for client in clients if client["paid_orders"] == 0)
+    blocked = sum(1 for client in clients if client["blocked"])
+    lines = [
+        "👥 <b>Клиенты</b>",
+        "",
+        f"Всего клиентов: <b>{len(clients)}</b>",
+        f"С заказами: <b>{buyers}</b>",
+        f"Без заказов: <b>{no_orders}</b>",
+        f"Заблокированные: <b>{blocked}</b>",
+    ]
     return "\n".join(lines)
 
 
 def clients_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆕 Новые", callback_data="clients_cat:new"), InlineKeyboardButton("🟢 Активные", callback_data="clients_cat:active")],
-        [InlineKeyboardButton("⭐ VIP", callback_data="clients_cat:vip"), InlineKeyboardButton("😴 Спящие", callback_data="clients_cat:sleeping")],
-        [InlineKeyboardButton("🚫 Заблокированные", callback_data="clients_cat:blocked")],
+        [InlineKeyboardButton("👥 Все клиенты", callback_data="clients_cat:all")],
+        [InlineKeyboardButton("💳 С заказами", callback_data="clients_cat:buyers"), InlineKeyboardButton("🆕 Без заказов", callback_data="clients_cat:no_orders")],
         [InlineKeyboardButton("🍎 Apple ID", callback_data="clients_cat:apple_id"), InlineKeyboardButton("⭐ Stars", callback_data="clients_cat:telegram_stars")],
         [InlineKeyboardButton("💎 Premium", callback_data="clients_cat:telegram_premium"), InlineKeyboardButton("🌍 eSIM", callback_data="clients_cat:esim")],
+        [InlineKeyboardButton("🚫 Заблокированные", callback_data="clients_cat:blocked")],
         [InlineKeyboardButton("🔎 Поиск", callback_data="clients_search")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
     ])
-
 
 def client_list_text(category: str) -> str:
     title = CLIENT_CATEGORY_TITLES.get(category, "👥 Клиенты")
@@ -5185,15 +5206,13 @@ def client_list_text(category: str) -> str:
     lines = [f"👥 <b>Клиенты</b> — {title}", ""]
     for client in items:
         name = html_escape(client_display_name(client["user_id"], client["profile"]))
-        status = CRM_STATUS_LABELS.get(client["crm_status"], client["crm_status"])
         tags = ", ".join(client["tags"][:3]) or "—"
+        access = "🚫" if client["blocked"] else "✅"
         if client["paid_orders"] == 0:
             summary = "заказов нет"
-        elif client["crm_status"] == "sleeping":
-            summary = f"последний заказ {days_ago_text(client['last_paid_order_at'])}"
         else:
             summary = f"{client['paid_orders']} заказов / {format_rub(client['total_spent_rub'])} / {html_escape(tags)}"
-        lines.append(f"{status} {name} — {summary}")
+        lines.append(f"{access} {name} — {summary}")
     return "\n".join(lines)
 
 
@@ -5201,7 +5220,8 @@ def client_list_keyboard(category: str) -> InlineKeyboardMarkup:
     rows = []
     for client in client_category_items(category):
         name = client_display_name(client["user_id"], client["profile"])
-        rows.append([InlineKeyboardButton(f"{CRM_STATUS_LABELS.get(client['crm_status'], '')} {name}"[:64], callback_data=f"client_card:{client['user_id']}:{category}")])
+        access = "🚫" if client["blocked"] else "✅"
+        rows.append([InlineKeyboardButton(f"{access} {name}"[:64], callback_data=f"client_card:{client['user_id']}:{category}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_clients")])
     return InlineKeyboardMarkup(rows)
 
@@ -5246,7 +5266,7 @@ def client_card_text(user_id: str) -> str:
         f"Бонусы / cashback: <b>{format_usd_cents(profile.get('bonus_balance', 0))}</b>\n"
         f"Реферальные начисления: <b>{format_usd_cents(referral_stats['bonuses_awarded'])}</b>\n\n"
         "<b>CRM</b>\n"
-        f"Статус клиента: <b>{CRM_STATUS_LABELS.get(client['crm_status'], client['crm_status'])}</b>\n"
+        f"Доступ: <b>{ACCESS_LABELS[client['blocked']]}</b>\n"
         f"Комментарий менеджера: <b>{html_escape(profile.get('manager_comment') or profile.get('admin_comment') or '—')}</b>\n"
         f"🏷 Теги: <b>{html_escape(', '.join(client['tags']) or '—')}</b>"
     )
@@ -5257,7 +5277,6 @@ def client_card_keyboard(user_id: str, back: str = "buyers", user=None) -> Inlin
     if get_user_role(user) in {ROLE_OWNER, ROLE_ADMIN}:
         rows.append([InlineKeyboardButton("🏷 Изменить теги", callback_data=f"client_tags:{user_id}"), InlineKeyboardButton("📝 Комментарий", callback_data=f"client_comment:{user_id}")])
         rows.append([InlineKeyboardButton("🚫 Заблокировать / Разблокировать", callback_data=f"client_block:{user_id}")])
-        rows.append([InlineKeyboardButton("⭐ VIP / снять VIP", callback_data=f"client_vip:{user_id}")])
         rows.append([InlineKeyboardButton("💰 Изменить баланс", callback_data=f"client_balance:{user_id}")])
         rows.append([InlineKeyboardButton("✉️ Написать клиенту", callback_data=f"client_message:{user_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"clients_cat:{back}" if back in CLIENT_CATEGORY_TITLES else "admin_clients")])
@@ -5363,10 +5382,12 @@ def broadcast_recipients(category: str) -> list[dict]:
         "no_orders": lambda client: client["orders_count"] == 0,
         "buyers": lambda client: client["orders_count"] > 0,
         "balance": has_positive_balance,
-        "vip": lambda client: client["crm_status"] == "vip",
-        "regular": lambda client: client["crm_status"] == "active",
         "referrers": is_referrer,
         "inactive": is_inactive,
+        "apple_id": lambda client: "apple_id" in client["categories_used"],
+        "telegram_stars": lambda client: "telegram_stars" in client["categories_used"],
+        "telegram_premium": lambda client: "telegram_premium" in client["categories_used"],
+        "esim": lambda client: "esim" in client["categories_used"],
     }
     predicate = filters_by_category.get(category)
     if not predicate:
@@ -5437,13 +5458,19 @@ async def notify_client_order_status(context: ContextTypes.DEFAULT_TYPE, order: 
     if user_id is None:
         return
     status = normalize_order_status(order.get("status"))
-    template = STATUS_NOTIFICATION_TEXT.get(status)
-    if not template:
-        return
+    if status == "issued":
+        text = order_issued_user_text(order)
+    elif status == "in_progress":
+        text = order_in_progress_user_text(order)
+    else:
+        template = STATUS_NOTIFICATION_TEXT.get(status)
+        if not template:
+            return
+        text = template.format(number=order_number_plain(order))
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=template.format(number=order_number_plain(order)),
+            text=text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👨‍💻 Поддержка", url=SUPPORT_URL)],
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="back_main")],
@@ -6730,27 +6757,15 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     profile = sync_user_order_stats(user, ensure_user_profile(user))
     referrals = profile.get("referrals", [])
     referrals_count = len(referrals) if isinstance(referrals, list) else 0
-    total_spent = float(profile.get('total_spent') or 0)
-    next_progress = next_status_progress(total_spent)
-    progress_text = (
-        f"До следующего статуса:\n<b>{html_escape(format_status(next_progress[0]))}</b> — осталось <b>{format_usd_cents(next_progress[1])}</b>"
-        if next_progress
-        else "Максимальный статус достигнут 👑"
-    )
     text = (
-        "👤 <b>Личный кабинет</b>\n\n"
+        "👤 <b>Профиль</b>\n\n"
         f"Имя: <b>{html_escape(profile.get('full_name') or user.full_name or '—')}</b>\n"
         f"Telegram ID: <code>{user.id}</code>\n\n"
-        "Текущий статус:\n"
-        f"<b>{html_escape(format_status(profile.get('status', 'New')))}</b>\n\n"
-        f"Потрачено: <b>{format_usd_cents(total_spent)}</b>\n\n"
-        f"{progress_text}\n\n"
         f"Количество заказов: <b>{int(profile.get('orders_count') or 0)}</b>\n"
         f"SLIK Balance: <b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
         f"Приглашено друзей: <b>{referrals_count}</b>"
     )
     await edit_or_send(query, context, text, profile_keyboard())
-
 
 def format_order_date(order: dict) -> str:
     created_date = order.get("created_date")
@@ -6866,14 +6881,12 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
-    status = profile.get("status", "New")
     referral_reward = referral_reward_for_profile(profile)
     referral_stats = referral_analytics_for_profile(profile)
     username = await get_bot_username(context)
     referral_link = f"https://t.me/{username}?start=ref_{query.from_user.id}" if username else f"/start ref_{query.from_user.id}"
     text = (
         "👥 <b>Пригласить друга</b>\n\n"
-        f"Ваш статус: <b>{html_escape(format_status(status))}</b>\n\n"
         "За первую заявку друга:\n"
         f"Вы получите: <b>{format_usd(referral_reward)}</b>\n"
         f"Друг получит: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>\n\n"
@@ -6886,20 +6899,16 @@ async def show_profile_invite(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
 
-
 async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     profile = sync_user_order_stats(query.from_user, ensure_user_profile(query.from_user))
     referral_stats = referral_analytics_for_profile(profile)
-    status = profile.get("status", "New")
     referral_reward = referral_reward_for_profile(profile)
     text = (
         "💰 <b>SLIK Balance</b>\n\n"
         f"Баланс: <b>{format_usd_cents(profile.get('slik_balance', profile.get('bonus_balance', 0)))}</b>\n"
-        f"Статус: <b>{html_escape(format_status(status))}</b>\n"
-        f"Ваш кэшбэк: <b>{cashback_percent_for_status(status)}%</b>\n"
-        f"Ваш бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
+        f"Бонус за друга: <b>{format_usd(referral_reward)}</b>\n\n"
         "Реферальная аналитика:\n"
         f"Переходов: <b>{referral_stats['clicks']}</b>\n"
         f"Купили: <b>{referral_stats['bought']}</b>\n"
@@ -6908,6 +6917,7 @@ async def show_profile_bonuses(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Друг по вашей ссылке получает: <b>{format_usd(FRIEND_REFERRAL_REWARD_USD)}</b>."
     )
     await edit_or_send(query, context, text, profile_back_keyboard())
+
 
 
 # ─── Диалог покупки ───────────────────────────────────────────────────────────
@@ -7329,21 +7339,6 @@ async def notify_cashback_awarded(
         logger.error("Не удалось уведомить о cashback: %s", e)
 
 
-async def notify_status_upgrade(context: ContextTypes.DEFAULT_TYPE, user_id: int, status: str) -> None:
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "🎉 <b>Ваш статус повышен!</b>\n\n"
-                f"Новый статус: <b>{html_escape(format_status(status))}</b>\n\n"
-                f"Теперь вы получаете <b>{format_usd(referral_reward_for_status(status))}</b> "
-                "за приглашённого друга."
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error("Не удалось уведомить о повышении статуса: %s", e)
-
 
 async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     tg_handle = update.message.text.strip()
@@ -7456,8 +7451,6 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     if cashback_amount > 0:
         await notify_cashback_awarded(context, user.id, order, cashback_amount, profile)
-    if status_rank(current_status) > status_rank(previous_status):
-        await notify_status_upgrade(context, user.id, current_status)
     await notify_admin(context, order)
     if not has_admin_access(user):
         if plan.get("product_type") == "apple_id":
@@ -9571,7 +9564,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "client_tags:",
         "client_comment:",
         "client_block:",
-        "client_vip:",
         "payment_method:",
         "payment_toggle:",
         "payment_instructions:",
@@ -9656,7 +9648,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
         await edit_or_send(
             query, context,
-            "🏷 <b>Изменение тегов</b>\n\nВведите теги через запятую:\nApple ID, Stars, VIP",
+            "🏷 <b>Изменение тегов</b>\n\nВведите теги через запятую:\nApple ID, Stars, eSIM",
             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"client_card:{user_id}:buyers")]]),
         )
     elif data.startswith("client_comment:"):
@@ -9689,21 +9681,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         users[user_id] = profile
         save_users(users)
         await query.answer("Клиент заблокирован" if profile["blocked"] else "Клиент разблокирован", show_alert=True)
-        await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
-    elif data.startswith("client_vip:"):
-        if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
-            await query.answer("MANAGER не может менять VIP.", show_alert=True)
-            return
-        user_id = data.split(":", 1)[1]
-        users = load_users()
-        profile = users.get(user_id)
-        if not isinstance(profile, dict):
-            await query.answer("Клиент не найден.", show_alert=True)
-            return
-        profile["vip_manual"] = not bool(profile.get("vip_manual", False))
-        users[user_id] = profile
-        save_users(users)
-        await query.answer("VIP включён" if profile["vip_manual"] else "VIP снят", show_alert=True)
         await edit_or_send(query, context, client_card_text(user_id), client_card_keyboard(user_id, "buyers", query.from_user))
     elif data.startswith("client_message:"):
         if get_user_role(query.from_user) not in {ROLE_OWNER, ROLE_ADMIN}:
