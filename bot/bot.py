@@ -69,6 +69,9 @@ FAZERCARDS_PRODUCTS_ENDPOINT = "/giftcards?limit=100"
 FAZERCARDS_GIFTCARDS_CARDS_ENDPOINT = "/giftcards/cards"
 FAZERCARDS_TELEGRAM_STARS_ENDPOINT = "/telegram/stars"
 FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/telegram/premium"
+FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT = "/telegram/stars/buy"
+FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT = "/telegram/premium/buy"
+FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT = "/giftcards/order"
 MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/products/business/APPLE%20ID"
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
@@ -333,6 +336,16 @@ DEFAULT_CONFIG = {
     "telegram_stars_pending_supplier_positions": [],
     "telegram_premium_pending_supplier_positions": [],
     "telegram_services_last_sync_report": {},
+    "auto_fulfillment": {
+        "enabled": False,
+        "apple_id_enabled": False,
+        "telegram_stars_enabled": False,
+        "telegram_premium_enabled": False,
+        "esim_enabled": False,
+        "max_retries": 2,
+        "retry_delay_seconds": 30,
+        "manual_fallback_enabled": True,
+    },
     "fazercards": {
         "api_key": "",
         "enabled": False,
@@ -517,6 +530,18 @@ def load_config() -> dict:
         data["apple_id_pricing"] = apple_id_pricing
     for key, value in DEFAULT_APPLE_ID_PRICING.items():
         apple_id_pricing.setdefault(key, value)
+    auto_fulfillment = data.get("auto_fulfillment")
+    if not isinstance(auto_fulfillment, dict):
+        auto_fulfillment = {}
+        data["auto_fulfillment"] = auto_fulfillment
+    for key, value in DEFAULT_CONFIG["auto_fulfillment"].items():
+        auto_fulfillment.setdefault(key, value)
+    auto_fulfillment["enabled"] = bool(auto_fulfillment.get("enabled", False))
+    auto_fulfillment["manual_fallback_enabled"] = bool(auto_fulfillment.get("manual_fallback_enabled", True))
+    for key in ("apple_id_enabled", "telegram_stars_enabled", "telegram_premium_enabled", "esim_enabled"):
+        auto_fulfillment[key] = bool(auto_fulfillment.get(key, False))
+    auto_fulfillment["max_retries"] = max(0, int(safe_float(auto_fulfillment.get("max_retries", 2))))
+    auto_fulfillment["retry_delay_seconds"] = max(0, int(safe_float(auto_fulfillment.get("retry_delay_seconds", 30))))
     fazercards = data.get("fazercards")
     if not isinstance(fazercards, dict):
         fazercards = {}
@@ -2517,6 +2542,233 @@ async def fetch_fazercards_giftcards_cards_readonly(category_id: str = "") -> di
         logger.warning("FazerCards gift cards fetch failed: %s", safe_error)
         return {"ok": False, "error": safe_error, "items": []}
 
+
+
+
+def get_auto_fulfillment_settings() -> dict:
+    cfg = load_config().get("auto_fulfillment") or {}
+    defaults = DEFAULT_CONFIG["auto_fulfillment"]
+    return {key: cfg.get(key, value) for key, value in defaults.items()}
+
+
+def save_auto_fulfillment_settings(**fields) -> dict:
+    cfg = load_config()
+    settings = cfg.get("auto_fulfillment") if isinstance(cfg.get("auto_fulfillment"), dict) else {}
+    settings.update(fields)
+    cfg["auto_fulfillment"] = settings
+    save_config(cfg)
+    return get_auto_fulfillment_settings()
+
+
+def order_already_fulfilled(order: dict) -> bool:
+    return order_fulfillment_status(order) in {"auto_issued", "issued"} or bool(order.get("supplier_order_id")) or bool(order.get("auto_fulfilled_at"))
+
+
+def mask_giftcard_code(value) -> str:
+    text = str(value or "")
+    compact = "".join(ch for ch in text if ch.isalnum())
+    if len(compact) <= 4:
+        return "****" if compact else ""
+    return f"****-****-{compact[-4:]}"
+
+
+def sanitized_supplier_response(payload):
+    if isinstance(payload, dict):
+        clean = {}
+        for key, value in payload.items():
+            lk = str(key).lower()
+            if any(token in lk for token in ("code", "pin", "voucher", "secret", "token", "api_key")):
+                clean[key] = mask_giftcard_code(value)
+            else:
+                clean[key] = sanitized_supplier_response(value)
+        return clean
+    if isinstance(payload, list):
+        return [sanitized_supplier_response(item) for item in payload]
+    return payload
+
+
+def supplier_order_id_from_response(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("order_id", "id", "supplier_order_id", "uuid"):
+        if payload.get(key):
+            return str(payload.get(key))
+    for parent in ("data", "result", "order"):
+        value = payload.get(parent)
+        nested = supplier_order_id_from_response(value) if isinstance(value, dict) else ""
+        if nested:
+            return nested
+    return ""
+
+
+def giftcard_fields_from_response(payload) -> dict:
+    fields = {"giftcard_code": "", "giftcard_pin": "", "giftcard_link": ""}
+    if not isinstance(payload, dict):
+        return fields
+    for key, value in payload.items():
+        lk = str(key).lower()
+        if not fields["giftcard_code"] and lk in {"code", "giftcard_code", "card_code", "voucher"}:
+            fields["giftcard_code"] = str(value or "")
+        if not fields["giftcard_pin"] and "pin" in lk:
+            fields["giftcard_pin"] = str(value or "")
+        if not fields["giftcard_link"] and ("link" in lk or "url" in lk):
+            fields["giftcard_link"] = str(value or "")
+        if isinstance(value, dict):
+            nested = giftcard_fields_from_response(value)
+            for fkey, fval in nested.items():
+                fields[fkey] = fields[fkey] or fval
+    return fields
+
+
+def update_order_fields(order_id: int, **fields) -> dict | None:
+    orders = load_orders()
+    for item in orders:
+        try:
+            match = int(item.get("id")) == int(order_id)
+        except (TypeError, ValueError):
+            match = False
+        if match:
+            item.update(fields)
+            item["updated_at"] = now_str()
+            save_orders(orders)
+            if item.get("user_id") is not None:
+                sync_order_user_stats(item["user_id"])
+            return item
+    return None
+
+
+async def fazercards_post_order(endpoint: str, payload: dict) -> dict:
+    api_key = get_fazercards_api_key()
+    if not api_key:
+        raise ValueError("FAZERCARDS_API_KEY not configured")
+    async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        response = await client.post(endpoint, headers=fazercards_headers(api_key), json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and data.get("ok", True) is False:
+            raise ValueError(str(data.get("error") or data.get("message") or "supplier_error"))
+        return data if isinstance(data, dict) else {"data": data}
+
+
+async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
+    username = str(order.get("telegram_recipient_username") or order.get("recipient") or "").strip()
+    amount = int(safe_float(order.get("amount"), 0))
+    if not username or amount <= 0 or order_amount_rub(order) <= 0:
+        return {"ok": False, "error": "telegram_stars_supplier_data_missing", "manual_fallback": True}
+    payload = {"username": username.lstrip("@"), "amount": amount}
+    if order.get("fazercards_card_id"):
+        payload["card_id"] = order.get("fazercards_card_id")
+    data = await fazercards_post_order(FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT, payload)
+    return {"ok": True, "supplier_order_id": supplier_order_id_from_response(data), "supplier_response": sanitized_supplier_response(data)}
+
+
+async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
+    username = str(order.get("telegram_recipient_username") or order.get("recipient") or "").strip()
+    months = int(safe_float(order.get("duration_months"), 0))
+    if not username or months <= 0:
+        return {"ok": False, "error": "telegram_premium_supplier_data_missing", "manual_fallback": True}
+    payload = {"username": username.lstrip("@"), "months": months}
+    if order.get("fazercards_card_id"):
+        payload["card_id"] = order.get("fazercards_card_id")
+    data = await fazercards_post_order(FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT, payload)
+    return {"ok": True, "supplier_order_id": supplier_order_id_from_response(data), "supplier_response": sanitized_supplier_response(data)}
+
+
+async def auto_fulfill_apple_id_order(order: dict) -> dict:
+    card_id = order.get("fazercards_card_id") or order.get("fazercards_product_id")
+    if not card_id or not order.get("amount") or not (order.get("region") or order.get("country")):
+        return {"ok": False, "error": "apple_id_supplier_data_missing", "manual_fallback": True}
+    data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, {"card_id": card_id, "quantity": 1})
+    fields = giftcard_fields_from_response(data)
+    ok = bool(fields.get("giftcard_code"))
+    return {"ok": ok, "supplier_order_id": supplier_order_id_from_response(data), "supplier_response": sanitized_supplier_response(data), **fields, "error": "giftcard_code_missing" if not ok else "", "manual_fallback": not ok}
+
+
+async def auto_fulfill_esim_order(order: dict) -> dict:
+    return {"ok": False, "error": "esim_auto_fulfillment_not_configured", "manual_fallback": True}
+
+
+def auto_fulfillment_client_text(order: dict, ok: bool) -> str:
+    if not ok:
+        return f"✅ Оплата по заказу {order_number_plain(order)} получена.\n\nЗаказ передан менеджеру на выдачу.\nОбычно это занимает несколько минут."
+    lines = order_product_user_lines(order)
+    category = order_category_key(order)
+    text = f"✅ Ваш заказ {order_number_plain(order)} выдан автоматически.\n\n" + "\n".join(lines)
+    if category == "telegram_stars":
+        return text + "\n\nЕсли Stars не поступили в течение нескольких минут, напишите менеджеру."
+    if category == "telegram_premium":
+        return text + "\n\nЕсли Premium не активировался, напишите менеджеру."
+    if category == "apple_id" and order.get("giftcard_code"):
+        return text + f"\n\nКод:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>\n\nСохраните код до активации."
+    return text
+
+
+def auto_fulfillment_admin_text(order: dict, report: dict) -> str:
+    product = order.get("product_title") or order_category_label(order)
+    recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
+    if report.get("ok"):
+        return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+    return ("⚠️ <b>Автовыдача не удалась</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
+
+
+async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
+    try:
+        if order.get("user_id"):
+            await context.bot.send_message(chat_id=int(order["user_id"]), text=auto_fulfillment_client_text(order, bool(report.get("ok"))), parse_mode="HTML")
+    except Exception as exc:
+        logger.warning("Auto fulfillment client notification failed for order %s: %s", order.get("id"), exc)
+    chat_id = get_orders_chat_id()
+    if chat_id:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=auto_fulfillment_admin_text(order, report), parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Auto fulfillment admin notification failed for order %s: %s", order.get("id"), exc)
+
+
+async def auto_fulfill_order(context, order: dict, reason: str = "payment_paid") -> dict:
+    category = order_category_key(order)
+    report = {"ok": False, "order_id": str(order.get("number") or order.get("id") or ""), "category": category, "status": order_fulfillment_status(order)}
+    if order_payment_status(order) != "paid":
+        return {**report, "skipped": True, "message": "payment_not_paid"}
+    if order_already_fulfilled(order):
+        return {**report, "ok": True, "skipped": True, "message": "already_fulfilled"}
+    settings = get_auto_fulfillment_settings()
+    toggle = {"apple_id": "apple_id_enabled", "telegram_stars": "telegram_stars_enabled", "telegram_premium": "telegram_premium_enabled", "esim": "esim_enabled"}.get(category)
+    if not settings.get("enabled") or not toggle or not settings.get(toggle):
+        updated = update_order_fields(order.get("id"), fulfillment_status="manual_issue_required", auto_fulfillment=False, auto_fulfillment_last_error="auto_fulfillment_disabled", auto_fulfillment_reason=reason) or order
+        fallback = {**report, "status": "manual_issue_required", "error": "auto_fulfillment_disabled", "manual_fallback": True}
+        await notify_auto_fulfillment(context, updated, fallback)
+        return fallback
+    helpers = {"apple_id": auto_fulfill_apple_id_order, "telegram_stars": auto_fulfill_telegram_stars_order, "telegram_premium": auto_fulfill_telegram_premium_order, "esim": auto_fulfill_esim_order}
+    update_order_fields(order.get("id"), fulfillment_status="auto_issue_processing", auto_fulfillment=True)
+    attempts = max(1, int(settings.get("max_retries", 2)) + 1)
+    delay = int(settings.get("retry_delay_seconds", 30))
+    last_error = ""
+    result = {}
+    for attempt in range(1, attempts + 1):
+        try:
+            result = await helpers[category](order)
+            if result.get("ok"):
+                break
+            last_error = str(result.get("error") or "supplier_error")
+        except Exception as exc:
+            last_error = fazercards_api_error(exc)
+        if attempt < attempts:
+            await asyncio.sleep(delay)
+    if result.get("ok"):
+        fields = {"supplier": "fazercards", "supplier_order_id": result.get("supplier_order_id", ""), "supplier_response": result.get("supplier_response", {}), "auto_fulfillment": True, "auto_fulfilled_at": now_str(), "fulfillment_status": "auto_issued", "status": "auto_issued", "auto_fulfillment_attempts": attempt, "auto_fulfillment_last_error": ""}
+        for key in ("giftcard_code", "giftcard_pin", "giftcard_link"):
+            if result.get(key):
+                fields[key] = result[key]
+        updated = update_order_fields(order.get("id"), **fields) or {**order, **fields}
+        final = {**report, "ok": True, "status": "auto_issued", "supplier_order_id": fields["supplier_order_id"], "message": "issued"}
+        await notify_auto_fulfillment(context, updated, final)
+        return final
+    status = "manual_issue_required" if settings.get("manual_fallback_enabled", True) else "failed"
+    updated = update_order_fields(order.get("id"), fulfillment_status=status, status=status, auto_fulfillment=True, auto_fulfillment_attempts=attempts, auto_fulfillment_last_error=last_error or result.get("error") or "supplier_error") or order
+    final = {**report, "status": status, "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_issue_required"}
+    await notify_auto_fulfillment(context, updated, final)
+    return final
 
 def telegram_raw_diagnostics(raw, status_code: int | None = None) -> dict:
     diag = {
@@ -4596,8 +4848,8 @@ ORDER_LIST_FILTERS = {
     "esim": {"category:esim"},
     "pending_payment": {"payment:pending_payment"},
     "paid": {"payment:paid"},
-    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:new"},
-    "issued": {"fulfillment:issued"},
+    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_issue_required", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new"},
+    "issued": {"fulfillment:issued", "fulfillment:auto_issued"},
     "cancelled": {"payment:cancelled", "fulfillment:cancelled"},
     "new": {"fulfillment:new"},
     "in_progress": {"fulfillment:waiting_manual_issue"},
@@ -4665,8 +4917,14 @@ PAYMENT_STATUS_LABELS = {
 }
 FULFILLMENT_STATUS_LABELS = {
     "new": "🆕 новый",
+    "waiting_payment": "⏳ ожидает оплаты",
+    "paid": "✅ оплачен",
+    "auto_issue_pending": "🤖 ожидает автовыдачи",
+    "auto_issue_processing": "🤖 автовыдача выполняется",
+    "auto_issued": "✅ автовыдан",
+    "manual_issue_required": "⚠️ требуется ручная выдача",
     "waiting_manual_issue": "⏳ ожидает ручной выдачи",
-    "issued": "✅ выдан",
+    "issued": "✅ выдан вручную",
     "failed": "❌ ошибка выдачи",
     "cancelled": "❌ отменён",
 }
@@ -4760,12 +5018,14 @@ def order_fulfillment_status(order: dict) -> str:
     if explicit in FULFILLMENT_STATUS_LABELS:
         return explicit
     status = normalize_order_status(order.get("status"))
-    if status in {"issued", "done"}:
-        return "issued"
+    if status in {"auto_issued", "issued", "done"}:
+        return "auto_issued" if status == "auto_issued" else "issued"
     if status == "cancelled":
         return "cancelled"
     if status in {"failed", "payment_failed"}:
         return "failed"
+    if status in {"manual_issue_required", "auto_issue_pending", "auto_issue_processing", "paid"}:
+        return status
     if status in {"in_progress", "processing"}:
         return "waiting_manual_issue"
     return "waiting_manual_issue" if order_payment_status(order) == "paid" else "new"
@@ -4941,7 +5201,13 @@ def build_order_card_text(order: dict) -> str:
         f"Метод: <b>{html_escape(str(payment_method))}</b>\n\n"
         "<b>Выполнение</b>\n"
         f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
-        "Тип выдачи: <b>ручная</b>\n"
+        f"Тип выдачи: <b>{html_escape('автоматическая' if order_fulfillment_status(order) == 'auto_issued' else 'ручная / fallback')}</b>\n"
+        "\n<b>Автовыдача</b>\n"
+        f"Статус: <b>{html_escape(str(order.get('fulfillment_status') or 'disabled'))}</b>\n"
+        f"Поставщик: <b>{html_escape(str(order.get('supplier') or '—'))}</b>\n"
+        f"Supplier order ID: <code>{html_escape(str(order.get('supplier_order_id') or '—'))}</code>\n"
+        f"Попыток: <b>{html_escape(str(order.get('auto_fulfillment_attempts') or 0))}</b>\n"
+        f"Последняя ошибка: <b>{html_escape(str(order.get('auto_fulfillment_last_error') or '—'))}</b>\n\n"
         f"Комментарий менеджера: <b>{html_escape(str(manager_comment))}</b>\n\n"
         "<b>Даты</b>\n"
         f"Создан: <b>{html_escape(str(order.get('created_at') or format_order_date(order)))}</b>\n"
@@ -4951,8 +5217,9 @@ def build_order_card_text(order: dict) -> str:
 
 def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")],
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
-        [InlineKeyboardButton("📤 Выдано", callback_data=f"order_status:issued:{order_id}")],
+        [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
         [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
     ])
@@ -4980,7 +5247,7 @@ def is_revenue_order(order: dict) -> bool:
     status = normalize_order_status(order.get("status"))
     if status in {"cancelled", "waiting_payment", "pending_payment", "payment_failed", "refunded", "failed", "new", "pending"}:
         return False
-    return status in {"paid", "issued", "done", "in_progress", "processing"}
+    return status in {"paid", "auto_issued", "issued", "done", "in_progress", "processing"}
 
 
 def analytics_orders_since(orders: list, since: datetime.date) -> list[dict]:
@@ -6167,6 +6434,7 @@ def admin_service_sections_keyboard(user=None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
     if has_owner_access(user):
         rows.append([InlineKeyboardButton("🔑 FazerCards API", callback_data="admin_fazercards_api")])
+        rows.append([InlineKeyboardButton("🤖 Автовыдача", callback_data="admin_auto_fulfillment")])
         rows.append([InlineKeyboardButton("👤 Администраторы", callback_data="admin_admins")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(rows)
@@ -6393,8 +6661,9 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 
 def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")],
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
-        [InlineKeyboardButton("📤 Выдано", callback_data=f"order_status:issued:{order_id}")],
+        [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
         [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
     ])
 
@@ -7515,6 +7784,10 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "supplier_markup_percent": plan.get("supplier_markup_percent"),
             "estimated_margin_rub": plan.get("estimated_margin_rub"),
             "pricing_mode": "supplier_markup",
+            "payment_status": "paid",
+            "fazercards_category_id": plan.get("fazercards_category_id"),
+            "fazercards_card_id": plan.get("fazercards_card_id"),
+            "fazercards_product_id": plan.get("fazercards_product_id"),
             "country": APPLE_ID_REGION_TITLES.get(plan.get("region"), plan.get("region", "—")),
         })
     if plan.get("product_type") in {"telegram_stars", "telegram_premium"}:
@@ -7586,6 +7859,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if cashback_amount > 0:
         await notify_cashback_awarded(context, user.id, order, cashback_amount, profile)
     await notify_admin(context, order)
+    if order_payment_status(order) == "paid":
+        await auto_fulfill_order(context, order, reason="payment_paid")
     if not has_admin_access(user):
         if plan.get("product_type") == "apple_id":
             details = f"Товар: {plan.get('product_title')}\nЦена: {plan['price']}\nОплата: {payment}"
@@ -9455,6 +9730,43 @@ def fazercards_last_check_text(settings: dict) -> str:
     return "\n".join(lines)
 
 
+
+
+def auto_fulfillment_admin_text() -> str:
+    settings = get_auto_fulfillment_settings()
+    status = "✅ включена" if settings.get("enabled") else "❌ выключена"
+    def flag(key):
+        return "✅ включено" if settings.get(key) else "❌ выключено"
+    fallback = "✅ включён" if settings.get("manual_fallback_enabled") else "❌ выключен"
+    return (
+        "🤖 <b>Автовыдача</b>\n\n"
+        f"Общий статус: {status}\n\n"
+        f"🍎 Apple ID: {flag('apple_id_enabled')}\n"
+        f"⭐ Telegram Stars: {flag('telegram_stars_enabled')}\n"
+        f"💎 Telegram Premium: {flag('telegram_premium_enabled')}\n"
+        "🌍 eSIM: недоступно / вручную\n\n"
+        f"Fallback на ручную выдачу: {fallback}\n"
+        f"Попыток: {int(settings.get('max_retries', 2))}\n"
+        f"Пауза между попытками: {int(settings.get('retry_delay_seconds', 30))} сек"
+    )
+
+
+def auto_fulfillment_admin_keyboard() -> InlineKeyboardMarkup:
+    settings = get_auto_fulfillment_settings()
+    def toggle_label(title, key):
+        return ("❌ " if settings.get(key) else "✅ ") + title
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label("Автовыдача общая", "enabled"), callback_data="auto_fulfillment_toggle:enabled")],
+        [InlineKeyboardButton(toggle_label("🍎 Apple ID", "apple_id_enabled"), callback_data="auto_fulfillment_toggle:apple_id_enabled")],
+        [InlineKeyboardButton(toggle_label("⭐ Stars", "telegram_stars_enabled"), callback_data="auto_fulfillment_toggle:telegram_stars_enabled")],
+        [InlineKeyboardButton(toggle_label("💎 Premium", "telegram_premium_enabled"), callback_data="auto_fulfillment_toggle:telegram_premium_enabled")],
+        [InlineKeyboardButton("🌍 eSIM недоступно", callback_data="auto_fulfillment_esim_disabled")],
+        [InlineKeyboardButton("🔁 Изменить попытки", callback_data="auto_fulfillment_retries")],
+        [InlineKeyboardButton("⏱ Изменить паузу", callback_data="auto_fulfillment_delay")],
+        [InlineKeyboardButton("🧪 Тест режима", callback_data="auto_fulfillment_test")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
+    ])
+
 def fazercards_api_text() -> str:
     settings = get_fazercards_settings()
     connected = bool(settings.get("api_key"))
@@ -9700,6 +10012,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await deny_admin_access(update)
     elif (data.startswith(admin_prefixes) or data == "orders_stats") and not has_admin_access(query.from_user):
         await deny_admin_access(update)
+    elif data.startswith("order_auto_retry:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = find_order(order_id)
+        if not order:
+            await query.answer("Заказ не найден.", show_alert=True)
+            return
+        update_order_fields(order_id, supplier_order_id="", auto_fulfilled_at="", fulfillment_status="auto_issue_pending")
+        await query.answer("Запускаю автовыдачу...")
+        fresh = find_order(order_id) or order
+        await auto_fulfill_order(context, fresh, reason="manual_retry")
+        await edit_or_send(query, context, build_order_card_text(find_order(order_id) or fresh), order_card_keyboard(order_id))
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
     elif data.startswith("orders_list:"):
@@ -10511,6 +10837,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer("Привязка удалена.")
         await edit_or_send(query, context, apple_id_admin_product_text(product), apple_id_admin_product_keyboard(product))
+    elif data == "admin_auto_fulfillment":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(query, context, auto_fulfillment_admin_text(), auto_fulfillment_admin_keyboard())
+    elif data.startswith("auto_fulfillment_toggle:"):
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        key = data.split(":", 1)[1]
+        if key == "esim_enabled":
+            await query.answer("eSIM пока только вручную.", show_alert=True)
+            return
+        settings = get_auto_fulfillment_settings()
+        save_auto_fulfillment_settings(**{key: not bool(settings.get(key))})
+        await query.answer("Настройки обновлены.")
+        await edit_or_send(query, context, auto_fulfillment_admin_text(), auto_fulfillment_admin_keyboard())
+    elif data == "auto_fulfillment_retries":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        current = int(get_auto_fulfillment_settings().get("max_retries", 2))
+        save_auto_fulfillment_settings(max_retries=0 if current >= 3 else current + 1)
+        await query.answer("Количество попыток изменено.")
+        await edit_or_send(query, context, auto_fulfillment_admin_text(), auto_fulfillment_admin_keyboard())
+    elif data == "auto_fulfillment_delay":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        current = int(get_auto_fulfillment_settings().get("retry_delay_seconds", 30))
+        variants = [0, 10, 30, 60, 120]
+        save_auto_fulfillment_settings(retry_delay_seconds=variants[(variants.index(current) + 1) % len(variants)] if current in variants else 30)
+        await query.answer("Пауза изменена.")
+        await edit_or_send(query, context, auto_fulfillment_admin_text(), auto_fulfillment_admin_keyboard())
+    elif data == "auto_fulfillment_esim_disabled":
+        await query.answer("eSIM авто-выдача не настроена; fallback на менеджера.", show_alert=True)
+    elif data == "auto_fulfillment_test":
+        if not has_owner_access(query.from_user):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        await query.answer("Тестовый режим: POST не выполняется.", show_alert=True)
+        await edit_or_send(query, context, auto_fulfillment_admin_text() + "\n\n🧪 Тест режима: настройки читаются, supplier POST не выполняется.", auto_fulfillment_admin_keyboard())
     elif data == "admin_fazercards_api":
         if not has_owner_access(query.from_user):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
