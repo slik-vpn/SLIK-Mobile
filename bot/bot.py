@@ -62,6 +62,7 @@ USERS_FILE     = Path(__file__).parent / "users.json"
 BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
 PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
 CRYPTOBOT_API  = "https://pay.crypt.bot/api"
+CRYPTOBOT_MIN_INVOICE_USDT = 0.01
 FAZERCARDS_API_BASE_URL = "https://api.fzr.cards/api/v2"
 FAZERCARDS_TIMEOUT_SECONDS = 8.0
 FAZERCARDS_BALANCE_ENDPOINT = "/balance"
@@ -817,6 +818,102 @@ def format_rub(amount) -> str:
     return f"{rub:,}".replace(",", " ") + " ₽"
 
 
+def format_crypto_amount(amount, decimals: int = 2) -> str:
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        value = 0.0
+    return f"{value:.{decimals}f}"
+
+
+def round_crypto_amount_up(value: float, decimals: int = 2) -> float:
+    factor = 10 ** decimals
+    return math.ceil(float(value) * factor) / factor
+
+
+async def cryptobot_invoice_amount_from_rub(price_rub: float, asset: str = "USDT") -> dict:
+    rate, source = await get_usd_rub_rate()
+    rate = normalize_rate(rate) or USD_RUB_FALLBACK_RATE
+    crypto_amount = round_crypto_amount_up(float(price_rub) / rate, 2)
+    if str(asset).upper() == "USDT":
+        crypto_amount = max(crypto_amount, CRYPTOBOT_MIN_INVOICE_USDT)
+    return {
+        "price_rub": price_rub,
+        "asset": str(asset).upper(),
+        "crypto_amount": crypto_amount,
+        "usd_rub_rate_used": rate,
+        "usd_rub_rate_source": source or "fallback",
+    }
+
+
+def cryptobot_payment_details(invoice_calc: dict, invoice: dict | None = None) -> dict:
+    details = {
+        "payment_method": "cryptobot",
+        "payment_provider": "cryptobot",
+        "price_rub": invoice_calc.get("price_rub"),
+        "cryptobot_asset": invoice_calc.get("asset"),
+        "cryptobot_amount": invoice_calc.get("crypto_amount"),
+        "usd_rub_rate_used": invoice_calc.get("usd_rub_rate_used"),
+        "usd_rub_rate_source": invoice_calc.get("usd_rub_rate_source"),
+    }
+    if isinstance(invoice, dict):
+        details.update({
+            "invoice_id": invoice.get("invoice_id"),
+            "invoice_url": invoice.get("pay_url") or invoice.get("bot_invoice_url") or invoice.get("mini_app_invoice_url"),
+            "invoice_created_at": invoice.get("created_at") or now_str(),
+        })
+    return details
+
+
+def cryptobot_client_payment_text(price_rub, amount, asset, rate) -> str:
+    return (
+        "💳 <b>Оплата CryptoBot</b>\n\n"
+        f"Сумма заказа: <b>{html_escape(format_rub(price_rub))}</b>\n"
+        f"К оплате: <b>{html_escape(format_crypto_amount(amount))} {html_escape(asset)}</b>\n\n"
+        f"Курс расчёта: <b>{float(rate):.2f} ₽ за 1 {html_escape(asset)}</b>"
+    )
+
+
+def cryptobot_order_product_title(order: dict, plan: dict | None = None) -> str:
+    data = plan if isinstance(plan, dict) else order
+    return str(data.get("product_title") or data.get("gb") or data.get("title") or "—")
+
+
+async def notify_cryptobot_invoice_created(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
+    chat_id = get_payments_chat_id()
+    if not chat_id:
+        return
+    username = user_tag(user)
+    text = (
+        "🧾 <b>Создан CryptoBot invoice</b>\n\n"
+        f"Заказ: {html_escape((order or {}).get('number', '—'))}\n"
+        f"Клиент: {html_escape(username)} / {html_escape(str(user.id))}\n"
+        f"Товар: {html_escape(cryptobot_order_product_title(order or {}, plan))}\n\n"
+        f"Сумма заказа: {html_escape(format_rub(details.get('price_rub')))}\n"
+        f"CryptoBot: {html_escape(format_crypto_amount(details.get('cryptobot_amount')))} {html_escape(str(details.get('cryptobot_asset') or 'USDT'))}\n"
+        f"Курс: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
+        "Статус: ожидает оплату"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
+async def notify_cryptobot_invoice_paid(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
+    chat_id = get_payments_chat_id()
+    if not chat_id:
+        return
+    text = (
+        "✅ <b>CryptoBot оплата получена</b>\n\n"
+        f"Заказ: {html_escape((order or {}).get('number', '—'))}\n"
+        f"Клиент: {html_escape(user_tag(user))} / {html_escape(str(user.id))}\n"
+        f"Товар: {html_escape(cryptobot_order_product_title(order or {}, plan))}\n\n"
+        f"Сумма заказа: {html_escape(format_rub(details.get('price_rub')))}\n"
+        f"Оплачено: {html_escape(format_crypto_amount(details.get('cryptobot_amount')))} {html_escape(str(details.get('cryptobot_asset') or 'USDT'))}\n"
+        f"Курс расчёта: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
+        "Дальше: автовыдача / ручная выдача"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
 def parse_iso_datetime(value: str | None) -> datetime.datetime | None:
     if not value:
         return None
@@ -1184,6 +1281,9 @@ def card_payment_keyboard() -> InlineKeyboardMarkup:
 
 
 def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    if context.user_data.get("payment_provider") == "cryptobot":
+        details = context.user_data.get("cryptobot_payment_details")
+        return dict(details) if isinstance(details, dict) else None
     if context.user_data.get("payment_provider") != "card":
         return None
     lock = context.user_data.get("card_payment_lock")
@@ -4634,15 +4734,18 @@ async def crypto_get_me(token: str) -> dict | None:
         return None
 
 
-async def crypto_create_invoice(token: str, amount: float, description: str, payload: str) -> dict | None:
+async def crypto_create_invoice(token: str, amount: float, description: str, payload: str, asset: str = "USDT", price_rub: float | None = None) -> dict | None:
     """Создаёт инвойс. Возвращает result-объект или None при ошибке."""
+    asset = str(asset).upper()
+    if asset == "USDT" and price_rub is not None and float(amount) >= float(price_rub) / 2:
+        raise ValueError("Unsafe CryptoBot invoice amount: RUB amount passed as USDT")
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(
                 f"{CRYPTOBOT_API}/createInvoice",
                 headers={"Crypto-Pay-API-Token": token},
                 json={
-                    "asset":           "USDT",
+                    "asset":           asset,
                     "amount":          str(amount),
                     "description":     description,
                     "payload":         payload,
@@ -4660,8 +4763,7 @@ async def crypto_create_invoice(token: str, amount: float, description: str, pay
         return None
 
 
-async def crypto_check_invoice(token: str, invoice_id: int) -> str | None:
-    """Возвращает статус инвойса: 'active' | 'paid' | 'expired' | None."""
+async def crypto_get_invoice(token: str, invoice_id: int) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(
@@ -4671,10 +4773,16 @@ async def crypto_check_invoice(token: str, invoice_id: int) -> str | None:
             )
             data = r.json()
             items = data.get("result", {}).get("items", []) if data.get("ok") else []
-            return items[0]["status"] if items else None
+            return items[0] if items else None
     except Exception as e:
         logger.error("CryptoBot getInvoices error: %s", e)
         return None
+
+
+async def crypto_check_invoice(token: str, invoice_id: int) -> str | None:
+    """Возвращает статус инвойса: 'active' | 'paid' | 'expired' | None."""
+    invoice = await crypto_get_invoice(token, invoice_id)
+    return invoice.get("status") if invoice else None
 
 
 # ─── Баннеры ──────────────────────────────────────────────────────────────────
@@ -6981,11 +7089,19 @@ async def show_existing_checkout_payment(update: Update, context: ContextTypes.D
             [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{order['cryptobot_invoice_id']}")],
             [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
         ])
+        details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
+        if details.get("cryptobot_amount") and details.get("usd_rub_rate_used"):
+            text = cryptobot_client_payment_text(
+                details.get("price_rub") or order_amount_rub(order),
+                details.get("cryptobot_amount"),
+                details.get("cryptobot_asset") or "USDT",
+                details.get("usd_rub_rate_used"),
+            )
+        else:
+            text = "🤖 <b>Оплата через CryptoBot</b>\n\n" f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>"
         await edit_or_send(
             query, context,
-            "🤖 <b>Оплата через CryptoBot</b>\n\n"
-            f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
-            "Откройте уже созданный счёт, оплатите его и нажмите «Проверить оплату».",
+            text + "\n\nОткройте уже созданный счёт, оплатите его и нажмите «Проверить оплату».",
             InlineKeyboardMarkup(rows),
         )
         return WAITING_PAYMENT
@@ -7547,16 +7663,23 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         context.user_data["payment_method"] = payment_provider_label("cryptobot")
         context.user_data["payment_provider"] = "cryptobot"
-        amount = (apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else (telegram_payment_amount_rub(plan) if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else parse_price(plan.get("price", "0"))))
-        if amount <= 0:
+        price_rub = (apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else (telegram_payment_amount_rub(plan) if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else parse_price(plan.get("price", "0"))))
+        if price_rub <= 0:
             await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
             return WAITING_PAYMENT
+        invoice_calc = await cryptobot_invoice_amount_from_rub(price_rub, "USDT")
+        cryptobot_amount = invoice_calc["crypto_amount"]
+        cryptobot_asset = invoice_calc["asset"]
         description = (
             f"SLIK Apple ID {plan.get('product_title', '')}".strip()
             if plan.get("product_type") == "apple_id"
             else (f"SLIK Telegram {plan.get('product_title', '')}".strip() if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip())
         )
-        invoice = await crypto_create_invoice(token, amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}")
+        try:
+            invoice = await crypto_create_invoice(token, cryptobot_amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}", asset=cryptobot_asset, price_rub=price_rub)
+        except ValueError as e:
+            logger.error("CryptoBot invoice blocked by safety guard: %s", e)
+            invoice = None
         if not invoice:
             await query.message.reply_text(
                 "Не удалось создать счёт CryptoBot. Выберите оплату картой.",
@@ -7569,24 +7692,28 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         invoice_id = invoice.get("invoice_id")
         pay_url = invoice.get("pay_url") or invoice.get("bot_invoice_url") or invoice.get("mini_app_invoice_url")
-        update_checkout_order(
+        details = cryptobot_payment_details(invoice_calc, invoice)
+        context.user_data["cryptobot_payment_details"] = details
+        order = update_checkout_order(
             context.user_data.get("checkout_order_id"),
             payment_method=payment_provider_label("cryptobot"),
             payment_provider="cryptobot",
+            price_rub=price_rub,
+            payment_details=details,
             cryptobot_invoice_id=invoice_id,
             cryptobot_pay_url=pay_url,
         )
+        await notify_cryptobot_invoice_created(context, order, query.from_user, plan, details)
         rows = []
         if pay_url:
-            rows.append([InlineKeyboardButton("🤖 Оплатить в CryptoBot", url=pay_url)])
+            rows.append([InlineKeyboardButton(f"Оплатить {format_crypto_amount(cryptobot_amount)} {cryptobot_asset}", url=pay_url)])
         rows.extend([
             [InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment_{invoice_id}")],
             [InlineKeyboardButton("❌ Отменить заявку", callback_data="cancel_order")],
         ])
         await query.message.reply_text(
-            "🤖 <b>Оплата через CryptoBot</b>\n\n"
-            f"Сумма: <b>{html_escape(plan.get('price', '—'))}</b>\n"
-            "Откройте счёт, оплатите его и нажмите «Проверить оплату».",
+            cryptobot_client_payment_text(price_rub, cryptobot_amount, cryptobot_asset, invoice_calc["usd_rub_rate_used"])
+            + "\n\nОткройте счёт, оплатите его и нажмите «Проверить оплату».",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(rows),
         )
@@ -7645,14 +7772,35 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cfg   = load_config()
         token = cfg["payment"].get("cryptobot_token", "").strip()
         await query.answer("⏳ Проверяю оплату...", show_alert=False)
-        status = await crypto_check_invoice(token, invoice_id)
-        if status == "paid":
+        invoice = await crypto_get_invoice(token, invoice_id)
+        status = invoice.get("status") if invoice else None
+        order = find_order(context.user_data.get("checkout_order_id"))
+        details = (order or {}).get("payment_details") if isinstance((order or {}).get("payment_details"), dict) else context.user_data.get("cryptobot_payment_details", {})
+        expected_asset = str(details.get("cryptobot_asset") or "USDT").upper()
+        expected_amount = float(details.get("cryptobot_amount") or 0)
+        invoice_asset = str((invoice or {}).get("asset") or "").upper()
+        invoice_amount = float((invoice or {}).get("amount") or 0) if invoice else 0
+        invoice_matches = (
+            invoice is not None
+            and int((invoice or {}).get("invoice_id") or 0) == invoice_id
+            and invoice_asset == expected_asset
+            and abs(invoice_amount - expected_amount) < 0.000001
+        )
+        if status == "paid" and invoice_matches:
+            await notify_cryptobot_invoice_paid(context, order, query.from_user, plan, details)
             await query.message.reply_text(
                 "✅ <b>Оплата подтверждена!</b>\n\nОформляем вашу заявку.\n\nКак вас зовут?",
                 parse_mode="HTML",
                 reply_markup=cancel_keyboard(),
             )
             return WAITING_NAME
+        if status == "paid" and not invoice_matches:
+            await query.message.reply_text(
+                "⚠️ <b>Оплата требует проверки менеджером.</b>\n\nПараметры CryptoBot invoice не совпали с заказом.",
+                parse_mode="HTML",
+                reply_markup=cancel_keyboard(),
+            )
+            return WAITING_PAYMENT
         elif status == "expired":
             await query.message.reply_text(
                 "⏱ Счёт истёк. Пожалуйста, начните оформление заново.",
