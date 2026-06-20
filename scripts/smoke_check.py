@@ -641,7 +641,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record(
         "FazerCards connection check does not call purchase/order/create endpoints",
         "client.post" not in function_block(bot_text, "check_fazercards_connection")
-        and "/giftcards/order" not in bot_text
+        and "/giftcards/order" not in function_block(bot_text, "check_fazercards_connection")
         and "/topups/order" not in bot_text
         and "/gamekeys/order" not in bot_text
         and "/steam-gifts/order" not in bot_text
@@ -653,6 +653,44 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         "FazerCards diagnostics has no automatic code issuance",
         'auto_issue_enabled"] = True' not in bot_text
         and 'auto_issue_enabled": True' not in bot_text,
+    )
+    record(
+        "auto fulfillment default config is safe and complete",
+        '"auto_fulfillment": {' in bot_text
+        and '"enabled": False' in function_block(bot_text, "runtime_default_value") + bot_text[bot_text.find('"auto_fulfillment": {'):bot_text.find('"fazercards": {')]
+        and all(key in bot_text for key in ("apple_id_enabled", "telegram_stars_enabled", "telegram_premium_enabled", "esim_enabled", "max_retries", "retry_delay_seconds", "manual_fallback_enabled")),
+    )
+    record(
+        "auto fulfillment helpers and idempotency guard exist",
+        all(name in bot_text for name in ("async def auto_fulfill_order", "async def auto_fulfill_telegram_stars_order", "async def auto_fulfill_telegram_premium_order", "async def auto_fulfill_apple_id_order", "def order_already_fulfilled", "def mask_giftcard_code"))
+        and "supplier_order_id" in function_block(bot_text, "order_already_fulfilled")
+        and "auto_fulfilled_at" in function_block(bot_text, "order_already_fulfilled"),
+    )
+    record(
+        "FazerCards POST endpoints are limited to fulfillment helpers",
+        'FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT = "/telegram/stars/buy"' in bot_text
+        and 'FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT = "/telegram/premium/buy"' in bot_text
+        and 'FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT = "/giftcards/order"' in bot_text
+        and "FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT" in function_block(bot_text, "auto_fulfill_telegram_stars_order")
+        and "FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT" in function_block(bot_text, "auto_fulfill_telegram_premium_order")
+        and "FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT" in function_block(bot_text, "auto_fulfill_apple_id_order")
+        and "client.post" in function_block(bot_text, "fazercards_post_order")
+        and "client.post" not in function_block(bot_text, "refresh_supplier_prices_readonly")
+        and "client.post" not in function_block(bot_text, "check_fazercards_connection"),
+    )
+    record(
+        "auto fulfillment starts only after paid order save and falls back manually",
+        'await auto_fulfill_order(context, order, reason="payment_paid")' in bot_text
+        and "manual_issue_required" in function_block(bot_text, "auto_fulfill_order")
+        and "Заказ передан менеджеру на выдачу" in function_block(bot_text, "auto_fulfillment_client_text")
+        and "Автовыдача не удалась" in function_block(bot_text, "auto_fulfillment_admin_text"),
+    )
+    record(
+        "auto fulfillment customer texts are category-safe",
+        "Telegram Stars" in function_block(bot_text, "order_product_user_lines")
+        and "Telegram Premium" in function_block(bot_text, "order_product_user_lines")
+        and "Apple ID" in function_block(bot_text, "order_product_user_lines")
+        and "esim_auto_fulfillment_not_configured" in function_block(bot_text, "auto_fulfill_esim_order"),
     )
     record(
         "Apple ID products support FazerCards mapping fields",
@@ -733,7 +771,7 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     )
     record(
         "FazerCards mapping avoids purchase/order/create endpoints",
-        all(endpoint not in bot_text for endpoint in (
+        all(endpoint not in mapping_handlers_text for endpoint in (
             "/giftcards/order",
             "/topups/order",
             "/gamekeys/order",
@@ -1017,7 +1055,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("no client.post in FazerCards connection", "client.post" not in function_block(bot_text, "check_fazercards_connection"))
     record("FazerCards check uses Apple ID exact sync matching", "apple_id_exact_fazercards_match" in function_block(bot_text, "check_fazercards_connection") and "fetch_fazercards_giftcards_cards_readonly" in function_block(bot_text, "check_fazercards_connection"))
     record("admin supplier price refresh button exists", "🔄 Обновить цены поставщика" in bot_text and "admin_fazercards_refresh_prices" in bot_text)
-    record("no /giftcards/order", "/giftcards/order" not in bot_text)
+    record("/giftcards/order only in auto fulfillment helper", 'FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT = "/giftcards/order"' in bot_text and "FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT" in function_block(bot_text, "auto_fulfill_apple_id_order") and "/giftcards/order" not in function_block(bot_text, "sync_apple_id_fazercards_bulk"))
     record("eSIM logic present", '"product_type": "esim"' in bot_text and "create_checkout_order" in bot_text and "await get_usd_rub_rate()" in bot_text)
     record("cashback disabled by default", 'CASHBACK_ENABLED", "false"' in bot_text)
     record("global apple_id_pricing exists", '"apple_id_pricing"' in bot_text and "DEFAULT_APPLE_ID_PRICING" in bot_text)
@@ -1162,7 +1200,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("manual add amount prompt for US/TR asks USD", 'else:' in add_amount_input_block and "Введите цену продажи в USD" in add_amount_input_block and "Пример: <code>9.5</code>" in add_amount_input_block)
     record("manual add price saves price_rub only for RU", 'if region == "RU"' in add_price_input_block and '"price_rub": int(round(price))' in add_price_input_block and '"pricing_currency": "RUB"' in add_price_input_block and '"pricing_mode": "supplier_markup"' in add_price_input_block)
     record("manual add price saves price_usd for US/TR", 'else:' in add_price_input_block and '"price_usd": round(price, 2)' in add_price_input_block)
-    record("supplier sync uses only GET giftcards endpoints", "client.post" not in bulk_sync_block and "/giftcards/order" not in bot_text and "fetch_fazercards_products_readonly()  # GET /giftcards" in bulk_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bulk_sync_block)
+    record("supplier sync uses only GET giftcards endpoints", "client.post" not in bulk_sync_block and "/giftcards/order" not in bulk_sync_block and "fetch_fazercards_products_readonly()  # GET /giftcards" in bulk_sync_block and "fetch_fazercards_giftcards_cards_readonly(category_id)  # GET /giftcards/cards" in bulk_sync_block)
     record("sort_apple_id_products sorts by amount then title/id", "def sort_apple_id_products" in bot_text and "apple_id_sort_key" in sort_products_block and "amount" in function_block(bot_text, "apple_id_sort_key") and "title_or_id" in function_block(bot_text, "apple_id_sort_key"))
     record("apple_id_products_by_region returns sorted products", "sort_apple_id_products" in products_by_region_block)
     record("new and saved Apple ID products are sorted", "sort_apple_id_products" in save_products_block and "save_apple_id_products(catalog)" in add_pending_block)
@@ -1221,7 +1259,7 @@ def check_apple_id_rub_market_pricing(bot_text: str) -> None:
     record("Telegram read-only helpers and relative endpoint constants exist", "async def fetch_fazercards_telegram_stars_readonly" in bot_text and "async def fetch_fazercards_telegram_premium_readonly" in bot_text and 'FAZERCARDS_TELEGRAM_STARS_ENDPOINT = "/telegram/stars"' in bot_text and 'FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/telegram/premium"' in bot_text)
     record("Telegram sync uses official endpoints as primary path", "fetch_fazercards_telegram_stars_readonly()" in telegram_sync_block and "fetch_fazercards_telegram_premium_readonly()" in telegram_sync_block and ordered_tokens(telegram_sync_block, "fetch_fazercards_telegram_stars_readonly()", "_sync_telegram_giftcards_fallback"))
     record("Telegram endpoint constants do not duplicate API prefix", "/api/v2/telegram/stars" not in bot_text and "/api/v2/telegram/premium" not in bot_text)
-    record("Telegram sync avoids buy/order POST endpoints", all(x not in bot_text for x in ("/telegram/stars/buy", "/telegram/premium/buy", "/giftcards/order")) and "client.post" not in telegram_sync_block)
+    record("Telegram sync avoids buy/order POST endpoints", all(x not in telegram_sync_block for x in ("/telegram/stars/buy", "/telegram/premium/buy", "/giftcards/order")) and "client.post" not in telegram_sync_block)
     record("Telegram giftcards fallback is not primary", "_sync_telegram_giftcards_fallback" in bot_text and 'report["fallback_used"] = True' in telegram_sync_block)
     record("Telegram admin main back returns to settings", 'callback_data="admin_payment_sections"' in telegram_keyboard_block and 'callback_data="admin_business"' not in telegram_keyboard_block)
     record("Telegram inner admin screens return to Telegram services", bot_text.count('callback_data="admin_telegram_services"') >= 2 and "admin_telegram_stars_catalog" in bot_text and "admin_telegram_premium_catalog" in bot_text)

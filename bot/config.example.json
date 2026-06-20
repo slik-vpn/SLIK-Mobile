@@ -39,5 +39,15 @@
     "last_report": {},
     "last_notice_at": "",
     "last_error_notice_at": ""
+  },
+  "auto_fulfillment": {
+    "enabled": false,
+    "apple_id_enabled": false,
+    "telegram_stars_enabled": false,
+    "telegram_premium_enabled": false,
+    "esim_enabled": false,
+    "max_retries": 2,
+    "retry_delay_seconds": 30,
+    "manual_fallback_enabled": true
   }
 }
