@@ -693,6 +693,18 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
         and "Apple ID" in function_block(bot_text, "order_product_user_lines")
         and "esim_auto_fulfillment_not_configured" in function_block(bot_text, "auto_fulfill_esim_order"),
     )
+    apple_fulfill_block = function_block(bot_text, "auto_fulfill_apple_id_order")
+    maybe_fulfill_block = function_block(bot_text, "maybe_auto_fulfill_paid_order")
+    retry_branch_block = callback_branch_block(bot_text, 'elif data.startswith("order_auto_retry:")')
+    order_card_text_block = function_block(bot_text, "build_order_card_text")
+    client_delivery_block = function_block(bot_text, "auto_fulfillment_client_text")
+    admin_delivery_block = function_block(bot_text, "auto_fulfillment_admin_text")
+    record("Apple ID paid-only auto fulfillment is enforced", 'if order_payment_status(order) != "paid"' in maybe_fulfill_block and 'await maybe_auto_fulfill_paid_order(context, order, reason="payment_paid")' in bot_text and 'reason="manual_payment_confirmed"' in bot_text and "auto_fulfill_apple_id_order(" not in function_block(bot_text, "choose_payment") and "auto_fulfill_apple_id_order(" not in function_block(bot_text, "get_telegram"))
+    record("Apple ID supplier POST is isolated to fulfillment helper", "FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT" in apple_fulfill_block and "fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT" in apple_fulfill_block and "/giftcards/order" not in function_block(bot_text, "sync_apple_id_fazercards_bulk") and "client.post" not in function_block(bot_text, "check_fazercards_connection") and "client.post" not in function_block(bot_text, "refresh_supplier_prices_readonly"))
+    record("Apple ID double issue protection covers code supplier id and retry", "giftcard_code" in function_block(bot_text, "order_already_fulfilled") and "supplier_order_id" in function_block(bot_text, "order_already_fulfilled") and "auto_fulfilled_at" in function_block(bot_text, "order_already_fulfilled") and "order_already_fulfilled(order)" in apple_fulfill_block and "order_already_fulfilled(order)" in retry_branch_block and 'supplier_order_id=""' not in retry_branch_block)
+    record("Apple ID gift card privacy is enforced in admin chats and CRM", "def mask_giftcard_code" in bot_text and "masked_giftcard_code" in order_card_text_block and "mask_giftcard_code" in admin_delivery_block and "giftcard_code" not in function_block(bot_text, "notify_payments_chat") and "giftcard_code" not in function_block(bot_text, "format_payment_event_text"))
+    record("Apple ID client delivery and manual fallback texts exist", "✅ Заказ выдан" in client_delivery_block and "Ваш код" in client_delivery_block and "Redeem Gift Card or Code" in client_delivery_block and "Заказ передан менеджеру на выдачу" in client_delivery_block and "скоро отправим код" in client_delivery_block)
+    record("Apple ID fulfillment statuses are saved", '"fulfillment_status": "issued"' in maybe_fulfill_block and 'status=("paid_waiting_manual_issue" if status == "manual_required" else status)' in maybe_fulfill_block and "manual_required" in maybe_fulfill_block)
     record(
         "Apple ID products support FazerCards mapping fields",
         all(field in function_block(bot_text, "normalize_apple_id_product") for field in (

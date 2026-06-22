@@ -2839,15 +2839,22 @@ def save_auto_fulfillment_settings(**fields) -> dict:
 
 
 def order_already_fulfilled(order: dict) -> bool:
-    return order_fulfillment_status(order) in {"issued", "auto_issued"} or bool(order.get("supplier_order_id")) or bool(order.get("giftcard_code")) or bool(order.get("auto_fulfilled_at"))
+    return (
+        order_fulfillment_status(order) in {"issued", "auto_issued"}
+        or bool(order.get("supplier_order_id"))
+        or bool(order.get("giftcard_code"))
+        or bool(order.get("auto_fulfilled_at"))
+    )
 
 
 def mask_giftcard_code(value) -> str:
-    text = str(value or "")
+    text = str(value or "").strip()
     compact = "".join(ch for ch in text if ch.isalnum())
-    if len(compact) <= 4:
-        return "****" if compact else ""
-    return f"****-****-{compact[-4:]}"
+    if not compact:
+        return ""
+    if len(compact) <= 8:
+        return "****"
+    return f"{compact[:4]}-****-****-{compact[-4:]}"
 
 
 def sanitized_supplier_response(payload):
@@ -2953,13 +2960,24 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
 
 
 async def auto_fulfill_apple_id_order(order: dict) -> dict:
+    if order_category_key(order) != "apple_id" and str(order.get("product_type") or "") != "apple_id":
+        return {"ok": False, "error": "not_apple_id_order", "manual_fallback": True}
+    if order_already_fulfilled(order):
+        return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
+    category_id = order.get("fazercards_category_id")
     card_id = order.get("fazercards_card_id") or order.get("fazercards_product_id")
-    if not card_id or not order.get("amount") or not (order.get("region") or order.get("country")):
+    amount = order.get("nominal") or order.get("amount")
+    region = order.get("region") or order.get("country")
+    if not category_id or not card_id or not amount or not region:
         return {"ok": False, "error": "apple_id_supplier_data_missing", "manual_fallback": True}
-    data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, {"card_id": card_id, "quantity": 1})
+    payload = {"category_id": str(category_id), "card_id": str(card_id), "quantity": 1}
+    data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, payload)
     fields = giftcard_fields_from_response(data)
+    supplier_order_id = supplier_order_id_from_response(data)
     ok = bool(fields.get("giftcard_code"))
-    return {"ok": ok, "supplier_order_id": supplier_order_id_from_response(data), "supplier_response": sanitized_supplier_response(data), **fields, "error": "giftcard_code_missing" if not ok else "", "manual_fallback": not ok}
+    if not ok:
+        return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), **fields, "error": "giftcard_code_missing", "manual_fallback": True}
+    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), **fields}
 
 
 async def auto_fulfill_esim_order(order: dict) -> dict:
@@ -2968,16 +2986,32 @@ async def auto_fulfill_esim_order(order: dict) -> dict:
 
 def auto_fulfillment_client_text(order: dict, ok: bool) -> str:
     if not ok:
-        return f"✅ Оплата по заказу {order_number_plain(order)} получена.\n\nЗаказ передан менеджеру на выдачу.\nОбычно это занимает несколько минут."
+        return "✅ Оплата подтверждена.\n⏳ Заказ передан менеджеру на выдачу.\nМы скоро отправим код."
     lines = order_product_user_lines(order)
     category = order_category_key(order)
+    if category == "apple_id" and order.get("giftcard_code"):
+        region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
+        nominal = order.get("nominal") or order.get("amount") or order_display_amount(order)
+        extra = []
+        if order.get("giftcard_pin"):
+            extra.append(f"PIN: <code>{html_escape(str(order.get('giftcard_pin')))}</code>")
+        if order.get("giftcard_link"):
+            extra.append(f"Ссылка: {html_escape(str(order.get('giftcard_link')))}")
+        return (
+            "✅ Заказ выдан\n\n"
+            "🍎 Apple Gift Card\n"
+            f"Регион: {html_escape(str(region))}\n"
+            f"Номинал: {html_escape(str(nominal))}\n\n"
+            "Ваш код:\n"
+            f"<code>{html_escape(str(order.get('giftcard_code')))}</code>\n"
+            + (("\n" + "\n".join(extra) + "\n") if extra else "")
+            + "\nИнструкция:\n1. Откройте App Store.\n2. Нажмите на профиль.\n3. Выберите “Redeem Gift Card or Code”.\n4. Введите код."
+        )
     text = f"✅ Ваш заказ {order_number_plain(order)} выдан автоматически.\n\n" + "\n".join(lines)
     if category == "telegram_stars":
         return text + "\n\nЕсли Stars не поступили в течение нескольких минут, напишите менеджеру."
     if category == "telegram_premium":
         return text + "\n\nЕсли Premium не активировался, напишите менеджеру."
-    if category == "apple_id" and order.get("giftcard_code"):
-        return text + f"\n\nКод:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>\n\nСохраните код до активации."
     return text
 
 
@@ -2985,9 +3019,11 @@ def auto_fulfillment_admin_text(order: dict, report: dict) -> str:
     product = order.get("product_title") or order_category_label(order)
     recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
     if report.get("ok"):
+        if order_category_key(order) == "apple_id":
+            return ("✅ <b>Apple ID код выдан</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
         return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
-    return ("⚠️ <b>Автовыдача не удалась</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
-
+    title = "⚠️ <b>Автовыдача Apple ID не удалась, нужна ручная выдача</b>" if order_category_key(order) == "apple_id" else "⚠️ <b>Автовыдача не удалась</b>"
+    return (title + "\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
 
 async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
     try:
@@ -3001,6 +3037,22 @@ async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
             await context.bot.send_message(chat_id=chat_id, text=auto_fulfillment_admin_text(order, report), parse_mode="HTML")
         except Exception as exc:
             logger.warning("Auto fulfillment admin notification failed for order %s: %s", order.get("id"), exc)
+    if not report.get("ok") and order_category_key(order) == "apple_id":
+        tech_chat_id = get_tech_alerts_chat_id()
+        if tech_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=tech_chat_id,
+                    text=(
+                        "FazerCards Apple ID fulfillment failed\n"
+                        f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
+                        f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
+                        f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as exc:
+                logger.warning("Auto fulfillment tech notification failed for order %s: %s", order.get("id"), exc)
 
 
 async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "payment_paid") -> dict:
@@ -3019,6 +3071,11 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
         return fallback
     helpers = {"apple_id": auto_fulfill_apple_id_order, "telegram_stars": auto_fulfill_telegram_stars_order, "telegram_premium": auto_fulfill_telegram_premium_order, "esim": auto_fulfill_esim_order}
     update_order_fields(order.get("id"), fulfillment_status="auto_processing", auto_fulfillment=True)
+    if category == "apple_id" and get_orders_chat_id():
+        try:
+            await context.bot.send_message(chat_id=get_orders_chat_id(), text=f"📦 Автовыдача Apple ID запущена\nЗаказ: {html_escape(order_number_plain(order))}", parse_mode="HTML")
+        except Exception as exc:
+            logger.warning("Auto fulfillment start notification failed for order %s: %s", order.get("id"), exc)
     attempts = max(1, int(settings.get("max_retries", 2)) + 1)
     delay = int(settings.get("retry_delay_seconds", 30))
     last_error = ""
@@ -5459,8 +5516,10 @@ def build_order_card_text(order: dict) -> str:
     amount = order_display_amount(order)
     rub_note = "" if order_amount_rub(order) > 0 else "RUB-сумма: <b>не зафиксирована</b>\n"
     manager_comment = order.get("manager_comment") or order.get("admin_comment") or "—"
-    issued_at = order.get("issued_at") or order.get("fulfilled_at") or "—"
+    issued_at = order.get("issued_at") or order.get("fulfilled_at") or order.get("auto_fulfilled_at") or "—"
     paid_at = order.get("paid_at") or order.get("payment_paid_at") or "—"
+    auto_issue_label = "успешна" if order.get("auto_fulfillment") and order_fulfillment_status(order) == "issued" else str(order.get("fulfillment_status") or "disabled")
+    masked_giftcard_code = mask_giftcard_code(order.get("giftcard_code")) if category == "apple_id" else ""
 
     product_lines = [
         f"Категория: <b>{html_escape(order_category_label(order))}</b>",
@@ -5497,10 +5556,11 @@ def build_order_card_text(order: dict) -> str:
         f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
         f"Тип выдачи: <b>{html_escape('автоматическая' if order.get('auto_fulfillment') and order_fulfillment_status(order) == 'issued' else 'ручная / fallback')}</b>\n"
         "\n<b>Автовыдача</b>\n"
-        f"Статус: <b>{html_escape(str(order.get('fulfillment_status') or 'disabled'))}</b>\n"
+        f"Статус: <b>{html_escape(auto_issue_label)}</b>\n"
         f"Поставщик: <b>{html_escape(str(order.get('supplier') or '—'))}</b>\n"
         f"Supplier order ID: <code>{html_escape(str(order.get('supplier_order_id') or '—'))}</code>\n"
-        f"Попыток: <b>{html_escape(str(order.get('auto_fulfillment_attempts') or 0))}</b>\n"
+        + (f"Код: <code>{html_escape(masked_giftcard_code)}</code>\n" if masked_giftcard_code else "")
+        + f"Попыток: <b>{html_escape(str(order.get('auto_fulfillment_attempts') or 0))}</b>\n"
         f"Последняя ошибка: <b>{html_escape(str(order.get('auto_fulfillment_last_error') or '—'))}</b>\n\n"
         f"Комментарий менеджера: <b>{html_escape(str(manager_comment))}</b>\n\n"
         "<b>Даты</b>\n"
@@ -5516,8 +5576,10 @@ def auto_fulfillment_supported_product(order: dict) -> bool:
 def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
     order = find_order(order_id) or {}
     rows = []
-    if order_payment_status(order) == "paid" and order_fulfillment_status(order) in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order):
+    if order_payment_status(order) == "paid" and order_fulfillment_status(order) in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order) and not order_already_fulfilled(order):
         rows.append([InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
+    if order_category_key(order) == "apple_id" and order.get("giftcard_code"):
+        rows.append([InlineKeyboardButton("👁 Показать код", callback_data=f"order_show_code:{order_id}")])
     rows.extend([
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
         [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
@@ -10378,14 +10440,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not order:
             await query.answer("Заказ не найден.", show_alert=True)
             return
-        if order_payment_status(order) != "paid" or order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"} or not auto_fulfillment_supported_product(order):
+        if order_payment_status(order) != "paid" or order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"} or not auto_fulfillment_supported_product(order) or order_already_fulfilled(order):
             await query.answer("Повторная автовыдача недоступна для этого заказа.", show_alert=True)
             return
-        update_order_fields(order_id, supplier_order_id="", auto_fulfilled_at="", fulfillment_status="pending")
+        update_order_fields(order_id, auto_fulfilled_at="", fulfillment_status="pending")
         await query.answer("Запускаю автовыдачу...")
         fresh = find_order(order_id) or order
         await maybe_auto_fulfill_paid_order(context, fresh, reason="manual_retry")
         await edit_or_send(query, context, build_order_card_text(find_order(order_id) or fresh), order_card_keyboard(order_id))
+    elif data.startswith("order_show_code:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = find_order(order_id)
+        if not order or order_category_key(order) != "apple_id" or not order.get("giftcard_code"):
+            await query.answer("Код недоступен.", show_alert=True)
+            return
+        await query.answer()
+        await context.bot.send_message(chat_id=query.from_user.id, text=(f"👁 Код Apple ID для {html_escape(order_number_plain(order))}:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>"), parse_mode="HTML")
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
     elif data.startswith("orders_list:"):
