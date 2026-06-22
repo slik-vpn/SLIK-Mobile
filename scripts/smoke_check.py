@@ -680,8 +680,9 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     )
     record(
         "auto fulfillment starts only after paid order save and falls back manually",
-        'await auto_fulfill_order(context, order, reason="payment_paid")' in bot_text
-        and "manual_issue_required" in function_block(bot_text, "auto_fulfill_order")
+        'await maybe_auto_fulfill_paid_order(context, order, reason="payment_paid")' in bot_text
+        and "manual_required" in function_block(bot_text, "maybe_auto_fulfill_paid_order")
+        and 'if order_payment_status(order) != "paid"' in function_block(bot_text, "maybe_auto_fulfill_paid_order")
         and "Заказ передан менеджеру на выдачу" in function_block(bot_text, "auto_fulfillment_client_text")
         and "Автовыдача не удалась" in function_block(bot_text, "auto_fulfillment_admin_text"),
     )
