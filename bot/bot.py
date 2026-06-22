@@ -1878,6 +1878,8 @@ def create_checkout_order(user, plan_key: str, plan: dict) -> dict:
         "user_id": user.id,
         "status": "waiting_payment",
         "checkout_created_at": datetime.datetime.now(tz=TZ).isoformat(timespec="seconds"),
+        "payment_status": "waiting_payment",
+        "fulfillment_status": "pending",
         "abandoned_reminder_sent": False,
     })
 
@@ -2837,7 +2839,7 @@ def save_auto_fulfillment_settings(**fields) -> dict:
 
 
 def order_already_fulfilled(order: dict) -> bool:
-    return order_fulfillment_status(order) in {"auto_issued", "issued"} or bool(order.get("supplier_order_id")) or bool(order.get("auto_fulfilled_at"))
+    return order_fulfillment_status(order) in {"issued", "auto_issued"} or bool(order.get("supplier_order_id")) or bool(order.get("giftcard_code")) or bool(order.get("auto_fulfilled_at"))
 
 
 def mask_giftcard_code(value) -> str:
@@ -3001,7 +3003,7 @@ async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
             logger.warning("Auto fulfillment admin notification failed for order %s: %s", order.get("id"), exc)
 
 
-async def auto_fulfill_order(context, order: dict, reason: str = "payment_paid") -> dict:
+async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "payment_paid") -> dict:
     category = order_category_key(order)
     report = {"ok": False, "order_id": str(order.get("number") or order.get("id") or ""), "category": category, "status": order_fulfillment_status(order)}
     if order_payment_status(order) != "paid":
@@ -3011,12 +3013,12 @@ async def auto_fulfill_order(context, order: dict, reason: str = "payment_paid")
     settings = get_auto_fulfillment_settings()
     toggle = {"apple_id": "apple_id_enabled", "telegram_stars": "telegram_stars_enabled", "telegram_premium": "telegram_premium_enabled", "esim": "esim_enabled"}.get(category)
     if not settings.get("enabled") or not toggle or not settings.get(toggle):
-        updated = update_order_fields(order.get("id"), fulfillment_status="manual_issue_required", auto_fulfillment=False, auto_fulfillment_last_error="auto_fulfillment_disabled", auto_fulfillment_reason=reason) or order
-        fallback = {**report, "status": "manual_issue_required", "error": "auto_fulfillment_disabled", "manual_fallback": True}
+        updated = update_order_fields(order.get("id"), fulfillment_status="manual_required", auto_fulfillment=False, auto_fulfillment_last_error="auto_fulfillment_disabled", auto_fulfillment_reason=reason) or order
+        fallback = {**report, "status": "manual_required", "error": "auto_fulfillment_disabled", "manual_fallback": True}
         await notify_auto_fulfillment(context, updated, fallback)
         return fallback
     helpers = {"apple_id": auto_fulfill_apple_id_order, "telegram_stars": auto_fulfill_telegram_stars_order, "telegram_premium": auto_fulfill_telegram_premium_order, "esim": auto_fulfill_esim_order}
-    update_order_fields(order.get("id"), fulfillment_status="auto_issue_processing", auto_fulfillment=True)
+    update_order_fields(order.get("id"), fulfillment_status="auto_processing", auto_fulfillment=True)
     attempts = max(1, int(settings.get("max_retries", 2)) + 1)
     delay = int(settings.get("retry_delay_seconds", 30))
     last_error = ""
@@ -3032,19 +3034,22 @@ async def auto_fulfill_order(context, order: dict, reason: str = "payment_paid")
         if attempt < attempts:
             await asyncio.sleep(delay)
     if result.get("ok"):
-        fields = {"supplier": "fazercards", "supplier_order_id": result.get("supplier_order_id", ""), "supplier_response": result.get("supplier_response", {}), "auto_fulfillment": True, "auto_fulfilled_at": now_str(), "fulfillment_status": "auto_issued", "status": "auto_issued", "auto_fulfillment_attempts": attempt, "auto_fulfillment_last_error": ""}
+        fields = {"supplier": "fazercards", "supplier_order_id": result.get("supplier_order_id", ""), "supplier_response": result.get("supplier_response", {}), "auto_fulfillment": True, "auto_fulfilled_at": now_str(), "fulfillment_status": "issued", "status": "issued", "auto_fulfillment_attempts": attempt, "auto_fulfillment_last_error": ""}
         for key in ("giftcard_code", "giftcard_pin", "giftcard_link"):
             if result.get(key):
                 fields[key] = result[key]
         updated = update_order_fields(order.get("id"), **fields) or {**order, **fields}
-        final = {**report, "ok": True, "status": "auto_issued", "supplier_order_id": fields["supplier_order_id"], "message": "issued"}
+        final = {**report, "ok": True, "status": "issued", "supplier_order_id": fields["supplier_order_id"], "message": "issued"}
         await notify_auto_fulfillment(context, updated, final)
         return final
-    status = "manual_issue_required" if settings.get("manual_fallback_enabled", True) else "failed"
-    updated = update_order_fields(order.get("id"), fulfillment_status=status, status=status, auto_fulfillment=True, auto_fulfillment_attempts=attempts, auto_fulfillment_last_error=last_error or result.get("error") or "supplier_error") or order
-    final = {**report, "status": status, "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_issue_required"}
+    status = "manual_required" if settings.get("manual_fallback_enabled", True) else "failed"
+    updated = update_order_fields(order.get("id"), fulfillment_status=status, status=("paid_waiting_manual_issue" if status == "manual_required" else status), auto_fulfillment=True, auto_fulfillment_attempts=attempts, auto_fulfillment_last_error=last_error or result.get("error") or "supplier_error") or order
+    final = {**report, "status": status, "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_required"}
     await notify_auto_fulfillment(context, updated, final)
     return final
+
+async def auto_fulfill_order(context, order: dict, reason: str = "payment_paid") -> dict:
+    return await maybe_auto_fulfill_paid_order(context, order, reason)
 
 def telegram_raw_diagnostics(raw, status_code: int | None = None) -> dict:
     diag = {
@@ -5132,7 +5137,7 @@ ORDER_LIST_FILTERS = {
     "esim": {"category:esim"},
     "pending_payment": {"payment:pending_payment"},
     "paid": {"payment:paid"},
-    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_issue_required", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new"},
+    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new"},
     "issued": {"fulfillment:issued", "fulfillment:auto_issued"},
     "cancelled": {"payment:cancelled", "fulfillment:cancelled"},
     "new": {"fulfillment:new"},
@@ -5203,12 +5208,15 @@ FULFILLMENT_STATUS_LABELS = {
     "new": "🆕 новый",
     "waiting_payment": "⏳ ожидает оплаты",
     "paid": "✅ оплачен",
+    "pending": "⏳ ожидает выдачи",
+    "auto_processing": "🤖 автовыдача выполняется",
+    "issued": "✅ выдан",
+    "manual_required": "⚠️ требуется ручная выдача",
     "auto_issue_pending": "🤖 ожидает автовыдачи",
     "auto_issue_processing": "🤖 автовыдача выполняется",
     "auto_issued": "✅ автовыдан",
     "manual_issue_required": "⚠️ требуется ручная выдача",
     "waiting_manual_issue": "⏳ ожидает ручной выдачи",
-    "issued": "✅ выдан вручную",
     "failed": "❌ ошибка выдачи",
     "cancelled": "❌ отменён",
 }
@@ -5303,13 +5311,15 @@ def order_fulfillment_status(order: dict) -> str:
         return explicit
     status = normalize_order_status(order.get("status"))
     if status in {"auto_issued", "issued", "done"}:
-        return "auto_issued" if status == "auto_issued" else "issued"
+        return "issued"
     if status == "cancelled":
         return "cancelled"
     if status in {"failed", "payment_failed"}:
         return "failed"
-    if status in {"manual_issue_required", "auto_issue_pending", "auto_issue_processing", "paid"}:
+    if status in {"manual_required", "pending", "auto_processing", "paid"}:
         return status
+    if status in {"manual_issue_required", "auto_issue_pending", "auto_issue_processing"}:
+        return {"manual_issue_required": "manual_required", "auto_issue_pending": "pending", "auto_issue_processing": "auto_processing"}[status]
     if status in {"in_progress", "processing"}:
         return "waiting_manual_issue"
     return "waiting_manual_issue" if order_payment_status(order) == "paid" else "new"
@@ -5485,7 +5495,7 @@ def build_order_card_text(order: dict) -> str:
         f"Метод: <b>{html_escape(str(payment_method))}</b>\n\n"
         "<b>Выполнение</b>\n"
         f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
-        f"Тип выдачи: <b>{html_escape('автоматическая' if order_fulfillment_status(order) == 'auto_issued' else 'ручная / fallback')}</b>\n"
+        f"Тип выдачи: <b>{html_escape('автоматическая' if order.get('auto_fulfillment') and order_fulfillment_status(order) == 'issued' else 'ручная / fallback')}</b>\n"
         "\n<b>Автовыдача</b>\n"
         f"Статус: <b>{html_escape(str(order.get('fulfillment_status') or 'disabled'))}</b>\n"
         f"Поставщик: <b>{html_escape(str(order.get('supplier') or '—'))}</b>\n"
@@ -5499,14 +5509,22 @@ def build_order_card_text(order: dict) -> str:
         f"Выдан: <b>{html_escape(str(issued_at))}</b>"
     )
 
+def auto_fulfillment_supported_product(order: dict) -> bool:
+    return order_category_key(order) in {"apple_id", "telegram_stars", "telegram_premium"}
+
+
 def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")],
+    order = find_order(order_id) or {}
+    rows = []
+    if order_payment_status(order) == "paid" and order_fulfillment_status(order) in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order):
+        rows.append([InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
+    rows.extend([
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
         [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
         [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_orders_stats_text() -> str:
@@ -7960,9 +7978,11 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             and abs(invoice_amount - expected_amount) < 0.000001
         )
         if status == "paid" and invoice_matches:
+            order = update_checkout_order(context.user_data.get("checkout_order_id"), payment_status="paid", paid_at=now_str(), payment_paid_at=now_str(), fulfillment_status="pending") or order
+            context.user_data["payment_paid_confirmed"] = True
             await notify_payment_event_once(context, "invoice_paid", "invoice_paid", order, query.from_user, plan, details)
             await query.message.reply_text(
-                "✅ <b>Оплата подтверждена!</b>\n\nОформляем вашу заявку.\n\nКак вас зовут?",
+                "✅ <b>Оплата подтверждена.</b>\n⏳ Запускаем выдачу.\n\nОформляем вашу заявку.\n\nКак вас зовут?",
                 parse_mode="HTML",
                 reply_markup=cancel_keyboard(),
             )
@@ -8092,6 +8112,8 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "name":           name,
         "tg_handle":      tg_handle,
         "user_id":        user.id,
+        "payment_status": "paid" if context.user_data.get("payment_paid_confirmed") else "waiting_payment",
+        "fulfillment_status": "pending",
     }
     if plan.get("product_type") == "apple_id":
         order_payload.update({
@@ -8109,7 +8131,6 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "supplier_markup_percent": plan.get("supplier_markup_percent"),
             "estimated_margin_rub": plan.get("estimated_margin_rub"),
             "pricing_mode": "supplier_markup",
-            "payment_status": "paid",
             "fazercards_category_id": plan.get("fazercards_category_id"),
             "fazercards_card_id": plan.get("fazercards_card_id"),
             "fazercards_product_id": plan.get("fazercards_product_id"),
@@ -8123,7 +8144,6 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "duration_months": plan.get("duration_months"),
             "currency": plan.get("currency"),
             "telegram_recipient_username": context.user_data.get("telegram_recipient_username"),
-            "payment_status": "paid",
             "price_rub": plan.get("price_rub"),
             "supplier_price_usd": plan.get("supplier_price_usd"),
             "usd_rub_rate_used": plan.get("usd_rub_rate_used"),
@@ -8185,7 +8205,7 @@ async def get_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await notify_cashback_awarded(context, user.id, order, cashback_amount, profile)
     await notify_admin(context, order)
     if order_payment_status(order) == "paid":
-        await auto_fulfill_order(context, order, reason="payment_paid")
+        await maybe_auto_fulfill_paid_order(context, order, reason="payment_paid")
     if not has_admin_access(user):
         if plan.get("product_type") == "apple_id":
             details = f"Товар: {plan.get('product_title')}\nЦена: {plan['price']}\nОплата: {payment}"
@@ -8385,8 +8405,10 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Заявка не найдена.", show_alert=True)
         return
 
-    if normalize_order_status(status) == "in_progress" and order_payment_status(order) == "paid" and str(order.get("payment_provider") or "").lower() == "card":
+    if normalize_order_status(status) == "in_progress" and str(order.get("payment_provider") or "").lower() == "card":
+        order = update_order_fields(order_id, payment_status="paid", paid_at=order.get("paid_at") or now_str(), fulfillment_status=order.get("fulfillment_status") or "pending") or order
         await notify_payment_event_once(context, "manual_confirm", "manual_payment_confirmed", order, query.from_user, order, order.get("payment_details"), actor=query.from_user)
+        await maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")
     if normalize_order_status(status) == "cancelled" and previous_order and order_payment_status(previous_order) == "paid":
         await notify_payment_event_once(context, "payment_cancelled_after_paid", "refund_required", order, query.from_user, order, order.get("payment_details"), actor=query.from_user, error="отмена оплаченного заказа")
     await query.answer(f"Статус: {order_status_label(order.get('status'))}")
@@ -10356,10 +10378,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not order:
             await query.answer("Заказ не найден.", show_alert=True)
             return
-        update_order_fields(order_id, supplier_order_id="", auto_fulfilled_at="", fulfillment_status="auto_issue_pending")
+        if order_payment_status(order) != "paid" or order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"} or not auto_fulfillment_supported_product(order):
+            await query.answer("Повторная автовыдача недоступна для этого заказа.", show_alert=True)
+            return
+        update_order_fields(order_id, supplier_order_id="", auto_fulfilled_at="", fulfillment_status="pending")
         await query.answer("Запускаю автовыдачу...")
         fresh = find_order(order_id) or order
-        await auto_fulfill_order(context, fresh, reason="manual_retry")
+        await maybe_auto_fulfill_paid_order(context, fresh, reason="manual_retry")
         await edit_or_send(query, context, build_order_card_text(find_order(order_id) or fresh), order_card_keyboard(order_id))
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
