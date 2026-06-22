@@ -2968,15 +2968,35 @@ async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
 
 
 async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
-    username = str(order.get("telegram_recipient_username") or order.get("recipient") or "").strip()
-    months = int(safe_float(order.get("duration_months"), 0))
-    if not username or months <= 0:
-        return {"ok": False, "error": "telegram_premium_supplier_data_missing", "manual_fallback": True}
-    payload = {"username": username.lstrip("@"), "months": months}
-    if order.get("fazercards_card_id"):
-        payload["card_id"] = order.get("fazercards_card_id")
+    if order_category_key(order) != "telegram_premium" and str(order.get("product_type") or "") != "telegram_premium":
+        return {"ok": False, "error": "not_telegram_premium_order", "manual_fallback": True}
+    if order_payment_status(order) != "paid":
+        return {"ok": False, "error": "payment_not_paid", "manual_fallback": True}
+    if order_already_fulfilled(order):
+        return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
+
+    username = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+    months = int(safe_float(order.get("duration_months") or order.get("months") or order.get("quantity"), 0))
+    product_id = order.get("fazercards_product_id") or order.get("fazercards_telegram_product_id") or order.get("fazercards_card_id")
+    category_id = order.get("fazercards_category_id")
+    card_id = order.get("fazercards_card_id") or product_id
+    if not username:
+        return {"ok": False, "error": "telegram_premium_recipient_invalid", "manual_fallback": True}
+    if months <= 0:
+        return {"ok": False, "error": "telegram_premium_duration_missing", "manual_fallback": True}
+    if not product_id and not card_id:
+        return {"ok": False, "error": "telegram_premium_supplier_product_missing", "manual_fallback": True}
+
+    payload = {"product_id": str(product_id or card_id), "duration_months": months, "months": months, "recipient": username, "username": username}
+    if category_id:
+        payload["category_id"] = str(category_id)
+    if card_id:
+        payload["card_id"] = str(card_id)
     data = await fazercards_post_order(FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT, payload)
-    return {"ok": True, "supplier_order_id": supplier_order_id_from_response(data), "supplier_response": sanitized_supplier_response(data)}
+    supplier_order_id = supplier_order_id_from_response(data)
+    if not supplier_order_id and not data:
+        return {"ok": False, "supplier": "fazercards", "error": "supplier_empty_response", "manual_fallback": True}
+    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), "message": "issued"}
 
 
 async def auto_fulfill_apple_id_order(order: dict) -> dict:
@@ -3009,6 +3029,8 @@ def auto_fulfillment_client_text(order: dict, ok: bool) -> str:
     if not ok:
         if category == "telegram_stars":
             return "✅ Оплата подтверждена.\n⏳ Заказ передан менеджеру на выдачу.\nМы скоро отправим Stars."
+        if category == "telegram_premium":
+            return "✅ Оплата подтверждена.\n⏳ Заказ передан менеджеру на выдачу.\nМы скоро оформим Premium."
         return "✅ Оплата подтверждена.\n⏳ Заказ передан менеджеру на выдачу.\nМы скоро отправим код."
     lines = order_product_user_lines(order)
     if category == "apple_id" and order.get("giftcard_code"):
@@ -3040,9 +3062,18 @@ def auto_fulfillment_client_text(order: dict, ok: bool) -> str:
             "Stars отправлены на указанный аккаунт.\n"
             "Если они не появились сразу, подождите несколько минут."
         )
-    text = f"✅ Ваш заказ {order_number_plain(order)} выдан автоматически.\n\n" + "\n".join(lines)
     if category == "telegram_premium":
-        return text + "\n\nЕсли Premium не активировался, напишите менеджеру."
+        months = order.get("duration_months") or order.get("months") or order.get("quantity") or "—"
+        recipient = display_telegram_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+        return (
+            "✅ Заказ выдан\n\n"
+            "💎 Telegram Premium\n"
+            f"Срок: {html_escape(str(months))} {html_escape(month_word(months))}\n"
+            f"Получатель: {html_escape(recipient)}\n\n"
+            "Premium отправлен на указанный аккаунт.\n"
+            "Если он не активировался сразу, подождите несколько минут."
+        )
+    text = f"✅ Ваш заказ {order_number_plain(order)} выдан автоматически.\n\n" + "\n".join(lines)
     return text
 
 
@@ -3054,9 +3085,12 @@ def auto_fulfillment_admin_text(order: dict, report: dict) -> str:
             return ("✅ <b>Apple ID код выдан</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
         if order_category_key(order) == "telegram_stars":
             return ("✅ <b>Telegram Stars отправлены</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Количество: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))} ⭐\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+        if order_category_key(order) == "telegram_premium":
+            return ("✅ <b>Telegram Premium оформлен</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
         return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
-    title = "⚠️ <b>Автовыдача Apple ID не удалась, нужна ручная выдача</b>" if order_category_key(order) == "apple_id" else ("⚠️ <b>Автовыдача Telegram Stars не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_stars" else "⚠️ <b>Автовыдача не удалась</b>")
-    return (title + "\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
+    title = "⚠️ <b>Автовыдача Apple ID не удалась, нужна ручная выдача</b>" if order_category_key(order) == "apple_id" else ("⚠️ <b>Автовыдача Telegram Stars не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_stars" else ("⚠️ <b>Автовыдача Telegram Premium не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_premium" else "⚠️ <b>Автовыдача не удалась</b>"))
+    duration_line = f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" if order_category_key(order) == "telegram_premium" else ""
+    return (title + "\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"{duration_line}" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
 
 async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
     try:
@@ -3070,17 +3104,18 @@ async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
             await context.bot.send_message(chat_id=chat_id, text=auto_fulfillment_admin_text(order, report), parse_mode="HTML")
         except Exception as exc:
             logger.warning("Auto fulfillment admin notification failed for order %s: %s", order.get("id"), exc)
-    if not report.get("ok") and order_category_key(order) in {"apple_id", "telegram_stars"}:
+    if not report.get("ok") and order_category_key(order) in {"apple_id", "telegram_stars", "telegram_premium"}:
         tech_chat_id = get_tech_alerts_chat_id()
         if tech_chat_id:
             try:
                 await context.bot.send_message(
                     chat_id=tech_chat_id,
                     text=(
-                        ("FazerCards Telegram Stars fulfillment failed" if order_category_key(order) == "telegram_stars" else "FazerCards Apple ID fulfillment failed") + "\n"
+                        ("FazerCards Telegram Premium fulfillment failed" if order_category_key(order) == "telegram_premium" else ("FazerCards Telegram Stars fulfillment failed" if order_category_key(order) == "telegram_stars" else "FazerCards Apple ID fulfillment failed")) + "\n"
                         f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
                         f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
                         f"recipient: {html_escape(display_telegram_username(order.get('telegram_recipient_username') or order.get('recipient') or ''))}\n"
+                        f"duration_months: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))}\n"
                         f"amount: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))}\n"
                         f"error: {html_escape(str(report.get('error') or 'unknown'))}"
                     ),
@@ -3106,9 +3141,9 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
         return fallback
     helpers = {"apple_id": auto_fulfill_apple_id_order, "telegram_stars": auto_fulfill_telegram_stars_order, "telegram_premium": auto_fulfill_telegram_premium_order, "esim": auto_fulfill_esim_order}
     update_order_fields(order.get("id"), fulfillment_status="auto_processing", auto_fulfillment=True)
-    if category in {"apple_id", "telegram_stars"} and get_orders_chat_id():
+    if category in {"apple_id", "telegram_stars", "telegram_premium"} and get_orders_chat_id():
         try:
-            start_title = "📦 Автовыдача Telegram Stars запущена" if category == "telegram_stars" else "📦 Автовыдача Apple ID запущена"
+            start_title = "📦 Автовыдача Telegram Stars запущена" if category == "telegram_stars" else ("📦 Автовыдача Telegram Premium запущена" if category == "telegram_premium" else "📦 Автовыдача Apple ID запущена")
             await context.bot.send_message(chat_id=get_orders_chat_id(), text=f"{start_title}\nЗаказ: {html_escape(order_number_plain(order))}", parse_mode="HTML")
         except Exception as exc:
             logger.warning("Auto fulfillment start notification failed for order %s: %s", order.get("id"), exc)
@@ -3131,6 +3166,9 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
         if category == "telegram_stars":
             fields["telegram_recipient_username"] = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or "")
             fields["stars_amount"] = int(safe_float(order.get("stars_amount") or order.get("amount") or order.get("quantity"), 0))
+        if category == "telegram_premium":
+            fields["telegram_recipient_username"] = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+            fields["duration_months"] = int(safe_float(order.get("duration_months") or order.get("months") or order.get("quantity"), 0))
         for key in ("giftcard_code", "giftcard_pin", "giftcard_link"):
             if result.get(key):
                 fields[key] = result[key]
@@ -5550,7 +5588,7 @@ def build_order_card_text(order: dict) -> str:
     username = order.get("tg_handle") or order.get("username") or "—"
     category = order_category_key(order)
     product = order.get("product_title") or order.get("title") or order.get("gb") or order_category_label(order)
-    recipient = order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—"
+    recipient = display_telegram_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "") if category in {"telegram_stars", "telegram_premium"} else (order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "—")
     region = APPLE_ID_REGION_TITLES.get(order.get("region"), order.get("region") or order.get("country") or "—")
     amount = order_display_amount(order)
     rub_note = "" if order_amount_rub(order) > 0 else "RUB-сумма: <b>не зафиксирована</b>\n"
