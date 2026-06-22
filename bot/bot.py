@@ -856,6 +856,9 @@ def cryptobot_payment_details(invoice_calc: dict, invoice: dict | None = None) -
         "payment_method": "cryptobot",
         "payment_provider": "cryptobot",
         "price_rub": invoice_calc.get("price_rub"),
+        "payment_amount_rub": invoice_calc.get("price_rub"),
+        "payment_asset": invoice_calc.get("asset"),
+        "payment_asset_amount": invoice_calc.get("crypto_amount"),
         "cryptobot_asset": invoice_calc.get("asset"),
         "cryptobot_amount": invoice_calc.get("crypto_amount"),
         "usd_rub_rate_used": invoice_calc.get("usd_rub_rate_used"),
@@ -879,9 +882,187 @@ def cryptobot_client_payment_text(price_rub, amount, asset, rate) -> str:
     )
 
 
+def payment_data_value(order: dict | None = None, plan: dict | None = None, *keys: str):
+    for source in (order, plan):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+        details = source.get("payment_details")
+        if isinstance(details, dict):
+            for key in keys:
+                value = details.get(key)
+                if value not in (None, ""):
+                    return value
+    return None
+
+
+def order_product_type_for_payment(order: dict | None = None, plan: dict | None = None) -> str:
+    product_type = payment_data_value(order, plan, "product_type")
+    return str(product_type or "other").strip() or "other"
+
+
+def order_product_title_for_payment(order: dict | None = None, plan: dict | None = None) -> str:
+    title = payment_data_value(order, plan, "product_title", "title", "gb", "name")
+    if title in (None, ""):
+        return "Товар"
+    if str(title).isdigit() and payment_data_value(order, plan, "days"):
+        return f"eSIM {title} GB / {payment_data_value(order, plan, 'days')} дней"
+    return str(title)
+
+
+def order_product_category_for_payment(order: dict | None = None, plan: dict | None = None) -> str:
+    category = payment_data_value(order, plan, "category_title")
+    if category not in (None, ""):
+        return str(category)
+    product_type = order_product_type_for_payment(order, plan)
+    return {
+        "apple_id": "Apple ID",
+        "telegram_stars": "Telegram Stars",
+        "telegram_premium": "Telegram Premium",
+        "esim": "eSIM",
+        "steam": "Steam",
+        "giftcard": "Gift cards",
+        "service_payment": "Зарубежные сервисы",
+        "subscription": "Подписки",
+        "other": "Другое",
+    }.get(product_type, product_type or "Другое")
+
+
+def order_payment_amount_rub(order: dict | None = None, plan: dict | None = None) -> float:
+    for source in (order, plan):
+        if not isinstance(source, dict):
+            continue
+        if source.get("product_type") == "apple_id":
+            amount = apple_id_payment_amount_rub(source)
+            if amount > 0:
+                return amount
+        if source.get("product_type") in {"telegram_stars", "telegram_premium"}:
+            amount = telegram_payment_amount_rub(source)
+            if amount > 0:
+                return amount
+    value = payment_data_value(order, plan, "price_rub", "payment_amount_rub", "amount_rub", "rub_amount")
+    amount = safe_float(value)
+    if amount > 0:
+        return amount
+    return parse_price(payment_data_value(order, plan, "price") or "0")
+
+
+def order_payment_recipient_for_payment(order: dict | None = None, plan: dict | None = None) -> str:
+    recipient = payment_data_value(order, plan, "recipient", "telegram_recipient_username", "tg_handle", "email", "login")
+    return str(recipient) if recipient not in (None, "") else "—"
+
+
 def cryptobot_order_product_title(order: dict, plan: dict | None = None) -> str:
-    data = plan if isinstance(plan, dict) else order
-    return str(data.get("product_title") or data.get("gb") or data.get("title") or "—")
+    return order_product_title_for_payment(order, plan)
+
+
+def format_payment_user(user) -> str:
+    if not user:
+        return "—"
+    user_id = getattr(user, "id", None) or (user.get("id") if isinstance(user, dict) else None)
+    return f"{user_tag(user)} / {user_id or '—'}"
+
+
+def format_payment_actor(actor) -> str:
+    return user_tag(actor) if actor else "—"
+
+
+def payment_detail(details: dict | None, *keys: str, default=None):
+    if not isinstance(details, dict):
+        return default
+    for key in keys:
+        value = details.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def format_payment_event_text(event_type: str, order: dict | None = None, user=None, plan: dict | None = None, details: dict | None = None, actor=None, error: str | None = None) -> str:
+    details = details if isinstance(details, dict) else ((order or {}).get("payment_details") if isinstance((order or {}).get("payment_details"), dict) else {})
+    order_number = (order or {}).get("number") or (f"#{int((order or {}).get('id')):04d}" if (order or {}).get("id") else "—")
+    title = order_product_title_for_payment(order, plan)
+    category = order_product_category_for_payment(order, plan)
+    amount = order_payment_amount_rub(order, plan)
+    recipient = order_payment_recipient_for_payment(order, plan)
+    method = payment_detail(details, "payment_method", default=(order or {}).get("payment_provider") or (order or {}).get("payment_method") or "—")
+    provider = payment_detail(details, "payment_provider", default=(order or {}).get("payment_provider") or "")
+    asset = str(payment_detail(details, "payment_asset", "cryptobot_asset", default="USDT"))
+    asset_amount = payment_detail(details, "payment_asset_amount", "cryptobot_amount")
+    rate = payment_detail(details, "usd_rub_rate_used")
+    invoice_id = payment_detail(details, "invoice_id", default=(order or {}).get("cryptobot_invoice_id"))
+    headers = {
+        "payment_method_selected": "💳 <b>Клиент выбрал оплату переводом</b>" if provider == "card" or method == "card" or method == "Карта" else "💳 <b>Клиент выбрал способ оплаты</b>",
+        "invoice_created": "🧾 <b>Создан CryptoBot invoice</b>",
+        "invoice_paid": "✅ <b>CryptoBot оплата получена</b>",
+        "invoice_expired": "⏱ <b>CryptoBot invoice истёк</b>",
+        "invoice_mismatch": "⚠️ <b>CryptoBot оплата требует проверки</b>",
+        "payment_failed": "❌ <b>Оплата не прошла</b>",
+        "payment_cancelled_before_paid": "❌ <b>Заявка отменена до оплаты</b>",
+        "payment_cancelled_after_paid": "↩️ <b>Оплаченный заказ отменён / нужен возврат</b>",
+        "manual_payment_confirmed": "👤 <b>Оплата подтверждена вручную</b>",
+        "refund_required": "↩️ <b>Оплаченный заказ отменён / нужен возврат</b>",
+    }
+    lines = [headers.get(event_type, "💳 <b>Событие оплаты</b>"), f"Заказ: {html_escape(str(order_number))}", f"Клиент: {html_escape(format_payment_user(user))}", f"Категория: {html_escape(category)}", f"Товар: {html_escape(title)}"]
+    if recipient != "—":
+        lines.append(f"Получатель: {html_escape(recipient)}")
+    if event_type in {"invoice_created", "invoice_paid", "invoice_expired"}:
+        lines.append(f"Сумма заказа: {html_escape(format_rub(amount))}")
+    elif event_type == "invoice_mismatch":
+        lines.append(f"Ожидалось: {html_escape(format_crypto_amount(asset_amount))} {html_escape(asset)}")
+        lines.append(f"Фактически: {html_escape(str(payment_detail(details, 'actual_amount', default='—')))} {html_escape(str(payment_detail(details, 'actual_asset', default=asset)))}")
+        lines.append(f"Invoice ID: {html_escape(str(invoice_id or '—'))}")
+        lines.append(f"Причина: {html_escape(error or 'параметры invoice не совпали с заказом')}")
+        return "\n".join(lines)
+    else:
+        lines.append(f"Сумма: {html_escape(format_rub(amount))}")
+    if event_type == "invoice_created":
+        lines += [f"CryptoBot: {html_escape(format_crypto_amount(asset_amount))} {html_escape(asset)}", f"Курс: {float(rate or 0):.2f} ₽", "Статус: ожидает оплату"]
+    elif event_type == "invoice_paid":
+        lines += [f"Оплачено: {html_escape(format_crypto_amount(asset_amount))} {html_escape(asset)}", f"Курс расчёта: {float(rate or 0):.2f} ₽", "Дальше: автовыдача / ручная выдача"]
+    elif event_type == "invoice_expired":
+        lines += [f"CryptoBot: {html_escape(format_crypto_amount(asset_amount))} {html_escape(asset)}", "Статус: invoice expired"]
+    elif event_type == "manual_payment_confirmed":
+        lines += [f"Метод: {html_escape(str(method))}", f"Подтвердил: {html_escape(format_payment_actor(actor))}", f"Время: {html_escape(now_str())}"]
+    elif event_type in {"payment_cancelled_after_paid", "refund_required"}:
+        lines += [f"Метод: {html_escape(str(method))}", f"Статус оплаты: {html_escape(str((order or {}).get('payment_status') or 'paid'))}", f"Причина: {html_escape(error or 'отмена заказа')}"]
+    elif event_type == "payment_cancelled_before_paid":
+        lines += [f"Метод: {html_escape(str(method))}", f"Статус был: {html_escape(str((order or {}).get('payment_status') or (order or {}).get('status') or 'ожидает оплату'))}"]
+        if invoice_id:
+            lines.append(f"CryptoBot invoice: #{html_escape(str(invoice_id))}")
+    else:
+        lines += [f"Метод: {html_escape(str(method))}", "Статус: ожидает оплату"]
+    return "\n".join(lines)
+
+
+def payment_notice_already_sent(order: dict, key: str) -> bool:
+    details = order.get("payment_details") if isinstance(order, dict) and isinstance(order.get("payment_details"), dict) else {}
+    notices = details.get("payment_notifications") if isinstance(details.get("payment_notifications"), dict) else {}
+    return bool(notices.get(f"{key}_sent") or order.get(f"payment_notice_{key}_at"))
+
+
+def mark_payment_notice_sent(order_id: int, key: str) -> None:
+    order = find_order(order_id)
+    if not order:
+        return
+    details = order.get("payment_details") if isinstance(order.get("payment_details"), dict) else {}
+    notices = details.get("payment_notifications") if isinstance(details.get("payment_notifications"), dict) else {}
+    notices[f"{key}_sent"] = True
+    notices[f"{key}_at"] = now_str()
+    details["payment_notifications"] = notices
+    update_order_fields(order_id, payment_details=details, **{f"payment_notice_{key}_at": notices[f"{key}_at"]})
+
+
+async def notify_payment_event_once(context: ContextTypes.DEFAULT_TYPE, key: str, event_type: str, order: dict | None = None, user=None, plan: dict | None = None, details: dict | None = None, actor=None, error: str | None = None) -> None:
+    if not order or not order.get("id"):
+        await notify_payments_chat(context, format_payment_event_text(event_type, order, user, plan, details, actor, error))
+        return
+    if payment_notice_already_sent(order, key):
+        return
+    await notify_payments_chat(context, format_payment_event_text(event_type, order, user, plan, details, actor, error))
+    mark_payment_notice_sent(int(order["id"]), key)
 
 
 async def notify_payments_chat(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -895,31 +1076,12 @@ async def notify_payments_chat(context: ContextTypes.DEFAULT_TYPE, text: str) ->
 
 
 async def notify_cryptobot_invoice_created(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
-    username = user_tag(user)
-    text = (
-        "🧾 <b>Создан CryptoBot invoice</b>\n\n"
-        f"Заказ: {html_escape((order or {}).get('number', '—'))}\n"
-        f"Клиент: {html_escape(username)} / {html_escape(str(user.id))}\n"
-        f"Товар: {html_escape(cryptobot_order_product_title(order or {}, plan))}\n\n"
-        f"Сумма заказа: {html_escape(format_rub(details.get('price_rub')))}\n"
-        f"CryptoBot: {html_escape(format_crypto_amount(details.get('cryptobot_amount')))} {html_escape(str(details.get('cryptobot_asset') or 'USDT'))}\n"
-        f"Курс: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
-        "Статус: ожидает оплату"
-    )
+    text = format_payment_event_text("invoice_created", order, user, plan, details)
     await notify_payments_chat(context, text)
 
 
 async def notify_cryptobot_invoice_paid(context: ContextTypes.DEFAULT_TYPE, order: dict | None, user, plan: dict, details: dict) -> None:
-    text = (
-        "✅ <b>CryptoBot оплата получена</b>\n\n"
-        f"Заказ: {html_escape((order or {}).get('number', '—'))}\n"
-        f"Клиент: {html_escape(user_tag(user))} / {html_escape(str(user.id))}\n"
-        f"Товар: {html_escape(cryptobot_order_product_title(order or {}, plan))}\n\n"
-        f"Сумма заказа: {html_escape(format_rub(details.get('price_rub')))}\n"
-        f"Оплачено: {html_escape(format_crypto_amount(details.get('cryptobot_amount')))} {html_escape(str(details.get('cryptobot_asset') or 'USDT'))}\n"
-        f"Курс расчёта: {float(details.get('usd_rub_rate_used') or 0):.2f} ₽\n\n"
-        "Дальше: автовыдача / ручная выдача"
-    )
+    text = format_payment_event_text("invoice_paid", order, user, plan, details)
     await notify_payments_chat(context, text)
 
 
@@ -1306,6 +1468,11 @@ def order_payment_details_from_context(context: ContextTypes.DEFAULT_TYPE) -> di
         "markup_percent": lock.get("markup_percent"),
         "final_usd_rub_rate": lock.get("final_usd_rub_rate"),
         "rub_amount": lock.get("rub_amount"),
+        "payment_amount_rub": lock.get("rub_amount"),
+        "payment_method": "card",
+        "payment_provider": "card",
+        "payment_asset": "RUB",
+        "payment_asset_amount": lock.get("rub_amount"),
         "rate_locked_until": lock.get("rate_locked_until"),
     }
 
@@ -7672,18 +7839,14 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         context.user_data["payment_method"] = payment_provider_label("cryptobot")
         context.user_data["payment_provider"] = "cryptobot"
-        price_rub = (apple_id_payment_amount_rub(plan) if plan.get("product_type") == "apple_id" else (telegram_payment_amount_rub(plan) if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else parse_price(plan.get("price", "0"))))
+        price_rub = order_payment_amount_rub(find_order(context.user_data.get("checkout_order_id")), plan)
         if price_rub <= 0:
             await query.message.reply_text(payment_amount_error_text(plan), parse_mode="HTML")
             return WAITING_PAYMENT
         invoice_calc = await cryptobot_invoice_amount_from_rub(price_rub, "USDT")
         cryptobot_amount = invoice_calc["crypto_amount"]
         cryptobot_asset = invoice_calc["asset"]
-        description = (
-            f"SLIK Apple ID {plan.get('product_title', '')}".strip()
-            if plan.get("product_type") == "apple_id"
-            else (f"SLIK Telegram {plan.get('product_title', '')}".strip() if plan.get("product_type") in {"telegram_stars", "telegram_premium"} else f"SLIK eSIM {plan.get('gb', '')} / {plan.get('days', '')}".strip())
-        )
+        description = f"SLIK {order_product_category_for_payment(None, plan)} {order_product_title_for_payment(None, plan)}".strip()
         try:
             invoice = await crypto_create_invoice(token, cryptobot_amount, description, f"user:{query.from_user.id}:plan:{context.user_data.get('plan_key', '')}", asset=cryptobot_asset, price_rub=price_rub)
         except ValueError as e:
@@ -7712,7 +7875,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             cryptobot_invoice_id=invoice_id,
             cryptobot_pay_url=pay_url,
         )
-        await notify_cryptobot_invoice_created(context, order, query.from_user, plan, details)
+        await notify_payment_event_once(context, "invoice_created", "invoice_created", order, query.from_user, plan, details)
         rows = []
         if pay_url:
             rows.append([InlineKeyboardButton(f"Оплатить {format_crypto_amount(cryptobot_amount)} {cryptobot_asset}", url=pay_url)])
@@ -7768,7 +7931,8 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not lock:
             return WAITING_PAYMENT
         context.user_data["card_payment_lock"] = lock
-        update_checkout_order(context.user_data.get("checkout_order_id"), payment_method=payment_provider_label("card"), payment_provider="card", payment_details=order_payment_details_from_context(context))
+        order = update_checkout_order(context.user_data.get("checkout_order_id"), payment_method=payment_provider_label("card"), payment_provider="card", payment_status="waiting_payment", payment_details=order_payment_details_from_context(context))
+        await notify_payment_event_once(context, "payment_method_selected", "payment_method_selected", order, query.from_user, plan, order_payment_details_from_context(context))
         await query.message.reply_text(
             build_card_payment_text(plan, card, lock),
             parse_mode="HTML",
@@ -7796,7 +7960,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             and abs(invoice_amount - expected_amount) < 0.000001
         )
         if status == "paid" and invoice_matches:
-            await notify_cryptobot_invoice_paid(context, order, query.from_user, plan, details)
+            await notify_payment_event_once(context, "invoice_paid", "invoice_paid", order, query.from_user, plan, details)
             await query.message.reply_text(
                 "✅ <b>Оплата подтверждена!</b>\n\nОформляем вашу заявку.\n\nКак вас зовут?",
                 parse_mode="HTML",
@@ -7804,6 +7968,9 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return WAITING_NAME
         if status == "paid" and not invoice_matches:
+            mismatch_details = dict(details) if isinstance(details, dict) else {}
+            mismatch_details.update({"actual_amount": invoice_amount, "actual_asset": invoice_asset, "invoice_id": invoice_id})
+            await notify_payment_event_once(context, "invoice_mismatch", "invoice_mismatch", order, query.from_user, plan, mismatch_details, error="параметры invoice не совпали с заказом")
             await query.message.reply_text(
                 "⚠️ <b>Оплата требует проверки менеджером.</b>\n\nПараметры CryptoBot invoice не совпали с заказом.",
                 parse_mode="HTML",
@@ -7811,6 +7978,7 @@ async def choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return WAITING_PAYMENT
         elif status == "expired":
+            await notify_payment_event_once(context, "invoice_expired", "invoice_expired", order, query.from_user, plan, details)
             await query.message.reply_text(
                 "⏱ Счёт истёк. Пожалуйста, начните оформление заново.",
                 reply_markup=InlineKeyboardMarkup([
@@ -8032,7 +8200,12 @@ async def cancel_order_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     if context.user_data.get("checkout_order_id"):
-        update_checkout_order(context.user_data.get("checkout_order_id"), status="cancelled")
+        order = find_order(context.user_data.get("checkout_order_id"))
+        event_type = "payment_cancelled_after_paid" if order and order_payment_status(order) == "paid" else "payment_cancelled_before_paid"
+        key = "payment_cancelled_after_paid" if event_type == "payment_cancelled_after_paid" else "payment_cancelled_before_paid"
+        details = order.get("payment_details") if isinstance((order or {}).get("payment_details"), dict) else order_payment_details_from_context(context)
+        await notify_payment_event_once(context, key, event_type, order, query.from_user, context.user_data.get("plan", {}), details, error="отмена заявки")
+        update_checkout_order(context.user_data.get("checkout_order_id"), status="cancelled", payment_status=("cancelled" if event_type == "payment_cancelled_before_paid" else order_payment_status(order)))
     context.user_data.clear()
     await query.message.reply_text(
         "Заявка отменена.",
@@ -8206,11 +8379,16 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         status = action
         order_id = int(data.split("_", 1)[1])
 
+    previous_order = find_order(order_id)
     order = update_order_status(order_id, status, query.from_user.id)
     if not order:
         await query.answer("Заявка не найдена.", show_alert=True)
         return
 
+    if normalize_order_status(status) == "in_progress" and order_payment_status(order) == "paid" and str(order.get("payment_provider") or "").lower() == "card":
+        await notify_payment_event_once(context, "manual_confirm", "manual_payment_confirmed", order, query.from_user, order, order.get("payment_details"), actor=query.from_user)
+    if normalize_order_status(status) == "cancelled" and previous_order and order_payment_status(previous_order) == "paid":
+        await notify_payment_event_once(context, "payment_cancelled_after_paid", "refund_required", order, query.from_user, order, order.get("payment_details"), actor=query.from_user, error="отмена оплаченного заказа")
     await query.answer(f"Статус: {order_status_label(order.get('status'))}")
     await notify_client_order_status(context, order)
     await edit_or_send(query, context, build_order_card_text(order), order_card_keyboard(order_id))
