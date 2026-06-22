@@ -2943,7 +2943,7 @@ async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
     if order_already_fulfilled(order):
         return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
 
-    username = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+    username = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or "")
     amount = int(safe_float(order.get("stars_amount") or order.get("amount") or order.get("quantity"), 0))
     product_id = order.get("fazercards_product_id") or order.get("fazercards_telegram_product_id") or order.get("fazercards_card_id")
     category_id = order.get("fazercards_category_id")
@@ -2975,7 +2975,8 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
     if order_already_fulfilled(order):
         return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
 
-    username = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+    recipient_raw = order.get("telegram_recipient_username") or order.get("recipient") or ""
+    username = normalize_telegram_recipient_username(recipient_raw)
     months = int(safe_float(order.get("duration_months") or order.get("months") or order.get("quantity"), 0))
     product_id = order.get("fazercards_product_id") or order.get("fazercards_telegram_product_id") or order.get("fazercards_card_id")
     category_id = order.get("fazercards_category_id")
@@ -3167,7 +3168,7 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
             fields["telegram_recipient_username"] = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or "")
             fields["stars_amount"] = int(safe_float(order.get("stars_amount") or order.get("amount") or order.get("quantity"), 0))
         if category == "telegram_premium":
-            fields["telegram_recipient_username"] = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or order.get("tg_handle") or "")
+            fields["telegram_recipient_username"] = normalize_telegram_recipient_username(order.get("telegram_recipient_username") or order.get("recipient") or "")
             fields["duration_months"] = int(safe_float(order.get("duration_months") or order.get("months") or order.get("quantity"), 0))
         for key in ("giftcard_code", "giftcard_pin", "giftcard_link"):
             if result.get(key):
