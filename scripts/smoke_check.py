@@ -1504,6 +1504,25 @@ def check_unified_stock(bot_text: str, config_example_text: str) -> None:
     record("Unified stock admin category sections exist", all(x in bot_text for x in ("Apple ID", "Telegram Stars", "Telegram Premium", "eSIM")) and "admin_stock_category:" in bot_text)
     record("Stock privacy masks codes outside delivery", "mask_giftcard_code" in stock_list and "👁 Показать код" in bot_text and "Код: <code>{html_escape(mask_giftcard_code" in bot_text)
 
+
+def check_fazercards_stock_sync(bot_text: str, config_example_text: str) -> None:
+    fetch_block = function_block(bot_text, "fetch_fazercards_orders")
+    sync_block = function_block(bot_text, "sync_fazercards_orders_to_stock")
+    parser_block = function_block(bot_text, "parse_fazercards_orders_response")
+    upsert_block = function_block(bot_text, "upsert_stock_item_from_fazercards_order")
+    report_block = function_block(bot_text, "fazercards_stock_sync_report_text")
+    callback_block = callback_branch_block(bot_text, 'elif data == "admin_stock_sync_fazercards"')
+    record("FazerCards orders sync uses read-only GET", "async def fetch_fazercards_orders" in bot_text and "client.get" in fetch_block and "client.post" not in fetch_block)
+    record("FazerCards stock sync avoids purchase helpers", "fazercards_post_order" not in sync_block and "/giftcards/order" not in sync_block and "client.post" not in sync_block)
+    record("FazerCards orders parser supports common containers", all(x in parser_block for x in ('("data",)', '("data", "items")', '("data", "orders")', '("result",)', '("result", "items")', '("result", "orders")', '("orders",)', '("items",)')))
+    record("FazerCards order upsert exists and preserves used/invalid", "def upsert_stock_item_from_fazercards_order" in bot_text and "supplier_order_id" in upsert_block and '{"used", "invalid"}' in upsert_block)
+    record("FazerCards upsert pending can become available", 'new_status = "available"' in upsert_block and 'new_status = "pending"' in upsert_block and "code_key" in upsert_block)
+    record("FazerCards sync admin UI exists with admin/owner guard", "🔄 Синхронизировать с FazerCards" in bot_text and "admin_stock_sync_fazercards" in bot_text and "has_admin_access(query.from_user) or has_owner_access(query.from_user)" in callback_block)
+    record("FazerCards sync report shows counters", all(x in report_block for x in ("checked", "added", "updated", "already", "skipped", "errors")))
+    record("FazerCards sync report masks gift card codes", "mask_giftcard_code" in report_block and "delivery_code" in report_block)
+    record("FazerCards stock_sync config exists disabled by default", '"stock_sync"' in config_example_text and '"fazercards_enabled": false' in config_example_text and all(x in config_example_text for x in ('"last_run_at"', '"last_ok_at"', '"last_error"')))
+    record("FazerCards periodic stock sync is disabled by config gate", "stock_sync_fazercards_periodic_job" in bot_text and 'settings.get("fazercards_enabled", False)' in bot_text)
+
 def main() -> int:
     check_syntax("bot/bot.py")
     check_syntax("bot/run_mvp.py")
@@ -1535,6 +1554,7 @@ def main() -> int:
     check_apple_id_rub_market_pricing(bot_text)
     check_telegram_premium_auto_fulfillment(bot_text)
     check_unified_stock(bot_text, config_example_text)
+    check_fazercards_stock_sync(bot_text, config_example_text)
     check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',

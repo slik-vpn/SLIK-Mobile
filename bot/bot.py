@@ -76,6 +76,7 @@ FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/telegram/premium"
 FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT = "/telegram/stars/buy"
 FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT = "/telegram/premium/buy"
 FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT = "/giftcards/order"
+FAZERCARDS_ORDERS_ENDPOINT = "/orders"
 FAZERCARDS_ORDER_DETAILS_ENDPOINT = "/orders/{orderId}"
 FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT = os.environ.get("FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT", FAZERCARDS_ORDER_DETAILS_ENDPOINT).strip() or FAZERCARDS_ORDER_DETAILS_ENDPOINT
 MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/products/business/APPLE%20ID"
@@ -356,6 +357,14 @@ DEFAULT_CONFIG = {
         "retry_delay_seconds": 30,
         "manual_fallback_enabled": True,
     },
+    "stock_sync": {
+        "fazercards_enabled": False,
+        "interval_minutes": 60,
+        "lookback_hours": 48,
+        "last_run_at": "",
+        "last_ok_at": "",
+        "last_error": "",
+    },
     "stock": {
         "enabled": True,
         "categories": {
@@ -587,6 +596,12 @@ def load_config() -> dict:
         data["supplier_price_refresh"] = supplier_refresh
     for key, value in {"last_run_at": "", "last_ok_at": "", "last_reason": "", "last_error": "", "last_report": {}, "last_notice_at": "", "last_error_notice_at": ""}.items():
         supplier_refresh.setdefault(key, value)
+    stock_sync = data.get("stock_sync")
+    if not isinstance(stock_sync, dict):
+        stock_sync = {}
+        data["stock_sync"] = stock_sync
+    for key, value in DEFAULT_CONFIG["stock_sync"].items():
+        stock_sync.setdefault(key, value)
     stock = data.get("stock")
     if not isinstance(stock, dict):
         stock = {}
@@ -813,6 +828,7 @@ STOCK_CATEGORIES = {
     "steam": {"title": "Steam", "emoji": "🎮"},
     "gift_cards": {"title": "Gift Cards", "emoji": "🎁"},
     "subscriptions": {"title": "Подписки / зарубежные сервисы", "emoji": "🧾"},
+    "unknown": {"title": "Неизвестно", "emoji": "❔"},
 }
 
 
@@ -3347,6 +3363,148 @@ def giftcard_fields_from_response(payload) -> dict:
     walk(payload)
     return fields
 
+
+def parse_fazercards_orders_response(data: dict) -> list[dict]:
+    """Extract FazerCards orders from known list containers without assuming one schema."""
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    paths = (
+        ("data",), ("data", "items"), ("data", "orders"),
+        ("result",), ("result", "items"), ("result", "orders"),
+        ("orders",), ("items",),
+    )
+    for path in paths:
+        current = data
+        for key in path:
+            current = current.get(key) if isinstance(current, dict) else None
+        if isinstance(current, list):
+            return [item for item in current if isinstance(item, dict)]
+    return []
+
+
+def fazercards_order_next_page(data: dict, current_page: int) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    candidates = [data]
+    for key in ("data", "result", "meta", "pagination"):
+        if isinstance(data.get(key), dict):
+            candidates.append(data[key])
+    for obj in candidates:
+        value = obj.get("next_page") or obj.get("nextPage")
+        if value:
+            try:
+                nxt = int(value)
+                return nxt if nxt > current_page else None
+            except (TypeError, ValueError):
+                return current_page + 1
+        total = obj.get("total_pages") or obj.get("page_count") or obj.get("pageCount") or obj.get("pages")
+        try:
+            if total and current_page < int(total):
+                return current_page + 1
+        except (TypeError, ValueError):
+            pass
+        if obj.get("next"):
+            return current_page + 1
+    return None
+
+
+def detect_fazercards_order_category(order_data: dict) -> str:
+    def collect(value) -> list[str]:
+        if isinstance(value, dict):
+            out = []
+            for child in value.values():
+                out.extend(collect(child))
+            return out
+        if isinstance(value, list):
+            out = []
+            for child in value:
+                out.extend(collect(child))
+            return out
+        return [str(value)] if isinstance(value, (str, int, float)) else []
+
+    blob = " ".join(collect(order_data)).lower()
+    if any(t in blob for t in ("apple", "app store", "itunes", "gift card", "usd", "try", "kzt")) and any(t in blob for t in ("apple", "app store", "itunes")):
+        return "apple_id"
+    if "stars" in blob:
+        return "telegram_stars"
+    if "premium" in blob and "telegram" in blob:
+        return "telegram_premium"
+    if "steam" in blob:
+        return "steam"
+    if "subscription" in blob or "подпис" in blob:
+        return "subscriptions"
+    if "gift" in blob or "card" in blob:
+        return "gift_cards"
+    return "unknown"
+
+
+def _first_order_value(order_data: dict, keys: tuple[str, ...]):
+    for key in keys:
+        value = order_data.get(key)
+        if value not in (None, ""):
+            return value
+    for parent in ("product", "card", "giftcard", "item"):
+        nested = order_data.get(parent)
+        if isinstance(nested, dict):
+            value = _first_order_value(nested, keys)
+            if value not in (None, ""):
+                return value
+    return ""
+
+
+def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | None, str]:
+    supplier_order_id = supplier_order_id_from_response(order_data)
+    if not supplier_order_id:
+        return None, "skipped"
+    fields = giftcard_fields_from_response(order_data)
+    code = fields.get("giftcard_code", "")
+    code_key = normalize_stock_code(code)
+    category = detect_fazercards_order_category(order_data)
+    title = str(_first_order_value(order_data, ("title", "name", "product_name", "card_name", "description")) or "FazerCards order")
+    region = str(_first_order_value(order_data, ("region", "country", "country_code")) or "").upper().strip()
+    currency = str(_first_order_value(order_data, ("currency", "currency_code")) or "").upper().strip()
+    amount = _first_order_value(order_data, ("amount", "nominal", "value", "denomination", "face_value"))
+    items = load_stock()
+    existing = None
+    for item in items:
+        if str(item.get("supplier_order_id") or "").strip() == supplier_order_id:
+            existing = item; break
+    if existing is None and code_key:
+        for item in items:
+            if normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == code_key:
+                return None, "already"
+        for order in load_orders():
+            if normalize_stock_code(order.get("giftcard_code")) == code_key:
+                return None, "skipped"
+    action = "updated" if existing else "added"
+    target = existing or {"id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}", "created_at": now_str()}
+    if existing is None:
+        items.append(target)
+    current_status = str(target.get("status") or "")
+    if current_status in {"used", "invalid"}:
+        new_status = current_status
+    elif code_key and category != "unknown":
+        new_status = "available"
+    else:
+        new_status = "pending"
+    target.update({
+        "category": category, "product_key": f"{category}_{region.lower()}_{stock_amount_key(amount)}_{currency.lower()}".strip("_"),
+        "supplier": "fazercards", "supplier_order_id": supplier_order_id, "title": title,
+        "region": region, "amount": amount, "currency": currency, "delivery_type": "code",
+        "delivery_code": code or target.get("delivery_code", ""),
+        "delivery_pin": fields.get("giftcard_pin", "") or target.get("delivery_pin", ""),
+        "delivery_link": fields.get("giftcard_link", "") or target.get("delivery_link", ""),
+        "giftcard_code": code or target.get("giftcard_code", ""),
+        "giftcard_pin": fields.get("giftcard_pin", "") or target.get("giftcard_pin", ""),
+        "giftcard_link": fields.get("giftcard_link", "") or target.get("giftcard_link", ""),
+        "status": new_status, "updated_at": now_str(), "comment": target.get("comment") or "synced from FazerCards orders",
+    })
+    save_stock([normalize_stock_item(item) for item in items])
+    return normalize_stock_item(target), action
+
+
 def update_order_fields(order_id: int, **fields) -> dict | None:
     orders = load_orders()
     for item in orders:
@@ -3433,6 +3591,79 @@ async def fetch_fazercards_order_details(order_id: str) -> dict:
         if isinstance(data, dict) and data.get("ok", True) is False:
             raise ValueError(str(data.get("error") or data.get("message") or "supplier_error"))
         return data if isinstance(data, dict) else {"data": data}
+
+
+async def fetch_fazercards_orders(limit: int = 100, page: int = 1) -> dict:
+    api_key = get_fazercards_api_key()
+    if not api_key:
+        return {"ok": False, "error": "FAZERCARDS_API_KEY not configured"}
+    params = {"limit": int(limit or 100), "page": int(page or 1)}
+    async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        response = await client.get(FAZERCARDS_ORDERS_ENDPOINT, headers=fazercards_headers(api_key), params=params)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and data.get("ok", True) is False:
+            raise ValueError(str(data.get("error") or data.get("message") or "supplier_error"))
+        return data if isinstance(data, dict) else {"data": data}
+
+
+async def sync_fazercards_orders_to_stock(limit: int = 100, max_pages: int = 10) -> dict:
+    report = {"checked": 0, "added": 0, "updated": 0, "already": 0, "skipped": 0, "errors": 0, "added_items": [], "pending_items": []}
+    page = 1
+    seen_pages = set()
+    while page and page not in seen_pages and len(seen_pages) < max_pages:
+        seen_pages.add(page)
+        try:
+            data = await fetch_fazercards_orders(limit=limit, page=page)
+        except Exception as exc:
+            report["errors"] += 1
+            report["last_error"] = fazercards_api_error(exc)
+            break
+        orders = parse_fazercards_orders_response(data)
+        for order_data in orders:
+            report["checked"] += 1
+            try:
+                item, action = upsert_stock_item_from_fazercards_order(order_data)
+                if action in {"added", "updated", "already", "skipped"}:
+                    report[action] += 1
+                else:
+                    report["skipped"] += 1
+                if item and action == "added":
+                    (report["pending_items"] if item.get("status") == "pending" else report["added_items"]).append(item)
+            except Exception as exc:
+                logger.warning("FazerCards stock sync item failed: %s", exc)
+                report["errors"] += 1
+        next_page = fazercards_order_next_page(data, page)
+        page = next_page if next_page and orders else None
+    now = now_str()
+    cfg = load_config(); state = cfg.setdefault("stock_sync", {})
+    state["last_run_at"] = now
+    if report["errors"]:
+        state["last_error"] = report.get("last_error") or f"{report['errors']} errors"
+    else:
+        state["last_ok_at"] = now; state["last_error"] = ""
+    save_config(cfg)
+    return report
+
+
+def fazercards_stock_sync_report_text(report: dict) -> str:
+    lines = [
+        "✅ <b>Синхронизация FazerCards завершена</b>", "",
+        f"Проверено заказов: {int(report.get('checked') or 0)}",
+        f"Добавлено на склад: {int(report.get('added') or 0)}",
+        f"Обновлено: {int(report.get('updated') or 0)}",
+        f"Уже были: {int(report.get('already') or 0)}",
+        f"Пропущено: {int(report.get('skipped') or 0)}",
+        f"Ошибок: {int(report.get('errors') or 0)}",
+    ]
+    for title, key in (("Добавлено", "added_items"), ("Pending", "pending_items")):
+        items = report.get(key) or []
+        if items:
+            lines.extend(["", f"<b>{title}:</b>"])
+            for item in items[:10]:
+                code = mask_giftcard_code(item.get("delivery_code") or item.get("giftcard_code")) or "код не найден"
+                lines.append(f"• {html_escape(str(item.get('title') or item.get('product_key') or 'FazerCards'))} · {html_escape(str(item.get('supplier_order_id') or '—'))} · {html_escape(code)}")
+    return "\n".join(lines)
 
 
 async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
@@ -7581,6 +7812,7 @@ def stock_dashboard_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(stock_category_title("telegram_stars"), callback_data="admin_stock_category:telegram_stars")],
         [InlineKeyboardButton(stock_category_title("telegram_premium"), callback_data="admin_stock_category:telegram_premium")],
         [InlineKeyboardButton(stock_category_title("esim"), callback_data="admin_stock_category:esim")],
+        [InlineKeyboardButton("🔄 Синхронизировать с FazerCards", callback_data="admin_stock_sync_fazercards")],
         [InlineKeyboardButton("⚙️ Настройки склада", callback_data="admin_stock_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
@@ -11586,6 +11818,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer("Выберите категорию и переключите режим.")
         await edit_or_send(query, context, stock_dashboard_text(), stock_dashboard_keyboard())
+    elif data == "admin_stock_sync_fazercards":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        await query.answer("Синхронизирую...")
+        await edit_or_send(query, context, "🔄 Синхронизирую купленные товары FazerCards...", stock_dashboard_keyboard())
+        report = await sync_fazercards_orders_to_stock()
+        await edit_or_send(query, context, fazercards_stock_sync_report_text(report), stock_dashboard_keyboard())
     elif data.startswith("admin_stock_category:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
@@ -12898,6 +13138,28 @@ def schedule_usd_rub_auto_refresh(app: Application) -> None:
     app.create_task(usd_rub_auto_refresh_loop(app), name="usd_rub_auto_refresh")
 
 
+async def stock_sync_fazercards_periodic_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = load_config().get("stock_sync") or {}
+    if not settings.get("fazercards_enabled", False):
+        return
+    try:
+        await sync_fazercards_orders_to_stock()
+    except Exception as exc:
+        cfg = load_config(); state = cfg.setdefault("stock_sync", {})
+        state["last_run_at"] = now_str(); state["last_error"] = fazercards_api_error(exc)
+        save_config(cfg)
+        logger.warning("Periodic FazerCards stock sync failed: %s", exc)
+
+
+def schedule_stock_sync(app: Application) -> None:
+    if not app.job_queue:
+        logger.warning("JobQueue недоступен; periodic FazerCards stock sync не запущен")
+        return
+    settings = load_config().get("stock_sync") or DEFAULT_CONFIG["stock_sync"]
+    interval = max(5, int(settings.get("interval_minutes") or 60)) * 60
+    app.job_queue.run_repeating(stock_sync_fazercards_periodic_job, interval=interval, first=interval, name="stock_sync_fazercards")
+
+
 # ─── Регистрация команд Telegram ──────────────────────────────────────────────
 
 async def post_init(app: Application) -> None:
@@ -12929,6 +13191,7 @@ async def post_init(app: Application) -> None:
     schedule_automatic_backups(app)
     schedule_abandoned_checkout_reminders(app)
     schedule_esim_expiry_reminders(app)
+    schedule_stock_sync(app)
     schedule_usd_rub_auto_refresh(app)
 
 

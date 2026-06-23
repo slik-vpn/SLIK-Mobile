@@ -82,5 +82,13 @@
         "fallback_to_supplier": false
       }
     }
+  },
+  "stock_sync": {
+    "fazercards_enabled": false,
+    "interval_minutes": 60,
+    "lookback_hours": 48,
+    "last_run_at": "",
+    "last_ok_at": "",
+    "last_error": ""
   }
 }
