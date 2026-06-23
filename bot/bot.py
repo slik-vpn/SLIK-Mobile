@@ -60,6 +60,7 @@ RUSSIA_IMAGE = IMAGES_DIR / "russia.jpg"   # запасной файл для Р
 CONFIG_FILE    = Path(__file__).parent / "config.json"
 ORDERS_FILE    = Path(__file__).parent / "orders.json"
 APPLE_ID_STOCK_FILE = Path(__file__).parent / "apple_id_stock.json"
+STOCK_FILE = Path(__file__).parent / "stock.json"
 USERS_FILE     = Path(__file__).parent / "users.json"
 BALANCE_LOG_FILE = Path(__file__).parent / "balance_changes.json"
 PAYMENT_METHODS_FILE = Path(__file__).parent / "payment_methods.json"
@@ -133,6 +134,7 @@ BACKUP_FILES = [
     (USERS_FILE, "bot/users.json", "users.json"),
     (ORDERS_FILE, "bot/orders.json", "orders.json"),
     (APPLE_ID_STOCK_FILE, "bot/apple_id_stock.json", "apple_id_stock.json"),
+    (STOCK_FILE, "bot/stock.json", "stock.json"),
     (CONFIG_FILE, "bot/config.json", "config.json"),
     (BALANCE_LOG_FILE, "bot/balance_changes.json", "balance_changes.json"),
 ]
@@ -143,6 +145,7 @@ RUNTIME_JSON_FILES = [
     (USERS_FILE, "users.json"),
     (ORDERS_FILE, "orders.json"),
     (APPLE_ID_STOCK_FILE, "apple_id_stock.json"),
+    (STOCK_FILE, "stock.json"),
     (CONFIG_FILE, "config.json"),
     (BALANCE_LOG_FILE, "balance_changes.json"),
 ]
@@ -352,6 +355,18 @@ DEFAULT_CONFIG = {
         "retry_delay_seconds": 30,
         "manual_fallback_enabled": True,
     },
+    "stock": {
+        "enabled": True,
+        "categories": {
+            "apple_id": {"enabled": True, "fallback_to_supplier": True},
+            "telegram_stars": {"enabled": False, "fallback_to_supplier": True},
+            "telegram_premium": {"enabled": False, "fallback_to_supplier": True},
+            "esim": {"enabled": False, "fallback_to_supplier": False},
+            "steam": {"enabled": False, "fallback_to_supplier": False},
+            "gift_cards": {"enabled": False, "fallback_to_supplier": False},
+            "subscriptions": {"enabled": False, "fallback_to_supplier": False},
+        },
+    },
     "fazercards": {
         "api_key": "",
         "enabled": False,
@@ -444,7 +459,7 @@ ADMIN_MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_ADMIN, ROLE_OWNER)
 def runtime_default_value(path: Path):
     if path == CONFIG_FILE:
         return json.loads(json.dumps(DEFAULT_CONFIG))
-    if path in {ORDERS_FILE, BALANCE_LOG_FILE, APPLE_ID_STOCK_FILE}:
+    if path in {ORDERS_FILE, BALANCE_LOG_FILE, APPLE_ID_STOCK_FILE, STOCK_FILE}:
         return []
     return {}
 
@@ -571,6 +586,22 @@ def load_config() -> dict:
         data["supplier_price_refresh"] = supplier_refresh
     for key, value in {"last_run_at": "", "last_ok_at": "", "last_reason": "", "last_error": "", "last_report": {}, "last_notice_at": "", "last_error_notice_at": ""}.items():
         supplier_refresh.setdefault(key, value)
+    stock = data.get("stock")
+    if not isinstance(stock, dict):
+        stock = {}
+        data["stock"] = stock
+    stock.setdefault("enabled", True)
+    categories = stock.get("categories")
+    if not isinstance(categories, dict):
+        categories = {}
+        stock["categories"] = categories
+    for category, defaults in DEFAULT_CONFIG["stock"]["categories"].items():
+        current = categories.get(category)
+        if not isinstance(current, dict):
+            current = {}
+            categories[category] = current
+        current.setdefault("enabled", defaults["enabled"])
+        current.setdefault("fallback_to_supplier", defaults["fallback_to_supplier"])
     # Safety invariant: diagnostics must never enable FazerCards auto issue.
     fazercards["auto_issue_enabled"] = False
     return data
@@ -769,31 +800,19 @@ def save_orders(orders: list) -> None:
     save_runtime_json(ORDERS_FILE, orders)
 
 
-# ─── apple_id_stock.json ─────────────────────────────────────────────────────
+# ─── stock.json ───────────────────────────────────────────────────────────────
 
-APPLE_ID_STOCK_STATUSES = {"available", "reserved", "used", "invalid"}
-
-
-def load_apple_id_stock() -> list:
-    items = load_runtime_json(APPLE_ID_STOCK_FILE, [], list)
-    changed = False
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        if item.get("status") not in APPLE_ID_STOCK_STATUSES:
-            item["status"] = "available"
-            changed = True
-        for key in ("giftcard_pin", "giftcard_link", "used_at", "used_order_id", "comment"):
-            if key not in item:
-                item[key] = ""
-                changed = True
-    if changed:
-        save_apple_id_stock(items)
-    return [item for item in items if isinstance(item, dict)]
-
-
-def save_apple_id_stock(items: list) -> None:
-    save_runtime_json(APPLE_ID_STOCK_FILE, items if isinstance(items, list) else [])
+STOCK_STATUSES = {"available", "pending", "reserved", "used", "invalid"}
+STOCK_DELIVERY_TYPES = {"code", "pin", "link", "qr", "manual", "service_credit"}
+STOCK_CATEGORIES = {
+    "apple_id": {"title": "Apple ID", "emoji": "🍎"},
+    "telegram_stars": {"title": "Telegram Stars", "emoji": "⭐"},
+    "telegram_premium": {"title": "Telegram Premium", "emoji": "💎"},
+    "esim": {"title": "eSIM", "emoji": "🌍"},
+    "steam": {"title": "Steam", "emoji": "🎮"},
+    "gift_cards": {"title": "Gift Cards", "emoji": "🎁"},
+    "subscriptions": {"title": "Подписки / зарубежные сервисы", "emoji": "🧾"},
+}
 
 
 def normalize_stock_code(code: str) -> str:
@@ -808,17 +827,128 @@ def stock_amount_key(value) -> str:
         return str(value or "").strip()
 
 
-def apple_id_stock_code_exists(code: str) -> bool:
-    normalized = normalize_stock_code(code)
-    if not normalized:
+def stock_category_title(category: str) -> str:
+    meta = STOCK_CATEGORIES.get(str(category or ""), {})
+    return f"{meta.get('emoji', '📦')} {meta.get('title', category or '—')}".strip()
+
+
+def migrate_apple_id_stock_item(item: dict) -> dict:
+    code = item.get("delivery_code") or item.get("giftcard_code") or ""
+    delivery_type = item.get("delivery_type") or "code"
+    migrated = {
+        "id": item.get("id") or f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}",
+        "category": "apple_id",
+        "product_key": item.get("product_key") or f"apple_id_{str(item.get('region') or '').lower()}_{stock_amount_key(item.get('amount'))}_{str(item.get('currency') or '').lower()}",
+        "supplier": item.get("supplier") or "fazercards",
+        "supplier_order_id": item.get("supplier_order_id", ""),
+        "region": str(item.get("region") or "").upper().strip(),
+        "amount": item.get("amount"),
+        "currency": str(item.get("currency") or "").upper().strip(),
+        "title": item.get("title") or f"Apple ID {str(item.get('region') or '').upper()} {item.get('amount') or ''} {str(item.get('currency') or '').upper()}".strip(),
+        "delivery_type": delivery_type if delivery_type in STOCK_DELIVERY_TYPES else "code",
+        "delivery_code": str(code or "").strip(),
+        "delivery_pin": str(item.get("delivery_pin") or item.get("giftcard_pin") or "").strip(),
+        "delivery_link": str(item.get("delivery_link") or item.get("giftcard_link") or "").strip(),
+        "status": item.get("status") if item.get("status") in STOCK_STATUSES else "available",
+        "source_order_id": str(item.get("source_order_id") or ""),
+        "used_order_id": str(item.get("used_order_id") or ""),
+        "created_at": item.get("created_at") or now_str(),
+        "used_at": item.get("used_at") or "",
+        "comment": item.get("comment") or "",
+    }
+    migrated["giftcard_code"] = migrated["delivery_code"]
+    migrated["giftcard_pin"] = migrated["delivery_pin"]
+    migrated["giftcard_link"] = migrated["delivery_link"]
+    return migrated
+
+
+def migrate_apple_id_stock_to_unified() -> bool:
+    legacy = load_runtime_json(APPLE_ID_STOCK_FILE, [], list) if APPLE_ID_STOCK_FILE.exists() else []
+    if not legacy:
         return False
-    for item in load_apple_id_stock():
-        if normalize_stock_code(item.get("giftcard_code")) == normalized:
-            return True
-    for order in load_orders():
-        if normalize_stock_code(order.get("giftcard_code")) == normalized:
-            return True
-    return False
+    current = load_runtime_json(STOCK_FILE, [], list)
+    existing_ids = {str(item.get("id")) for item in current if isinstance(item, dict)}
+    existing_codes = {normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) for item in current if isinstance(item, dict)}
+    changed = False
+    for item in legacy:
+        if not isinstance(item, dict):
+            continue
+        migrated = migrate_apple_id_stock_item(item)
+        code_key = normalize_stock_code(migrated.get("delivery_code"))
+        if str(migrated.get("id")) in existing_ids or (code_key and code_key in existing_codes):
+            continue
+        current.append(migrated)
+        existing_ids.add(str(migrated.get("id")))
+        existing_codes.add(code_key)
+        changed = True
+    if changed:
+        save_runtime_json(STOCK_FILE, current)
+    return changed
+
+
+def normalize_stock_item(item: dict) -> dict:
+    item.setdefault("id", f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}")
+    item.setdefault("category", "apple_id")
+    item.setdefault("product_key", "")
+    item.setdefault("supplier", "")
+    item.setdefault("supplier_order_id", "")
+    item.setdefault("region", "")
+    item.setdefault("amount", "")
+    item.setdefault("currency", "")
+    item.setdefault("title", "")
+    item.setdefault("delivery_type", "code")
+    item.setdefault("delivery_code", item.get("giftcard_code", ""))
+    item.setdefault("delivery_pin", item.get("giftcard_pin", ""))
+    item.setdefault("delivery_link", item.get("giftcard_link", ""))
+    item.setdefault("source_order_id", "")
+    item.setdefault("used_order_id", "")
+    item.setdefault("created_at", now_str())
+    item.setdefault("used_at", "")
+    item.setdefault("comment", "")
+    if item.get("status") not in STOCK_STATUSES:
+        item["status"] = "available"
+    if item.get("delivery_type") not in STOCK_DELIVERY_TYPES:
+        item["delivery_type"] = "code"
+    item["giftcard_code"] = item.get("delivery_code", "")
+    item["giftcard_pin"] = item.get("delivery_pin", "")
+    item["giftcard_link"] = item.get("delivery_link", "")
+    return item
+
+
+def load_stock() -> list:
+    migrate_apple_id_stock_to_unified()
+    items = load_runtime_json(STOCK_FILE, [], list)
+    changed = False
+    normalized = []
+    for item in items:
+        if isinstance(item, dict):
+            before = dict(item)
+            normalized_item = normalize_stock_item(item)
+            normalized.append(normalized_item)
+            changed = changed or before != normalized_item
+    if changed:
+        save_stock(normalized)
+    return normalized
+
+
+def save_stock(items: list) -> None:
+    save_runtime_json(STOCK_FILE, items if isinstance(items, list) else [])
+
+
+APPLE_ID_STOCK_STATUSES = STOCK_STATUSES
+
+
+def load_apple_id_stock() -> list:
+    return [item for item in load_stock() if item.get("category") == "apple_id"]
+
+
+def save_apple_id_stock(items: list) -> None:
+    others = [item for item in load_stock() if item.get("category") != "apple_id"]
+    save_stock(others + [normalize_stock_item({**item, "category": "apple_id"}) for item in (items if isinstance(items, list) else [])])
+
+
+def apple_id_stock_code_exists(code: str) -> bool:
+    return bool(apple_id_stock_duplicate_reason(code))
 
 
 def apple_id_stock_duplicate_reason(code: str) -> str:
@@ -826,7 +956,7 @@ def apple_id_stock_duplicate_reason(code: str) -> str:
     if not normalized:
         return "empty_code"
     for item in load_apple_id_stock():
-        if normalize_stock_code(item.get("giftcard_code")) == normalized:
+        if normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == normalized:
             if item.get("status") == "used" or item.get("used_order_id"):
                 return f"used_stock:{item.get('used_order_id') or item.get('id') or ''}"
             return "stock"
@@ -854,14 +984,14 @@ def find_available_apple_id_stock_code(region: str, amount, currency: str) -> di
             and str(item.get("region") or "").upper().strip() == region_key
             and str(item.get("currency") or "").upper().strip() == currency_key
             and stock_amount_key(item.get("amount")) == amount_key
-            and normalize_stock_code(item.get("giftcard_code"))
+            and normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code"))
         ):
             return item
     return None
 
 
 def mark_apple_id_stock_code_used(stock_id: str, order_id: int) -> dict | None:
-    items = load_apple_id_stock()
+    items = load_stock()
     for item in items:
         if str(item.get("id") or "") == str(stock_id):
             if item.get("status") == "used":
@@ -869,9 +999,19 @@ def mark_apple_id_stock_code_used(stock_id: str, order_id: int) -> dict | None:
             item["status"] = "used"
             item["used_order_id"] = str(order_id)
             item["used_at"] = now_str()
-            save_apple_id_stock(items)
-            return item
+            save_stock(items)
+            return normalize_stock_item(item)
     return None
+
+
+def add_stock_item(item: dict) -> dict:
+    items = load_stock()
+    normalized = normalize_stock_item(item)
+    if not normalized.get("id"):
+        normalized["id"] = f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}"
+    items.append(normalized)
+    save_stock(items)
+    return normalized
 
 
 def add_apple_id_stock_code(supplier_order_id: str, region: str, amount, currency: str, code: str, supplier: str = "fazercards", pin: str = "", link: str = "", comment: str = "") -> dict:
@@ -884,27 +1024,27 @@ def add_apple_id_stock_code(supplier_order_id: str, region: str, amount, currenc
             order_id = duplicate_reason.split(":", 1)[1]
             raise ValueError(f"duplicate_order:{order_id}" if order_id else "duplicate")
         raise ValueError(f"duplicate:{duplicate_reason}")
-    items = load_apple_id_stock()
-    item = {
-        "id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}",
+    items_count = len(load_stock())
+    return add_stock_item({
+        "id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{items_count + 1}",
+        "category": "apple_id",
+        "product_key": f"apple_id_{str(region or '').lower()}_{stock_amount_key(amount)}_{str(currency or '').lower()}",
         "supplier": supplier or "fazercards",
         "supplier_order_id": str(supplier_order_id or "").strip(),
         "region": str(region or "").upper().strip(),
         "amount": amount,
         "currency": str(currency or "").upper().strip(),
-        "giftcard_code": str(code or "").strip(),
-        "giftcard_pin": str(pin or "").strip(),
-        "giftcard_link": str(link or "").strip(),
+        "title": f"Apple ID {str(region or '').upper()} {amount} {str(currency or '').upper()}",
+        "delivery_type": "code",
+        "delivery_code": str(code or "").strip(),
+        "delivery_pin": str(pin or "").strip(),
+        "delivery_link": str(link or "").strip(),
         "status": "available",
         "created_at": now_str(),
         "used_at": "",
         "used_order_id": "",
         "comment": str(comment or "").strip(),
-    }
-    items.append(item)
-    save_apple_id_stock(items)
-    return item
-
+    })
 
 # ─── users.json ───────────────────────────────────────────────────────────────
 
@@ -2985,6 +3125,41 @@ def save_auto_fulfillment_settings(**fields) -> dict:
     return get_auto_fulfillment_settings()
 
 
+def get_stock_settings() -> dict:
+    cfg = load_config().get("stock") or {}
+    defaults = DEFAULT_CONFIG["stock"]
+    categories = cfg.get("categories") if isinstance(cfg.get("categories"), dict) else {}
+    merged = {"enabled": cfg.get("enabled", defaults["enabled"]), "categories": {}}
+    for category, category_defaults in defaults["categories"].items():
+        current = categories.get(category) if isinstance(categories.get(category), dict) else {}
+        merged["categories"][category] = {
+            "enabled": current.get("enabled", category_defaults["enabled"]),
+            "fallback_to_supplier": current.get("fallback_to_supplier", category_defaults["fallback_to_supplier"]),
+        }
+    return merged
+
+
+def stock_category_settings(category: str) -> dict:
+    settings = get_stock_settings()
+    default = DEFAULT_CONFIG["stock"]["categories"].get(category, {"enabled": False, "fallback_to_supplier": False})
+    current = settings.get("categories", {}).get(category, default)
+    return {"enabled": bool(settings.get("enabled", True) and current.get("enabled")), "fallback_to_supplier": bool(current.get("fallback_to_supplier"))}
+
+
+def is_stock_enabled_for_category(category: str) -> bool:
+    return bool(stock_category_settings(category).get("enabled"))
+
+
+def save_stock_category_settings(category: str, **fields) -> dict:
+    cfg = load_config()
+    stock = cfg.setdefault("stock", {})
+    categories = stock.setdefault("categories", {})
+    current = categories.setdefault(category, {})
+    current.update(fields)
+    save_config(cfg)
+    return stock_category_settings(category)
+
+
 def order_already_fulfilled(order: dict) -> bool:
     return (
         order_fulfillment_status(order) in {"issued", "auto_issued"}
@@ -3146,6 +3321,8 @@ def issue_apple_id_order_from_stock(order_id: int) -> tuple[dict | None, dict | 
         return order, None, "already_has_code"
     if order_fulfillment_status(order) not in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"}:
         return order, None, "status_not_allowed"
+    if not is_stock_enabled_for_category("apple_id"):
+        return order, None, "stock_disabled"
     stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency"))
     if not stock:
         return order, None, "no_matching_stock"
@@ -3202,6 +3379,9 @@ async def fetch_fazercards_order_details(order_id: str) -> dict:
 
 
 async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
+    stock_settings = stock_category_settings("telegram_stars")
+    if stock_settings.get("enabled") and not stock_settings.get("fallback_to_supplier"):
+        return {"ok": False, "error": "stock_empty_supplier_disabled", "manual_fallback": True, "supplier_disabled": True}
     if order_category_key(order) != "telegram_stars" and str(order.get("product_type") or "") != "telegram_stars":
         return {"ok": False, "error": "not_telegram_stars_order", "manual_fallback": True}
     if order_payment_status(order) != "paid":
@@ -3234,6 +3414,9 @@ async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
 
 
 async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
+    stock_settings = stock_category_settings("telegram_premium")
+    if stock_settings.get("enabled") and not stock_settings.get("fallback_to_supplier"):
+        return {"ok": False, "error": "stock_empty_supplier_disabled", "manual_fallback": True, "supplier_disabled": True}
     if order_category_key(order) != "telegram_premium" and str(order.get("product_type") or "") != "telegram_premium":
         return {"ok": False, "error": "not_telegram_premium_order", "manual_fallback": True}
     if order_payment_status(order) != "paid":
@@ -3267,6 +3450,7 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
 
 
 async def auto_fulfill_apple_id_order(order: dict) -> dict:
+    apple_stock_settings = stock_category_settings("apple_id")
     if order_category_key(order) != "apple_id" and str(order.get("product_type") or "") != "apple_id":
         return {"ok": False, "error": "not_apple_id_order", "manual_fallback": True}
     if order_payment_status(order) != "paid":
@@ -3281,7 +3465,7 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
         fields = giftcard_fields_from_response(details)
         if fields.get("giftcard_code"):
             return {"ok": True, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), **fields}
-        stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency"))
+        stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency")) if apple_stock_settings.get("enabled") else None
         if stock:
             updated, used, stock_error = issue_apple_id_order_from_stock(int(order.get("id")))
             if updated and used and not stock_error:
@@ -3294,7 +3478,7 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
         return {"ok": False, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), **fields, "error": error, "manual_fallback": True}
 
     if order.get("supplier_purchase_attempted"):
-        stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency"))
+        stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency")) if apple_stock_settings.get("enabled") else None
         if stock:
             updated, used, stock_error = issue_apple_id_order_from_stock(int(order.get("id")))
             if updated and used and not stock_error:
@@ -3304,12 +3488,14 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
 
     if apple_id_supplier_purchase_already_attempted(order):
         return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
-    stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency"))
+    stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency")) if apple_stock_settings.get("enabled") else None
     if stock:
         updated, used, error = issue_apple_id_order_from_stock(int(order.get("id")))
         if updated and used and not error:
             return {"ok": True, "supplier": used.get("supplier") or "fazercards", "supplier_order_id": used.get("supplier_order_id") or "", "from_stock": True, "stock_code_id": used.get("id"), "giftcard_code": used.get("giftcard_code"), "giftcard_pin": used.get("giftcard_pin", ""), "giftcard_link": used.get("giftcard_link", "")}
         return {"ok": False, "error": f"apple_id_stock_issue_failed:{error}", "manual_fallback": True, "stock_code_id": (stock or {}).get("id")}
+    if apple_stock_settings.get("enabled") and not apple_stock_settings.get("fallback_to_supplier"):
+        return {"ok": False, "supplier": "fazercards", "error": "stock_empty_supplier_disabled", "manual_fallback": True, "supplier_disabled": True}
     category_id = order.get("fazercards_category_id")
     card_id = order.get("fazercards_card_id") or order.get("fazercards_product_id")
     product_id = order.get("fazercards_product_id") or card_id
@@ -3363,7 +3549,8 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
         else:
             error = f"giftcard_code_missing: response_keys={supplier_response_shape(data)}"
         return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), **fields, "error": error, "manual_fallback": True}
-    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), **fields}
+    stock_item = add_stock_item({"category": "apple_id", "product_key": f"apple_id_{str(region or '').lower()}_{stock_amount_key(amount)}_{str(currency or '').lower()}", "supplier": "fazercards", "supplier_order_id": supplier_order_id, "region": region, "amount": amount, "currency": currency, "title": f"Apple ID {region} {amount} {currency}", "delivery_type": "code", "delivery_code": fields.get("giftcard_code", ""), "delivery_pin": fields.get("giftcard_pin", ""), "delivery_link": fields.get("giftcard_link", ""), "status": "used", "source_order_id": str(order.get("id") or ""), "used_order_id": str(order.get("id") or ""), "used_at": now_str(), "comment": "created from FazerCards auto fulfillment"})
+    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), "from_stock": False, "stock_code_id": stock_item.get("id"), **fields}
 
 
 async def auto_fulfill_esim_order(order: dict) -> dict:
@@ -6038,8 +6225,8 @@ def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> I
     retry_allowed = order_payment_status(order) == "paid" and order_fulfillment_status(order) in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order) and (not order_already_fulfilled(order) or apple_id_can_fetch_existing_supplier_order(order))
     if retry_allowed:
         rows.append([InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"}:
-        rows.append([InlineKeyboardButton("📦 Выдать код со склада", callback_data=f"order_issue_stock:{order_id}")])
+    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"} and is_stock_enabled_for_category("apple_id"):
+        rows.append([InlineKeyboardButton("📦 Выдать со склада", callback_data=f"order_issue_stock:{order_id}")])
         rows.append([InlineKeyboardButton("➕ Добавить код под этот заказ", callback_data=f"order_add_stock_code:{order_id}")])
     if order_category_key(order) == "apple_id" and order.get("giftcard_code"):
         rows.append([InlineKeyboardButton("👁 Показать код", callback_data=f"order_show_code:{order_id}")])
@@ -7262,7 +7449,7 @@ def admin_payment_sections_keyboard(user=None) -> InlineKeyboardMarkup:
 def admin_service_sections_keyboard(user=None) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("🔔 Чаты уведомлений", callback_data="admin_notification_chats")]]
     if has_admin_access(user) or has_owner_access(user):
-        rows.append([InlineKeyboardButton("🍎 Склад Apple ID", callback_data="admin_apple_id_stock")])
+        rows.append([InlineKeyboardButton("📦 Склад", callback_data="admin_stock")])
     if has_backup_access(user):
         rows.append([InlineKeyboardButton("🩺 Проверка системы", callback_data="admin_healthcheck")])
         rows.append([InlineKeyboardButton("💾 Бэкапы", callback_data="admin_backups")])
@@ -7302,6 +7489,83 @@ def apple_id_stock_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚠️ Проблемные", callback_data="admin_apple_id_stock_list:problem")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
+
+def stock_status_counts(category: str) -> dict:
+    counts = {"available": 0, "pending": 0, "used": 0, "invalid": 0, "reserved": 0}
+    for item in load_stock():
+        if item.get("category") == category and item.get("status") in counts:
+            counts[item.get("status")] += 1
+    return counts
+
+
+def stock_dashboard_text() -> str:
+    settings = get_stock_settings()
+    lines = ["📦 <b>Склад товаров</b>", "", "<b>Режим:</b>"]
+    for category in ("apple_id", "telegram_stars", "telegram_premium", "esim"):
+        category_settings = settings.get("categories", {}).get(category, {})
+        enabled = bool(settings.get("enabled") and category_settings.get("enabled"))
+        if enabled:
+            fallback = "ВКЛ" if category_settings.get("fallback_to_supplier") else "ВЫКЛ"
+            lines.append(f"{STOCK_CATEGORIES[category]['title']}: склад ВКЛ, поставщик если пусто {fallback}")
+        else:
+            lines.append(f"{STOCK_CATEGORIES[category]['title']}: склад ВЫКЛ")
+    lines.extend(["", "<b>Доступные позиции:</b>"])
+    for category in ("apple_id", "telegram_stars", "telegram_premium", "esim"):
+        lines.append(f"{stock_category_title(category)}: {stock_status_counts(category)['available']}")
+    return "\n".join(lines)
+
+
+def stock_dashboard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(stock_category_title("apple_id"), callback_data="admin_stock_category:apple_id")],
+        [InlineKeyboardButton(stock_category_title("telegram_stars"), callback_data="admin_stock_category:telegram_stars")],
+        [InlineKeyboardButton(stock_category_title("telegram_premium"), callback_data="admin_stock_category:telegram_premium")],
+        [InlineKeyboardButton(stock_category_title("esim"), callback_data="admin_stock_category:esim")],
+        [InlineKeyboardButton("⚙️ Настройки склада", callback_data="admin_stock_settings")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
+    ])
+
+
+def stock_category_text(category: str) -> str:
+    settings = stock_category_settings(category)
+    counts = stock_status_counts(category)
+    return (
+        f"📦 <b>Склад: {html_escape(STOCK_CATEGORIES.get(category, {}).get('title', category))}</b>\n\n"
+        f"Использовать склад: {'✅ ВКЛ' if settings.get('enabled') else '❌ ВЫКЛ'}\n"
+        f"Если склад пустой — покупать у поставщика: {'✅ ВКЛ' if settings.get('fallback_to_supplier') else '❌ ВЫКЛ'}\n\n"
+        f"Доступно: {counts['available']}\n"
+        f"Pending: {counts['pending']}\n"
+        f"Used: {counts['used']}\n"
+        f"Invalid: {counts['invalid']}"
+    )
+
+
+def stock_category_keyboard(category: str) -> InlineKeyboardMarkup:
+    settings = stock_category_settings(category)
+    rows = [
+        [InlineKeyboardButton(f"🔁 Использовать склад: {'ВКЛ' if settings.get('enabled') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_enabled:{category}")],
+        [InlineKeyboardButton(f"🔁 Покупать у поставщика если пусто: {'ВКЛ' if settings.get('fallback_to_supplier') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_fallback:{category}")],
+        [InlineKeyboardButton("➕ Добавить товар", callback_data=("admin_apple_id_stock_add" if category == "apple_id" else f"admin_stock_add:{category}"))],
+        [InlineKeyboardButton("➕ Быстро добавить товары", callback_data=("admin_apple_id_stock_quick" if category == "apple_id" else f"admin_stock_quick:{category}"))],
+        [InlineKeyboardButton("📦 Доступные", callback_data=f"admin_stock_list:{category}:available")],
+        [InlineKeyboardButton("⏳ Ожидают код", callback_data=f"admin_stock_list:{category}:pending")],
+        [InlineKeyboardButton("✅ Использованные", callback_data=f"admin_stock_list:{category}:used")],
+        [InlineKeyboardButton("⚠️ Проблемные", callback_data=f"admin_stock_list:{category}:problem")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="admin_stock")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def stock_list_text(category: str, status_filter: str) -> str:
+    statuses = {"reserved", "invalid"} if status_filter == "problem" else {status_filter}
+    lines = [f"📦 <b>{html_escape(stock_category_title(category))}</b>", ""]
+    for item in load_stock():
+        if item.get("category") == category and item.get("status") in statuses:
+            code = item.get("delivery_code") or item.get("giftcard_code") or ""
+            lines.append(f"• <code>{html_escape(str(item.get('id') or '—'))}</code> · {html_escape(str(item.get('title') or item.get('product_key') or '—'))} · <code>{html_escape(mask_giftcard_code(code))}</code>")
+    if len(lines) == 2:
+        lines.append("Нет позиций.")
+    return "\n".join(lines)
 
 
 def apple_id_stock_catalog_regions() -> list[str]:
@@ -7614,8 +7878,8 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
     order = find_order(order_id) or {}
     rows = []
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"}:
-        rows.append([InlineKeyboardButton("📦 Выдать код со склада", callback_data=f"order_issue_stock:{order_id}")])
+    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"} and is_stock_enabled_for_category("apple_id"):
+        rows.append([InlineKeyboardButton("📦 Выдать со склада", callback_data=f"order_issue_stock:{order_id}")])
     rows.extend([
         [InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")],
         [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
@@ -11158,6 +11422,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         order_id = int(data.split(":", 1)[1])
         updated, stock, error = issue_apple_id_order_from_stock(order_id)
+        if error == "stock_disabled":
+            await edit_or_send(
+                query,
+                context,
+                "⚠️ Склад Apple ID выключен.\n\nВключите склад в:\nАдминка → Сервисы → 📦 Склад → Apple ID",
+                InlineKeyboardMarkup([[InlineKeyboardButton("📦 Открыть склад", callback_data="admin_stock_category:apple_id")], [InlineKeyboardButton("⬅️ Назад к заказу", callback_data=f"order_card:{order_id}")]]),
+            )
+            return
         if error == "no_matching_stock":
             order = updated or find_order(order_id) or {}
             text = (
@@ -11218,12 +11490,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(chat_id=query.from_user.id, text=(f"👁 Код Apple ID для {html_escape(order_number_plain(order))}:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>"), parse_mode="HTML")
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
+    elif data == "admin_stock":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        await query.answer()
+        await edit_or_send(query, context, stock_dashboard_text(), stock_dashboard_keyboard())
+    elif data == "admin_stock_settings":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        await query.answer("Выберите категорию и переключите режим.")
+        await edit_or_send(query, context, stock_dashboard_text(), stock_dashboard_keyboard())
+    elif data.startswith("admin_stock_category:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        category = data.split(":", 1)[1]
+        await query.answer()
+        await edit_or_send(query, context, stock_category_text(category), stock_category_keyboard(category))
+    elif data.startswith("admin_stock_toggle_enabled:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        category = data.split(":", 1)[1]
+        current = stock_category_settings(category)
+        save_stock_category_settings(category, enabled=not current.get("enabled"))
+        await query.answer("Настройки склада обновлены.")
+        await edit_or_send(query, context, stock_category_text(category), stock_category_keyboard(category))
+    elif data.startswith("admin_stock_toggle_fallback:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        category = data.split(":", 1)[1]
+        current = stock_category_settings(category)
+        save_stock_category_settings(category, fallback_to_supplier=not current.get("fallback_to_supplier"))
+        await query.answer("Настройки склада обновлены.")
+        await edit_or_send(query, context, stock_category_text(category), stock_category_keyboard(category))
+    elif data.startswith("admin_stock_quick:"):
+        category = data.split(":", 1)[1]
+        await query.answer()
+        await edit_or_send(query, context, "Быстрое добавление для этой категории пока не настроено.\nИспользуйте расширенное добавление.", stock_category_keyboard(category))
+    elif data.startswith("admin_stock_add:"):
+        category = data.split(":", 1)[1]
+        await query.answer()
+        await edit_or_send(query, context, "Расширенное добавление: category | product_key | title | delivery_type | region | amount | currency | supplier_order_id | code", stock_category_keyboard(category))
+    elif data.startswith("admin_stock_list:"):
+        _, category, status_filter = data.split(":", 2)
+        await query.answer()
+        await edit_or_send(query, context, stock_list_text(category, status_filter), InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{category}")]]))
     elif data == "admin_apple_id_stock":
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
             return
         await query.answer()
-        await edit_or_send(query, context, apple_id_stock_admin_text(), apple_id_stock_keyboard())
+        await edit_or_send(query, context, stock_category_text("apple_id"), stock_category_keyboard("apple_id"))
     elif data == "admin_apple_id_stock_add":
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
