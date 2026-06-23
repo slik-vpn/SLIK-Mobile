@@ -1085,6 +1085,27 @@ def find_available_apple_id_stock_code(region: str, amount, currency: str) -> di
     return None
 
 
+def stock_item_is_used(item: dict | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    return (
+        str(item.get("status") or "").strip() == "used"
+        or bool(str(item.get("used_at") or "").strip())
+        or bool(str(item.get("used_order_id") or "").strip())
+    )
+
+
+def used_stock_preserved_fields(item: dict) -> dict:
+    return {key: item.get(key) for key in ("status", "used_at", "used_order_id", "comment", "updated_at")}
+
+
+def restore_used_stock_fields(item: dict, preserved: dict) -> None:
+    item["status"] = "used"
+    for key in ("used_at", "used_order_id", "comment", "updated_at"):
+        if preserved.get(key) not in (None, ""):
+            item[key] = preserved.get(key)
+
+
 def mark_stock_item_issued(stock_id: str, used_order_id: str | None = None, comment: str = "") -> tuple[dict | None, str]:
     items = load_stock()
     for item in items:
@@ -1097,7 +1118,11 @@ def mark_stock_item_issued(stock_id: str, used_order_id: str | None = None, comm
             item["comment"] = comment or "Отмечено как выданное вручную"
             item["updated_at"] = now_str()
             save_stock(items)
-            return normalize_stock_item(item), "marked_issued"
+            saved = next((saved_item for saved_item in load_stock() if str(saved_item.get("id") or "") == str(stock_id)), None)
+            if not stock_item_is_used(saved):
+                logger.error("Stock item %s was not persisted as used after manual mark", stock_id)
+                return normalize_stock_item(item), "save_failed"
+            return normalize_stock_item(saved), "marked_issued"
     return None, "item_not_found"
 
 
@@ -1137,6 +1162,8 @@ def upsert_apple_id_fazercards_stock_item(order: dict, supplier_order_id: str, f
     if target is None:
         target = {"id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}", "category": "apple_id", "created_at": now_str()}
         items.append(target)
+    used_status_locked = stock_item_is_used(target)
+    preserved_used = used_stock_preserved_fields(target) if used_status_locked else {}
     region = order.get("region") or order.get("country") or target.get("region") or ""
     amount = order.get("nominal") or order.get("amount") or target.get("amount") or ""
     currency = order.get("currency") or target.get("currency") or ""
@@ -1150,15 +1177,17 @@ def upsert_apple_id_fazercards_stock_item(order: dict, supplier_order_id: str, f
         "currency": str(currency or "").upper().strip(),
         "title": f"Apple ID {str(region or '').upper()} {amount} {str(currency or '').upper()}".strip(),
         "delivery_type": "code",
-        "delivery_code": code,
+        "delivery_code": code or target.get("delivery_code", ""),
         "delivery_pin": str(fields.get("giftcard_pin") or target.get("delivery_pin") or "").strip(),
         "delivery_link": str(fields.get("giftcard_link") or target.get("delivery_link") or "").strip(),
-        "status": "used" if code else "pending",
+        "status": "used" if (used_status_locked or code) else status,
         "source_order_id": str(order.get("id") or target.get("source_order_id") or ""),
         "comment": target.get("comment") or "created from FazerCards order details",
     })
-    if code:
-        target["used_order_id"] = str(order.get("id") or target.get("used_order_id") or "")
+    if used_status_locked:
+        restore_used_stock_fields(target, preserved_used)
+    elif code:
+        target["used_order_id"] = str(order.get("id") or target.get("used_order_id") or "manual")
         target["used_at"] = target.get("used_at") or now_str()
     else:
         target.setdefault("used_order_id", "")
@@ -1167,6 +1196,77 @@ def upsert_apple_id_fazercards_stock_item(order: dict, supplier_order_id: str, f
     save_stock(normalized)
     return next((item for item in normalized if str(item.get("id")) == str(target.get("id"))), normalize_stock_item(target))
 
+
+def run_stock_persistence_diagnostics() -> dict:
+    result = {"ok": False, "checks": [], "error": ""}
+    original_items = load_stock()
+    test_id = f"stock_diag_{int(datetime.datetime.now(tz=TZ).timestamp())}"
+    dummy_code = "SLIK-DUMMY-CODE-0000"
+    try:
+        STOCK_FILE.read_text(encoding="utf-8") if STOCK_FILE.exists() else "[]"
+        result["checks"].append("Файл склада доступен для чтения")
+        test_item = normalize_stock_item({
+            "id": test_id,
+            "category": "apple_id",
+            "product_key": "apple_id_diag_1_usd",
+            "supplier": "fazercards",
+            "supplier_order_id": "diag-supplier-order",
+            "region": "US",
+            "amount": 1,
+            "currency": "USD",
+            "title": "Диагностическая позиция",
+            "delivery_code": dummy_code,
+            "status": "available",
+            "comment": "diagnostic temporary item",
+        })
+        save_stock(original_items + [test_item])
+        result["checks"].append("Файл склада доступен для записи")
+        marked, status = mark_stock_item_issued(test_id, "diagnostic", "Диагностическая проверка")
+        if status != "marked_issued" or not stock_item_is_used(marked):
+            raise RuntimeError("manual_mark_not_persisted")
+        reloaded = next((item for item in load_stock() if item.get("id") == test_id), None)
+        if not stock_item_is_used(reloaded):
+            raise RuntimeError("reload_lost_used_status")
+        result["checks"].append("Ручная отметка сохраняется после повторной загрузки")
+        upserted = upsert_apple_id_fazercards_stock_item(
+            {"id": "diag-order", "region": "US", "amount": 1, "currency": "USD"},
+            "diag-supplier-order",
+            {"giftcard_code": dummy_code},
+            status="pending",
+        )
+        if not stock_item_is_used(upserted) or (upserted or {}).get("status") != "used":
+            raise RuntimeError("upsert_reopened_used_item")
+        matches = [item for item in load_stock() if item.get("id") == test_id or normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == normalize_stock_code(dummy_code)]
+        if len(matches) != 1:
+            raise RuntimeError("upsert_created_duplicate")
+        result["checks"].append("Синхронизация не возвращает использованную позицию в продажу")
+        result["ok"] = True
+    except Exception as exc:
+        logger.exception("Stock persistence diagnostics failed")
+        result["error"] = str(exc)
+    finally:
+        cleanup_code_key = normalize_stock_code(dummy_code)
+        current_items = load_stock()
+        save_stock([
+            item for item in current_items
+            if not (
+                isinstance(item, dict)
+                and (item.get("id") == test_id or normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == cleanup_code_key)
+            )
+        ])
+    return result
+
+
+def stock_persistence_diagnostics_text(result: dict) -> str:
+    if result.get("ok"):
+        lines = ["🧪 <b>Проверка сохранения склада завершена</b>", "", "✅ Всё в порядке."]
+    else:
+        lines = ["🧪 <b>Проверка сохранения склада завершена</b>", "", "⚠️ Не удалось подтвердить сохранение склада. Попробуйте ещё раз или проверьте сервер."]
+    for check in result.get("checks") or []:
+        lines.append(f"• ✅ {html_escape(str(check))}")
+    if not result.get("ok"):
+        lines.append("• ⚠️ Техническая причина записана в журнал сервера")
+    return "\n".join(lines)
 
 def add_apple_id_stock_code(supplier_order_id: str, region: str, amount, currency: str, code: str, supplier: str = "fazercards", pin: str = "", link: str = "", comment: str = "") -> dict:
     normalized = normalize_stock_code(code)
@@ -3627,7 +3727,7 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
                 if normalize_stock_code(order.get("giftcard_code")) == code_key:
                     return None, "skipped"
     action = "updated" if existing else "added"
-    if existing and str(existing.get("status") or "") == "used":
+    if existing and stock_item_is_used(existing):
         action = "already"
     target = existing or {"id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}", "created_at": now_str()}
     if existing and category == "unknown" and target.get("category"):
@@ -3640,7 +3740,9 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
     if existing is None:
         items.append(target)
     current_status = str(target.get("status") or "")
-    if current_status == "used":
+    used_status_locked = stock_item_is_used(target)
+    preserved_used = used_stock_preserved_fields(target) if used_status_locked else {}
+    if used_status_locked:
         new_status = current_status
     elif code_key and category != "unknown":
         new_status = "available"
@@ -3652,7 +3754,6 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         new_status = "pending"
     else:
         new_status = "pending"
-    used_status_locked = current_status == "used"
     target_supplier_order_id = str(target.get("supplier_order_id") or supplier_order_id).strip() if used_status_locked else supplier_order_id
     response_shape = supplier_response_shape(order_data) if new_status == "pending" and not code_key else ""
     target.update({
@@ -3667,6 +3768,8 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         "giftcard_link": fields.get("giftcard_link", "") or target.get("giftcard_link", ""),
         "status": new_status, "updated_at": now_str(), "comment": target.get("comment") or "synced from FazerCards orders",
     })
+    if used_status_locked:
+        restore_used_stock_fields(target, preserved_used)
     if response_shape:
         target["last_response_shape"] = response_shape
     elif code_key:
@@ -8010,6 +8113,7 @@ def stock_dashboard_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(stock_category_title("telegram_premium"), callback_data="admin_stock_category:telegram_premium")],
         [InlineKeyboardButton(stock_category_title("esim"), callback_data="admin_stock_category:esim")],
         [InlineKeyboardButton(stock_action_label("refresh_from_fazercards"), callback_data="admin_stock_sync_fazercards")],
+        [InlineKeyboardButton("🧪 Проверить сохранение склада", callback_data="admin_stock_diagnostics")],
         [InlineKeyboardButton("⚙️ Настройки склада", callback_data="admin_stock_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
@@ -12144,6 +12248,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await edit_or_send(query, context, "🔄 Обновляю склад из FazerCards...", stock_dashboard_keyboard())
         report = await sync_fazercards_orders_to_stock()
         await edit_or_send(query, context, fazercards_stock_sync_report_text(report), stock_dashboard_keyboard())
+    elif data == "admin_stock_diagnostics":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        await query.answer("Проверяю сохранение склада...")
+        result = run_stock_persistence_diagnostics()
+        await edit_or_send(query, context, stock_persistence_diagnostics_text(result), stock_dashboard_keyboard())
     elif data.startswith("admin_stock_category:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
@@ -12201,6 +12312,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         if result == "already_used":
             await query.answer(f"Позиция уже в разделе «{stock_status_label('used', plural=True, category=(item or {}).get('category') or 'apple_id')}».", show_alert=True)
+        elif result == "save_failed":
+            await query.answer("Не удалось сохранить изменение склада. Попробуйте ещё раз или проверьте сервер.", show_alert=True)
+            return
         else:
             await query.answer("Позиция отмечена как выполненная." if (item or {}).get("category") in {"telegram_stars", "telegram_premium", "steam", "subscriptions", "manual"} else "Позиция отмечена как выданная.")
         category = item.get("category") if item else "apple_id"
