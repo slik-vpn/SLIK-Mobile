@@ -3703,7 +3703,7 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         return None, "skipped"
     fields = giftcard_fields_from_response(order_data)
     supplier_status = str(_first_order_value(order_data, ("status", "order_status", "state")) or "").lower().strip()
-    supplier_success_statuses = {"completed", "complete", "success", "successful", "paid", "issued", "done"}
+    supplier_success_statuses = {"completed", "complete", "success", "successful", "paid", "issued", "done", "fulfilled", "delivered"}
     supplier_failed_statuses = {"failed", "cancelled", "canceled", "refunded", "error"}
     code = fields.get("giftcard_code", "")
     code_key = normalize_stock_code(code)
@@ -3742,8 +3742,11 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
     current_status = str(target.get("status") or "")
     used_status_locked = stock_item_is_used(target)
     preserved_used = used_stock_preserved_fields(target) if used_status_locked else {}
+    telegram_service_completed = category in {"telegram_stars", "telegram_premium"} and supplier_status in supplier_success_statuses
     if used_status_locked:
         new_status = current_status
+    elif telegram_service_completed:
+        new_status = "used"
     elif code_key and category != "unknown":
         new_status = "available"
     elif supplier_status in supplier_failed_statuses:
@@ -3756,6 +3759,8 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         new_status = "pending"
     target_supplier_order_id = str(target.get("supplier_order_id") or supplier_order_id).strip() if used_status_locked else supplier_order_id
     response_shape = supplier_response_shape(order_data) if new_status == "pending" and not code_key else ""
+    completed_at = _first_order_value(order_data, ("completedAt", "completed_at", "fulfilledAt", "deliveredAt", "paidAt"))
+    source_order_id = str(_first_order_value(order_data, ("source_order_id", "used_order_id", "slik_order_id", "order_id")) or target.get("source_order_id") or "").strip()
     target.update({
         "category": category, "product_key": f"{category}_{region.lower()}_{stock_amount_key(amount)}_{currency.lower()}".strip("_"),
         "supplier": "fazercards", "supplier_order_id": target_supplier_order_id, "supplier_status": supplier_status, "title": title,
@@ -3768,8 +3773,14 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         "giftcard_link": fields.get("giftcard_link", "") or target.get("giftcard_link", ""),
         "status": new_status, "updated_at": now_str(), "comment": target.get("comment") or "synced from FazerCards orders",
     })
+    if source_order_id:
+        target["source_order_id"] = source_order_id
     if used_status_locked:
         restore_used_stock_fields(target, preserved_used)
+    elif telegram_service_completed:
+        target["used_at"] = str(completed_at or now_str())
+        target["used_order_id"] = source_order_id or str(target.get("used_order_id") or "")
+        target["comment"] = "Выполнено поставщиком"
     if response_shape:
         target["last_response_shape"] = response_shape
     elif code_key:
@@ -3993,10 +4004,13 @@ async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
     if card_id:
         payload["card_id"] = str(card_id)
     data = await fazercards_post_order(FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT, payload)
+    if isinstance(data, dict):
+        data.setdefault("source_order_id", str(order.get("id") or ""))
     supplier_order_id = supplier_order_id_from_response(data)
     if not supplier_order_id and not data:
         return {"ok": False, "supplier": "fazercards", "error": "supplier_empty_response", "manual_fallback": True}
-    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), "message": "issued"}
+    stock_item, _stock_action = upsert_stock_item_from_fazercards_order(data) if supplier_order_id else (None, "skipped")
+    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), "stock_code_id": (stock_item or {}).get("id", ""), "message": "issued"}
 
 
 async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
@@ -4029,10 +4043,13 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
     if card_id:
         payload["card_id"] = str(card_id)
     data = await fazercards_post_order(FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT, payload)
+    if isinstance(data, dict):
+        data.setdefault("source_order_id", str(order.get("id") or ""))
     supplier_order_id = supplier_order_id_from_response(data)
     if not supplier_order_id and not data:
         return {"ok": False, "supplier": "fazercards", "error": "supplier_empty_response", "manual_fallback": True}
-    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), "message": "issued"}
+    stock_item, _stock_action = upsert_stock_item_from_fazercards_order(data) if supplier_order_id else (None, "skipped")
+    return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), "stock_code_id": (stock_item or {}).get("id", ""), "message": "issued"}
 
 
 async def auto_fulfill_apple_id_order(order: dict) -> dict:
