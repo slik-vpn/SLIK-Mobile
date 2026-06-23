@@ -429,6 +429,8 @@ APPLE_ID_INPUT_ADD_AMOUNT = "apple_id_add_amount"
 APPLE_ID_INPUT_ADD_PRICE = "apple_id_add_price"
 APPLE_ID_INPUT_MARKUP = "apple_id_markup"
 APPLE_ID_STOCK_INPUT_ADD = "apple_id_stock_add"
+APPLE_ID_STOCK_INPUT_QUICK_CODES = "apple_id_stock_quick_codes"
+APPLE_ID_STOCK_INPUT_QUICK_REGION = "apple_id_stock_quick_region"
 TELEGRAM_QUOTE_USERNAME_INPUT = "telegram_quote_username"
 TELEGRAM_PRODUCT_PRICE_INPUT = "telegram_product_price_input"
 TELEGRAM_PRODUCT_MARKUP_INPUT = "telegram_product_markup_input"
@@ -819,6 +821,21 @@ def apple_id_stock_code_exists(code: str) -> bool:
     return False
 
 
+def apple_id_stock_duplicate_reason(code: str) -> str:
+    normalized = normalize_stock_code(code)
+    if not normalized:
+        return "empty_code"
+    for item in load_apple_id_stock():
+        if normalize_stock_code(item.get("giftcard_code")) == normalized:
+            if item.get("status") == "used" or item.get("used_order_id"):
+                return f"used_stock:{item.get('used_order_id') or item.get('id') or ''}"
+            return "stock"
+    for order in load_orders():
+        if normalize_stock_code(order.get("giftcard_code")) == normalized:
+            return f"order:{order.get('id') or order.get('number') or ''}"
+    return ""
+
+
 def apple_id_stock_code_duplicate_order_id(code: str) -> str:
     normalized = normalize_stock_code(code)
     for order in load_orders():
@@ -861,9 +878,12 @@ def add_apple_id_stock_code(supplier_order_id: str, region: str, amount, currenc
     normalized = normalize_stock_code(code)
     if not normalized:
         raise ValueError("empty_code")
-    if apple_id_stock_code_exists(code):
-        order_id = apple_id_stock_code_duplicate_order_id(code)
-        raise ValueError(f"duplicate_order:{order_id}" if order_id else "duplicate")
+    duplicate_reason = apple_id_stock_duplicate_reason(code)
+    if duplicate_reason:
+        if duplicate_reason.startswith("order:"):
+            order_id = duplicate_reason.split(":", 1)[1]
+            raise ValueError(f"duplicate_order:{order_id}" if order_id else "duplicate")
+        raise ValueError(f"duplicate:{duplicate_reason}")
     items = load_apple_id_stock()
     item = {
         "id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}",
@@ -6020,6 +6040,7 @@ def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> I
         rows.append([InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
     if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"}:
         rows.append([InlineKeyboardButton("📦 Выдать код со склада", callback_data=f"order_issue_stock:{order_id}")])
+        rows.append([InlineKeyboardButton("➕ Добавить код под этот заказ", callback_data=f"order_add_stock_code:{order_id}")])
     if order_category_key(order) == "apple_id" and order.get("giftcard_code"):
         rows.append([InlineKeyboardButton("👁 Показать код", callback_data=f"order_show_code:{order_id}")])
     rows.extend([
@@ -7274,12 +7295,87 @@ def apple_id_stock_admin_text() -> str:
 
 def apple_id_stock_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Быстро добавить коды", callback_data="admin_apple_id_stock_quick")],
         [InlineKeyboardButton("➕ Добавить код", callback_data="admin_apple_id_stock_add")],
         [InlineKeyboardButton("📦 Доступные коды", callback_data="admin_apple_id_stock_list:available")],
         [InlineKeyboardButton("✅ Использованные", callback_data="admin_apple_id_stock_list:used")],
         [InlineKeyboardButton("⚠️ Проблемные", callback_data="admin_apple_id_stock_list:problem")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
+
+
+def apple_id_stock_catalog_regions() -> list[str]:
+    products = get_apple_id_products()
+    regions = [str(region).upper().strip() for region, items in products.items() if isinstance(items, list) and items]
+    return sorted({region for region in regions if region})
+
+
+def apple_id_stock_region_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(region, callback_data=f"admin_apple_id_stock_quick_region:{region}")] for region in apple_id_stock_catalog_regions()]
+    rows.append([InlineKeyboardButton("✍️ Ввести регион вручную", callback_data="admin_apple_id_stock_quick_region_manual")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_apple_id_stock")])
+    return InlineKeyboardMarkup(rows)
+
+
+def apple_id_stock_amount_keyboard(region: str) -> InlineKeyboardMarkup:
+    rows = []
+    for product in apple_id_products_by_region(region, valid_only=True):
+        amount = product.get("amount")
+        currency = str(product.get("currency") or "").upper()
+        rows.append([InlineKeyboardButton(f"{amount} {currency}".strip(), callback_data=f"admin_apple_id_stock_quick_amount:{region}:{amount}:{currency}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("✍️ Ввести регион вручную", callback_data="admin_apple_id_stock_quick_region_manual")])
+    rows.append([InlineKeyboardButton("⬅️ К регионам", callback_data="admin_apple_id_stock_quick")])
+    return InlineKeyboardMarkup(rows)
+
+
+def apple_id_stock_quick_prompt(region: str, amount, currency: str, order_id: int | None = None) -> str:
+    if order_id:
+        return (
+            f"Вставьте код для заказа #{order_id}:\n"
+            f"{region} {amount} {currency}\n\n"
+            "Можно вставить CODE или supplier_order_id | CODE."
+        )
+    return (
+        "Вставьте Apple ID коды для:\n"
+        f"{region} {amount} {currency}\n\n"
+        "Можно вставить один код или несколько кодов.\n"
+        "Каждый код — с новой строки.\n\n"
+        "Пример:\n"
+        "XXXX-XXXX-XXXX\n"
+        "YYYY-YYYY-YYYY\n"
+        "ZZZZ-ZZZZ-ZZZZ"
+    )
+
+
+def parse_apple_id_quick_stock_line(line: str) -> tuple[str, str]:
+    if "|" in line:
+        supplier_order_id, code = line.split("|", 1)
+        return supplier_order_id.strip(), code.strip()
+    return "", line.strip()
+
+
+def apple_id_stock_add_result_text(region: str, amount, currency: str, added: list[dict], duplicates: list[tuple[str, str]], errors: list[tuple[str, str]]) -> str:
+    lines = [
+        "✅ Добавление завершено",
+        "",
+        f"Регион: {html_escape(str(region))}",
+        f"Номинал: {html_escape(str(amount))} {html_escape(str(currency))}",
+        "",
+        f"Добавлено: {len(added)}",
+        f"Дубликаты: {len(duplicates)}",
+        f"Ошибки: {len(errors)}",
+    ]
+    if added:
+        lines.extend(["", "Добавленные:"])
+        lines.extend(f"• <code>{html_escape(mask_giftcard_code(item.get('giftcard_code')))}</code>" for item in added[:20])
+    if duplicates:
+        lines.extend(["", "Дубликаты:"])
+        lines.extend(f"• <code>{html_escape(mask_giftcard_code(code))}</code> {html_escape(reason)}" for code, reason in duplicates[:20])
+    if errors:
+        lines.extend(["", "Ошибки:"])
+        lines.extend(f"• <code>{html_escape(mask_giftcard_code(code))}</code> {html_escape(reason)}" for code, reason in errors[:20])
+    return "\n".join(lines)
 
 
 def apple_id_stock_list_text(status_filter: str) -> str:
@@ -9022,6 +9118,66 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             f"Номинал: {html_escape(str(stock.get('amount')))} {html_escape(str(stock.get('currency')))}\n"
             f"Код: {html_escape(mask_giftcard_code(stock.get('giftcard_code')))}\n"
             f"Статус: {html_escape(str(stock.get('status')))}",
+            parse_mode="HTML",
+            reply_markup=apple_id_stock_keyboard(),
+        )
+        return
+
+    if input_mode == APPLE_ID_STOCK_INPUT_QUICK_REGION:
+        region = msg.text.strip().upper()
+        context.user_data["stock_region"] = region
+        context.user_data.pop("client_input", None)
+        await msg.reply_text(
+            f"Выберите номинал для {html_escape(region)}:",
+            parse_mode="HTML",
+            reply_markup=apple_id_stock_amount_keyboard(region),
+        )
+        return
+
+    if input_mode == APPLE_ID_STOCK_INPUT_QUICK_CODES:
+        region = context.user_data.get("stock_region")
+        amount = context.user_data.get("stock_amount")
+        currency = context.user_data.get("stock_currency")
+        source_order_id = context.user_data.get("source_order_id")
+        if not region or amount in (None, "") or not currency:
+            context.user_data.pop("client_input", None)
+            await msg.reply_text("⚠️ Не выбран регион или номинал.", reply_markup=apple_id_stock_keyboard())
+            return
+        added, duplicates, errors = [], [], []
+        for raw_line in msg.text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            supplier_order_id, code = parse_apple_id_quick_stock_line(line)
+            try:
+                added.append(add_apple_id_stock_code(supplier_order_id, region, amount, currency, code, comment=(f"source_order_id={source_order_id}" if source_order_id else "")))
+            except ValueError as exc:
+                reason = str(exc)
+                if reason.startswith("duplicate_order:"):
+                    order_id = reason.split(":", 1)[1]
+                    duplicates.append((code, f"уже есть в заказе #{order_id}" if order_id else "уже есть в заказах"))
+                elif reason.startswith("duplicate:"):
+                    duplicates.append((code, "уже есть на складе" if reason.endswith(":stock") else "уже использован ранее"))
+                else:
+                    errors.append((code, reason))
+        context.user_data.pop("client_input", None)
+        for key in ("stock_region", "stock_amount", "stock_currency"):
+            context.user_data.pop(key, None)
+        if source_order_id and len(added) == 1:
+            context.user_data.pop("source_order_id", None)
+            await msg.reply_text(
+                apple_id_stock_add_result_text(region, amount, currency, added, duplicates, errors)
+                + f"\n\n✅ Код добавлен на склад.\nВыдать заказу #{html_escape(str(source_order_id))}?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Выдать сейчас", callback_data=f"order_issue_stock:{source_order_id}")],
+                    [InlineKeyboardButton("❌ Оставить на складе", callback_data=f"order_card:{source_order_id}")],
+                ]),
+            )
+            return
+        context.user_data.pop("source_order_id", None)
+        await msg.reply_text(
+            apple_id_stock_add_result_text(region, amount, currency, added, duplicates, errors),
             parse_mode="HTML",
             reply_markup=apple_id_stock_keyboard(),
         )
@@ -11010,7 +11166,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"Регион: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n"
                 f"Номинал: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))} {html_escape(str(order.get('currency') or ''))}"
             )
-            await edit_or_send(query, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить код", callback_data="admin_apple_id_stock_add")], [InlineKeyboardButton("⬅️ Назад к заказу", callback_data=f"order_card:{order_id}")]]))
+            await edit_or_send(query, context, text, InlineKeyboardMarkup([[InlineKeyboardButton("➕ Добавить код под этот заказ", callback_data=f"order_add_stock_code:{order_id}")], [InlineKeyboardButton("➕ Добавить код", callback_data="admin_apple_id_stock_add")], [InlineKeyboardButton("⬅️ Назад к заказу", callback_data=f"order_card:{order_id}")]]))
             return
         if error or not updated or not stock:
             tech_chat_id = get_tech_alerts_chat_id()
@@ -11030,6 +11186,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await edit_or_send(query, context, build_order_card_text(updated), order_card_keyboard(order_id))
     elif data.startswith("order_manual_code:"):
         await query.answer("Используйте склад Apple ID.", show_alert=True)
+    elif data.startswith("order_add_stock_code:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await query.answer("⛔️ Недостаточно прав.", show_alert=True)
+            return
+        order_id = int(data.split(":", 1)[1])
+        order = find_order(order_id) or {}
+        if order_category_key(order) != "apple_id":
+            await query.answer("Это не Apple ID заказ.", show_alert=True)
+            return
+        region = str(order.get("region") or order.get("country") or "").upper().strip()
+        amount = order.get("nominal") or order.get("amount")
+        currency = str(order.get("currency") or "").upper().strip()
+        context.user_data["client_input"] = APPLE_ID_STOCK_INPUT_QUICK_CODES
+        context.user_data["stock_region"] = region
+        context.user_data["stock_amount"] = amount
+        context.user_data["stock_currency"] = currency
+        context.user_data["source_order_id"] = order_id
+        await query.answer()
+        await context.bot.send_message(chat_id=query.from_user.id, text=apple_id_stock_quick_prompt(region, amount, currency, order_id=order_id))
     elif data.startswith("order_show_code:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await query.answer("⛔️ Недостаточно прав.", show_alert=True)
@@ -11064,6 +11239,38 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "ord-49748 | US | 2 | USD | XXXX-XXXX-XXXX"
             ),
         )
+    elif data == "admin_apple_id_stock_quick":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        await query.answer()
+        await edit_or_send(query, context, "Выберите регион для быстрого добавления Apple ID кодов:", apple_id_stock_region_keyboard())
+    elif data == "admin_apple_id_stock_quick_region_manual":
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        context.user_data["client_input"] = APPLE_ID_STOCK_INPUT_QUICK_REGION
+        await query.answer()
+        await context.bot.send_message(chat_id=query.from_user.id, text="Введите регион вручную, например US:")
+    elif data.startswith("admin_apple_id_stock_quick_region:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        region = data.split(":", 1)[1].upper()
+        context.user_data["stock_region"] = region
+        await query.answer()
+        await edit_or_send(query, context, f"Выберите номинал для {html_escape(region)}:", apple_id_stock_amount_keyboard(region))
+    elif data.startswith("admin_apple_id_stock_quick_amount:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        _, region, amount, currency = data.split(":", 3)
+        context.user_data["client_input"] = APPLE_ID_STOCK_INPUT_QUICK_CODES
+        context.user_data["stock_region"] = region
+        context.user_data["stock_amount"] = amount
+        context.user_data["stock_currency"] = currency
+        await query.answer()
+        await context.bot.send_message(chat_id=query.from_user.id, text=apple_id_stock_quick_prompt(region, amount, currency))
     elif data.startswith("admin_apple_id_stock_list:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
