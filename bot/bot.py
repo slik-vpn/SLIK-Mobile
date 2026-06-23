@@ -2758,9 +2758,11 @@ def fazercards_api_error(exc: Exception) -> str:
         detail = ""
         try:
             payload = exc.response.json()
-            detail = str(payload.get("error") or payload.get("message") or "") if isinstance(payload, dict) else ""
+            detail = str(payload.get("error") or payload.get("message") or payload.get("detail") or payload.get("body") or "") if isinstance(payload, dict) else ""
         except Exception:
             detail = exc.response.text[:120]
+        if exc.response.status_code == 400 and "telegram_username" in detail and "required" in detail:
+            return "supplier_validation_error: missing telegram_username"
         return f"HTTP {exc.response.status_code}" + (f" / {detail}" if detail else "")
     if isinstance(exc, ValueError):
         return f"parse error: {exc}"
@@ -2955,7 +2957,7 @@ async def auto_fulfill_telegram_stars_order(order: dict) -> dict:
     if not product_id and not card_id:
         return {"ok": False, "error": "telegram_stars_supplier_product_missing", "manual_fallback": True}
 
-    payload = {"product_id": str(product_id or card_id), "quantity": amount, "amount": amount, "recipient": username, "username": username}
+    payload = {"telegram_username": username, "product_id": str(product_id or card_id), "quantity": amount, "amount": amount, "recipient": username, "username": username}
     if category_id:
         payload["category_id"] = str(category_id)
     if card_id:
@@ -2988,7 +2990,7 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
     if not product_id and not card_id:
         return {"ok": False, "error": "telegram_premium_supplier_product_missing", "manual_fallback": True}
 
-    payload = {"product_id": str(product_id or card_id), "duration_months": months, "months": months, "recipient": username, "username": username}
+    payload = {"telegram_username": username, "product_id": str(product_id or card_id), "duration_months": months, "months": months, "recipient": username, "username": username}
     if category_id:
         payload["category_id"] = str(category_id)
     if card_id:
