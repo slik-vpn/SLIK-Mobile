@@ -3293,6 +3293,24 @@ def supplier_response_shape(payload) -> str:
             return ""
         return ",".join(str(key) for key in list(value.keys())[:30])
 
+    def describe_card_like_path(root, prefix: str, path: tuple[str, ...]):
+        current = root
+        label = prefix
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return
+            current = current.get(key)
+            label = f"{label}.{key}" if label else key
+        if isinstance(current, list):
+            if not current:
+                lines.append(f"{label}: empty list")
+            elif isinstance(current[0], dict):
+                lines.append(f"{label}[0] keys: {safe_keys(current[0])}")
+            else:
+                lines.append(f"{label}[0] type: {type(current[0]).__name__}")
+        else:
+            lines.append(f"{label} type: {type(current).__name__}")
+
     if isinstance(payload, dict):
         lines.append(f"root keys: {safe_keys(payload)}")
         for key, value in payload.items():
@@ -3304,13 +3322,18 @@ def supplier_response_shape(payload) -> str:
                     lines.append(f"{key}[0] keys: {safe_keys(value[0])}")
             if len(lines) >= 12:
                 break
+        for path in (
+            ("order", "cards"), ("data", "cards"), ("result", "cards"),
+            ("order", "items"), ("data", "items"), ("result", "items"),
+        ):
+            describe_card_like_path(payload, "", path)
     elif isinstance(payload, list):
         lines.append(f"list length: {len(payload)}")
         if payload and isinstance(payload[0], dict):
             lines.append(f"[0] keys: {safe_keys(payload[0])}")
     else:
         lines.append(f"type: {type(payload).__name__}")
-    return "; ".join(lines)[:500]
+    return "; ".join(dict.fromkeys(lines))[:500]
 
 
 def supplier_order_id_from_response(payload) -> str:
@@ -3336,9 +3359,10 @@ def supplier_order_id_from_response(payload) -> str:
 
 def giftcard_fields_from_response(payload) -> dict:
     fields = {"giftcard_code": "", "giftcard_pin": "", "giftcard_link": ""}
-    code_keys = {"code", "giftcard_code", "delivery_code", "card_code", "voucher", "activation_code", "redeem_code", "voucher_code", "serial"}
-    pin_keys = {"pin", "giftcard_pin"}
+    code_keys = {"code", "delivery_code", "giftcard_code", "card_code", "activation_code", "redeem_code", "voucher_code", "serial", "value", "number", "key", "secret", "token", "voucher"}
+    pin_keys = {"pin", "giftcard_pin", "security_code"}
     link_keys = {"link", "url", "claim_url", "download_url", "giftcard_url"}
+    recursive_card_payload_keys = {"credentials", "credential", "data", "payload"}
 
     def walk(value):
         if isinstance(value, dict):
@@ -3445,7 +3469,7 @@ def _first_order_value(order_data: dict, keys: tuple[str, ...]):
         value = order_data.get(key)
         if value not in (None, ""):
             return value
-    for parent in ("product", "card", "giftcard", "item"):
+    for parent in ("order", "data", "result", "product", "card", "giftcard", "item"):
         nested = order_data.get(parent)
         if isinstance(nested, dict):
             value = _first_order_value(nested, keys)
@@ -3459,6 +3483,9 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
     if not supplier_order_id:
         return None, "skipped"
     fields = giftcard_fields_from_response(order_data)
+    supplier_status = str(_first_order_value(order_data, ("status", "order_status", "state")) or "").lower().strip()
+    supplier_success_statuses = {"completed", "complete", "success", "successful", "paid", "issued", "done"}
+    supplier_failed_statuses = {"failed", "cancelled", "canceled", "refunded", "error"}
     code = fields.get("giftcard_code", "")
     code_key = normalize_stock_code(code)
     category = detect_fazercards_order_category(order_data)
@@ -3490,16 +3517,22 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
     if existing is None:
         items.append(target)
     current_status = str(target.get("status") or "")
-    if current_status in {"used", "invalid"}:
+    if current_status == "used":
         new_status = current_status
     elif code_key and category != "unknown":
         new_status = "available"
+    elif supplier_status in supplier_failed_statuses:
+        new_status = "invalid"
+    elif current_status == "invalid":
+        new_status = current_status
+    elif supplier_status and supplier_status not in supplier_success_statuses:
+        new_status = "pending"
     else:
         new_status = "pending"
     response_shape = supplier_response_shape(order_data) if new_status == "pending" and not code_key else ""
     target.update({
         "category": category, "product_key": f"{category}_{region.lower()}_{stock_amount_key(amount)}_{currency.lower()}".strip("_"),
-        "supplier": "fazercards", "supplier_order_id": supplier_order_id, "title": title,
+        "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_status": supplier_status, "title": title,
         "region": region, "amount": amount, "currency": currency, "delivery_type": "code",
         "delivery_code": code or target.get("delivery_code", ""),
         "delivery_pin": fields.get("giftcard_pin", "") or target.get("delivery_pin", ""),
@@ -3571,12 +3604,15 @@ def issue_apple_id_order_from_stock(order_id: int) -> tuple[dict | None, dict | 
     return updated, used, ""
 
 
-async def fazercards_post_order(endpoint: str, payload: dict) -> dict:
+async def fazercards_post_order(endpoint: str, payload: dict, idempotency_key: str | None = None) -> dict:
     api_key = get_fazercards_api_key()
     if not api_key:
         raise ValueError("FAZERCARDS_API_KEY not configured")
+    headers = fazercards_headers(api_key)
+    if idempotency_key:
+        headers["idempotency-key"] = str(idempotency_key)
     async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
-        response = await client.post(endpoint, headers=fazercards_headers(api_key), json=payload)
+        response = await client.post(endpoint, headers=headers, json=payload)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("ok", True) is False:
@@ -3838,15 +3874,17 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
     if currency:
         payload["currency"] = currency
     attempted_at = now_str()
+    idempotency_key = order.get("supplier_idempotency_key") or f"slik-mobile:apple_id:{order['id']}"
     update_order_fields(
         order["id"],
         supplier="fazercards",
+        supplier_idempotency_key=idempotency_key,
         supplier_purchase_attempted=True,
         supplier_purchase_attempted_at=attempted_at,
         supplier_purchase_endpoint=FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT,
     )
-    order = {**order, "supplier": "fazercards", "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT}
-    data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, payload)
+    order = {**order, "supplier": "fazercards", "supplier_idempotency_key": idempotency_key, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT}
+    data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, payload, idempotency_key=idempotency_key)
     supplier_order_id = supplier_order_id_from_response(data)
     attempted_fields = {
         "supplier": "fazercards",
