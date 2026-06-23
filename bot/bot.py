@@ -3321,7 +3321,9 @@ def issue_apple_id_order_from_stock(order_id: int) -> tuple[dict | None, dict | 
         return order, None, "already_has_code"
     if order_fulfillment_status(order) not in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"}:
         return order, None, "status_not_allowed"
-    stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency")) if apple_stock_settings.get("enabled") else None
+    if not is_stock_enabled_for_category("apple_id"):
+        return order, None, "stock_disabled"
+    stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency"))
     if not stock:
         return order, None, "no_matching_stock"
     if apple_id_stock_code_duplicate_order_id(stock.get("giftcard_code")):
@@ -11420,6 +11422,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         order_id = int(data.split(":", 1)[1])
         updated, stock, error = issue_apple_id_order_from_stock(order_id)
+        if error == "stock_disabled":
+            await edit_or_send(
+                query,
+                context,
+                "⚠️ Склад Apple ID выключен.\n\nВключите склад в:\nАдминка → Сервисы → 📦 Склад → Apple ID",
+                InlineKeyboardMarkup([[InlineKeyboardButton("📦 Открыть склад", callback_data="admin_stock_category:apple_id")], [InlineKeyboardButton("⬅️ Назад к заказу", callback_data=f"order_card:{order_id}")]]),
+            )
+            return
         if error == "no_matching_stock":
             order = updated or find_order(order_id) or {}
             text = (
