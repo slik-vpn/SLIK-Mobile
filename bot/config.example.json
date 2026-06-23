@@ -49,5 +49,38 @@
     "max_retries": 2,
     "retry_delay_seconds": 30,
     "manual_fallback_enabled": true
+  },
+  "stock": {
+    "enabled": true,
+    "categories": {
+      "apple_id": {
+        "enabled": true,
+        "fallback_to_supplier": true
+      },
+      "telegram_stars": {
+        "enabled": false,
+        "fallback_to_supplier": true
+      },
+      "telegram_premium": {
+        "enabled": false,
+        "fallback_to_supplier": true
+      },
+      "esim": {
+        "enabled": false,
+        "fallback_to_supplier": false
+      },
+      "steam": {
+        "enabled": false,
+        "fallback_to_supplier": false
+      },
+      "gift_cards": {
+        "enabled": false,
+        "fallback_to_supplier": false
+      },
+      "subscriptions": {
+        "enabled": false,
+        "fallback_to_supplier": false
+      }
+    }
   }
 }

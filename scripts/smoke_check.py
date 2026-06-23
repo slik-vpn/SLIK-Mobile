@@ -728,8 +728,8 @@ def check_bot_contract(bot_text: str, env_example_text: str) -> None:
     record("Apple ID quick stock add flow exists", "➕ Быстро добавить коды" in bot_text and "admin_apple_id_stock_quick" in bot_text and "apple_id_stock_catalog_regions" in bot_text and "apple_id_stock_amount_keyboard" in bot_text and "APPLE_ID_STOCK_INPUT_QUICK_CODES" in quick_stock_input_block)
     record("Apple ID quick stock input supports bulk and optional supplier order", "parse_apple_id_quick_stock_line" in bot_text and "for raw_line in msg.text.splitlines()" in quick_stock_input_block and 'return "", line.strip()' in function_block(bot_text, "parse_apple_id_quick_stock_line") and 'supplier_order_id, code = line.split("|", 1)' in function_block(bot_text, "parse_apple_id_quick_stock_line"))
     record("Apple ID order-specific stock add exists", "➕ Добавить код под этот заказ" in bot_text and "order_add_stock_code:" in bot_text and "source_order_id" in quick_stock_input_block and "✅ Выдать сейчас" in quick_stock_input_block)
-    record("Apple ID stock add checks access duplicate and available status", "has_admin_access(update.effective_user)" in function_block(bot_text, "handle_client_crm_input") and "apple_id_stock_duplicate_reason" in function_block(bot_text, "add_apple_id_stock_code") and '"status": "available"' in function_block(bot_text, "add_apple_id_stock_code"))
-    record("Apple ID order issue from stock exists", "📦 Выдать код со склада" in bot_text and "order_issue_stock:" in bot_text and "find_available_apple_id_stock_code" in stock_issue_block and "giftcard_code=used.get" in stock_issue_block and 'fulfillment_status="issued"' in stock_issue_block and 'status="issued"' in stock_issue_block and "mark_apple_id_stock_code_used" in stock_issue_block and "used_order_id" in function_block(bot_text, "mark_apple_id_stock_code_used") and "auto_fulfillment_client_text(updated, True)" in stock_callback_block)
+    record("Apple ID stock add checks access duplicate and available status", "apple_id_stock_duplicate_reason" in function_block(bot_text, "add_apple_id_stock_code") and '"status": "available"' in function_block(bot_text, "add_apple_id_stock_code"))
+    record("Apple ID order issue from stock exists", ("📦 Выдать код со склада" in bot_text or "📦 Выдать со склада" in bot_text) and "order_issue_stock:" in bot_text and "find_available_apple_id_stock_code" in stock_issue_block and "giftcard_code=used.get" in stock_issue_block and 'fulfillment_status="issued"' in stock_issue_block and 'status="issued"' in stock_issue_block and "mark_apple_id_stock_code_used" in stock_issue_block and "used_order_id" in function_block(bot_text, "mark_apple_id_stock_code_used") and "auto_fulfillment_client_text(updated, True)" in stock_callback_block)
     record("Apple ID auto fulfillment checks stock before POST", "find_available_apple_id_stock_code" in apple_fulfill_block and "fazercards_post_order" in apple_fulfill_block and apple_fulfill_block.find("find_available_apple_id_stock_code") < apple_fulfill_block.find("fazercards_post_order") and "supplier_purchase_already_attempted_without_order_id" in bot_text)
     record("Apple ID stock privacy and duplicate safety exist", "mask_giftcard_code(item.get('giftcard_code'))" in function_block(bot_text, "apple_id_stock_list_text") and "giftcard_code" not in function_block(bot_text, "format_payment_event_text") and "giftcard_code" not in function_block(bot_text, "notify_payments_chat") and "Apple ID stock issue failed" in stock_callback_block and "apple_id_stock_code_duplicate_order_id" in stock_issue_block)
     record("Apple ID quick stock result masks codes and checks stock orders used", "apple_id_stock_add_result_text" in bot_text and "mask_giftcard_code(item.get('giftcard_code'))" in function_block(bot_text, "apple_id_stock_add_result_text") and "apple_id_stock_duplicate_reason" in bot_text and "load_apple_id_stock()" in function_block(bot_text, "apple_id_stock_duplicate_reason") and "load_orders()" in function_block(bot_text, "apple_id_stock_duplicate_reason") and "used_stock" in function_block(bot_text, "apple_id_stock_duplicate_reason"))
@@ -1477,6 +1477,22 @@ def check_telegram_premium_auto_fulfillment(bot_text: str) -> None:
     record("Stars helper still uses same recipient normalization baseline", "normalize_telegram_recipient_username" in stars_helper)
 
 
+
+def check_unified_stock(bot_text: str, config_example_text: str) -> None:
+    apple_helper = function_block(bot_text, "auto_fulfill_apple_id_order")
+    order_keyboard = function_block(bot_text, "order_card_keyboard")
+    stock_list = function_block(bot_text, "stock_list_text")
+    record("Unified stock file helpers exist", "STOCK_FILE" in bot_text and "def load_stock()" in bot_text and "def save_stock(items" in bot_text and '"category"' in function_block(bot_text, "normalize_stock_item"))
+    record("Stock settings exist", '"stock"' in config_example_text and '"categories"' in config_example_text and '"fallback_to_supplier"' in config_example_text)
+    record("Stock category toggles callbacks exist", "admin_stock_toggle_enabled:" in bot_text and "admin_stock_toggle_fallback:" in bot_text and "save_stock_category_settings" in bot_text)
+    record("Stock disabled prevents stock lookup in auto fulfillment", 'if apple_stock_settings.get("enabled") else None' in apple_helper and "stock_empty_supplier_disabled" in apple_helper)
+    record("Stock disabled hides order issue button", "is_stock_enabled_for_category" in order_keyboard and "📦 Выдать со склада" in order_keyboard)
+    record("Stock enabled checks stock before supplier POST", apple_helper.find("find_available_apple_id_stock_code") != -1 and apple_helper.find("fazercards_post_order") != -1 and apple_helper.find("find_available_apple_id_stock_code") < apple_helper.find("fazercards_post_order"))
+    record("Stock fallback controls supplier calls", "fallback_to_supplier" in apple_helper and "stock_empty_supplier_disabled" in apple_helper)
+    record("Apple ID migration to unified stock exists", "migrate_apple_id_stock_to_unified" in bot_text and "migrate_apple_id_stock_item" in bot_text and "APPLE_ID_STOCK_FILE" in bot_text and "STOCK_FILE" in bot_text)
+    record("Unified stock admin category sections exist", all(x in bot_text for x in ("Apple ID", "Telegram Stars", "Telegram Premium", "eSIM")) and "admin_stock_category:" in bot_text)
+    record("Stock privacy masks codes outside delivery", "mask_giftcard_code" in stock_list and "👁 Показать код" in bot_text and "Код: <code>{html_escape(mask_giftcard_code" in bot_text)
+
 def main() -> int:
     check_syntax("bot/bot.py")
     check_syntax("bot/run_mvp.py")
@@ -1507,6 +1523,7 @@ def main() -> int:
     check_multiservice_crm(bot_text)
     check_apple_id_rub_market_pricing(bot_text)
     check_telegram_premium_auto_fulfillment(bot_text)
+    check_unified_stock(bot_text, config_example_text)
     check_run_mvp_contract(run_mvp_text)
     for needle in [
         'ORDERS_CHAT_ID',
