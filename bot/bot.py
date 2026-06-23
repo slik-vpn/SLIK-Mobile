@@ -1180,15 +1180,15 @@ def upsert_apple_id_fazercards_stock_item(order: dict, supplier_order_id: str, f
         "delivery_code": code or target.get("delivery_code", ""),
         "delivery_pin": str(fields.get("giftcard_pin") or target.get("delivery_pin") or "").strip(),
         "delivery_link": str(fields.get("giftcard_link") or target.get("delivery_link") or "").strip(),
-        "status": "used" if used_status_locked else ("available" if code else status),
+        "status": "used" if (used_status_locked or code) else status,
         "source_order_id": str(order.get("id") or target.get("source_order_id") or ""),
         "comment": target.get("comment") or "created from FazerCards order details",
     })
     if used_status_locked:
         restore_used_stock_fields(target, preserved_used)
     elif code:
-        target.setdefault("used_order_id", "")
-        target.setdefault("used_at", "")
+        target["used_order_id"] = str(order.get("id") or target.get("used_order_id") or "manual")
+        target["used_at"] = target.get("used_at") or now_str()
     else:
         target.setdefault("used_order_id", "")
         target.setdefault("used_at", "")
@@ -1245,7 +1245,15 @@ def run_stock_persistence_diagnostics() -> dict:
         logger.exception("Stock persistence diagnostics failed")
         result["error"] = str(exc)
     finally:
-        save_stock([item for item in original_items if isinstance(item, dict)])
+        cleanup_code_key = normalize_stock_code(dummy_code)
+        current_items = load_stock()
+        save_stock([
+            item for item in current_items
+            if not (
+                isinstance(item, dict)
+                and (item.get("id") == test_id or normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == cleanup_code_key)
+            )
+        ])
     return result
 
 
