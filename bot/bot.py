@@ -835,16 +835,52 @@ STOCK_CATEGORIES = {
 
 
 
-def stock_status_label(status: str, *, plural: bool = False) -> str:
-    labels = {
+def stock_status_label(status: str, *, plural: bool = False, category: str = "") -> str:
+    apple_labels = {
         "available": ("✅ В наличии", "✅ В наличии"),
         "pending": ("⏳ Ожидает код", "⏳ Ожидают код"),
         "used": ("📤 Выдана", "📤 Выданные"),
         "invalid": ("⚠️ Проблема", "⚠️ Проблемные"),
         "reserved": ("⚠️ Проблема", "⚠️ Проблемные"),
     }
+    telegram_labels = {
+        "available": ("✅ Доступно к продаже", "✅ Доступно к продаже"),
+        "pending": ("⏳ Ожидает выполнения", "⏳ Ожидают выполнения"),
+        "used": ("📤 Выполнена", "📤 Выполненные"),
+        "invalid": ("⚠️ Проблема", "⚠️ Проблемные"),
+        "reserved": ("⚠️ Проблема", "⚠️ Проблемные"),
+    }
+    esim_labels = {
+        "available": ("✅ В наличии", "✅ В наличии"),
+        "pending": ("⏳ Ожидает выдачи", "⏳ Ожидают выдачи"),
+        "used": ("📤 Выдана", "📤 Выданные"),
+        "invalid": ("⚠️ Проблема", "⚠️ Проблемные"),
+        "reserved": ("⚠️ Проблема", "⚠️ Проблемные"),
+    }
+    universal_labels = {
+        "available": ("✅ Доступно", "✅ Доступно"),
+        "pending": ("⏳ Ожидает выполнения", "⏳ Ожидают выполнения"),
+        "used": ("📤 Выполнена", "📤 Выполненные"),
+        "invalid": ("⚠️ Проблема", "⚠️ Проблемные"),
+        "reserved": ("⚠️ Проблема", "⚠️ Проблемные"),
+    }
+    category_key = str(category or "")
+    if category_key in {"telegram_stars", "telegram_premium"}:
+        labels = telegram_labels
+    elif category_key == "esim":
+        labels = esim_labels
+    elif category_key in {"steam", "subscriptions", "manual"}:
+        labels = universal_labels
+    else:
+        labels = apple_labels
     singular, many = labels.get(str(status or ""), ("—", "—"))
     return many if plural else singular
+
+
+def stock_mark_done_label(category: str) -> str:
+    if str(category or "") in {"telegram_stars", "telegram_premium", "steam", "subscriptions", "manual"}:
+        return "📤 Отметить как выполненную"
+    return "📤 Отметить как выданную"
 
 
 def stock_field_label(field: str) -> str:
@@ -7936,9 +7972,9 @@ def apple_id_stock_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Быстро добавить коды", callback_data="admin_apple_id_stock_quick")],
         [InlineKeyboardButton("➕ Добавить код", callback_data="admin_apple_id_stock_add")],
-        [InlineKeyboardButton(stock_status_label("available", plural=True), callback_data="admin_apple_id_stock_list:available")],
-        [InlineKeyboardButton(stock_status_label("used", plural=True), callback_data="admin_apple_id_stock_list:used")],
-        [InlineKeyboardButton(stock_status_label("invalid", plural=True), callback_data="admin_apple_id_stock_list:problem")],
+        [InlineKeyboardButton(stock_status_label("available", plural=True, category="apple_id"), callback_data="admin_apple_id_stock_list:available")],
+        [InlineKeyboardButton(stock_status_label("used", plural=True, category="apple_id"), callback_data="admin_apple_id_stock_list:used")],
+        [InlineKeyboardButton(stock_status_label("invalid", plural=True, category="apple_id"), callback_data="admin_apple_id_stock_list:problem")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
 
@@ -7986,12 +8022,12 @@ def stock_category_text(category: str) -> str:
         f"📦 <b>Склад: {html_escape(STOCK_CATEGORIES.get(category, {}).get('title', category))}</b>\n\n"
         f"Использовать склад: {'✅ ВКЛ' if settings.get('enabled') else '❌ ВЫКЛ'}\n"
         f"🛒 Покупать у поставщика, если склад пуст: {'✅ ВКЛ' if settings.get('fallback_to_supplier') else '❌ ВЫКЛ'}\n"
-        "Включено — бот сначала ищет код на складе. Если подходящего кода нет, покупает у поставщика.\n"
+        "Включено — бот сначала ищет подходящую позицию на складе. Если её нет, покупает у поставщика.\n"
         "Выключено — бот продаёт только то, что уже есть на складе.\n\n"
-        f"{stock_status_label('available', plural=True)}: {counts['available']}\n"
-        f"{stock_status_label('pending', plural=True)}: {counts['pending']}\n"
-        f"{stock_status_label('used', plural=True)}: {counts['used']}\n"
-        f"{stock_status_label('invalid', plural=True)}: {counts['invalid']}"
+        f"{stock_status_label('available', plural=True, category=category)}: {counts['available']}\n"
+        f"{stock_status_label('pending', plural=True, category=category)}: {counts['pending']}\n"
+        f"{stock_status_label('used', plural=True, category=category)}: {counts['used']}\n"
+        f"{stock_status_label('invalid', plural=True, category=category)}: {counts['invalid']}"
     )
 
 
@@ -8002,10 +8038,10 @@ def stock_category_keyboard(category: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🛒 Покупать у поставщика, если склад пуст: {'ВКЛ' if settings.get('fallback_to_supplier') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_fallback:{category}")],
         [InlineKeyboardButton("➕ Добавить товар", callback_data=("admin_apple_id_stock_add" if category == "apple_id" else f"admin_stock_add:{category}"))],
         [InlineKeyboardButton("➕ Быстро добавить товары", callback_data=("admin_apple_id_stock_quick" if category == "apple_id" else f"admin_stock_quick:{category}"))],
-        [InlineKeyboardButton(stock_status_label("available", plural=True), callback_data=f"admin_stock_list:{category}:available")],
-        [InlineKeyboardButton(stock_status_label("pending", plural=True), callback_data=f"admin_stock_list:{category}:pending")],
-        [InlineKeyboardButton(stock_status_label("used", plural=True), callback_data=f"admin_stock_list:{category}:used")],
-        [InlineKeyboardButton(stock_status_label("invalid", plural=True), callback_data=f"admin_stock_list:{category}:problem")],
+        [InlineKeyboardButton(stock_status_label("available", plural=True, category=category), callback_data=f"admin_stock_list:{category}:available")],
+        [InlineKeyboardButton(stock_status_label("pending", plural=True, category=category), callback_data=f"admin_stock_list:{category}:pending")],
+        [InlineKeyboardButton(stock_status_label("used", plural=True, category=category), callback_data=f"admin_stock_list:{category}:used")],
+        [InlineKeyboardButton(stock_status_label("invalid", plural=True, category=category), callback_data=f"admin_stock_list:{category}:problem")],
         [InlineKeyboardButton(stock_action_label("find_by_id"), callback_data=f"admin_stock_find_by_id:{category}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_stock")],
     ]
@@ -8015,7 +8051,7 @@ def stock_category_keyboard(category: str) -> InlineKeyboardMarkup:
 def stock_list_text(category: str, status_filter: str) -> str:
     statuses = {"reserved", "invalid"} if status_filter == "problem" else {status_filter}
     header_status = "invalid" if status_filter == "problem" else status_filter
-    lines = [f"📦 <b>{html_escape(stock_category_title(category))} → {html_escape(stock_status_label(header_status, plural=True))}</b>", ""]
+    lines = [f"📦 <b>{html_escape(stock_category_title(category))} → {html_escape(stock_status_label(header_status, plural=True, category=category))}</b>", ""]
     for item in load_stock():
         if item.get("category") == category and item.get("status") in statuses:
             line = stock_item_summary_text(item)
@@ -8033,9 +8069,9 @@ def stock_list_text(category: str, status_filter: str) -> str:
 
 def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMarkup:
     rows = []
-    if category == "apple_id" and status_filter == "available":
+    if status_filter == "available":
         for item in load_stock():
-            if item.get("category") == "apple_id" and item.get("status") == "available":
+            if item.get("category") == category and item.get("status") == "available":
                 stock_id = str(item.get("id"))[:64]
                 rows.append([InlineKeyboardButton(stock_mark_issued_button_label(item), callback_data=f"admin_stock_mark_issued:{stock_id}")])
                 if len(rows) >= 20:
@@ -8090,7 +8126,7 @@ def stock_display_id(item: dict) -> str:
 
 
 def stock_mark_issued_button_label(item: dict) -> str:
-    return f"📤 Отметить выданной: {stock_display_id(item)}"
+    return f"{stock_mark_done_label(str(item.get('category') or 'apple_id'))}: {stock_display_id(item)}"
 
 
 def stock_item_summary_text(item: dict) -> str:
@@ -8101,9 +8137,11 @@ def stock_item_summary_text(item: dict) -> str:
     ]
     if code != "—":
         lines.append(f"{stock_field_label('delivery_code')}: <code>{html_escape(code)}</code>")
-    lines.append(f"Статус: {html_escape(stock_status_label(str(item.get('status') or '')))}")
+    lines.append(f"Статус: {html_escape(stock_status_label(str(item.get('status') or ''), category=str(item.get('category') or 'apple_id')))}")
     if item.get("status") == "used" and item.get("used_at"):
-        lines.append(f"Выдана: {html_escape(str(item.get('used_at')))}")
+        category = str(item.get("category") or "apple_id")
+        used_at_label = "Выполнена" if category in {"telegram_stars", "telegram_premium", "steam", "subscriptions", "manual"} else "Выдана"
+        lines.append(f"{used_at_label}: {html_escape(str(item.get('used_at')))}")
     if item.get("supplier_status"):
         lines.append(f"{stock_field_label('supplier_status')}: {html_escape(str(item.get('supplier_status')))}")
     if not item.get("supplier_order_id"):
@@ -8112,10 +8150,16 @@ def stock_item_summary_text(item: dict) -> str:
 
 
 def stock_mark_issued_confirm_text(item: dict) -> str:
+    category = str(item.get("category") or "apple_id")
+    if category in {"telegram_stars", "telegram_premium", "steam", "subscriptions", "manual"}:
+        question = "Заявка уже была выполнена?"
+    else:
+        question = "Позиция уже была выдана клиенту?"
     return (
-        "Позиция уже была выдана клиенту?\n\n"
+        f"{question}\n\n"
         f"{stock_item_summary_text(item)}\n\n"
-        "После подтверждения позиция исчезнет из “В наличии” и попадёт в “Выданные”."
+        f"После подтверждения она исчезнет из “{stock_status_label('available', plural=True, category=category)}” "
+        f"и попадёт в “{stock_status_label('used', plural=True, category=category)}”."
     )
 
 
@@ -8194,7 +8238,7 @@ def apple_id_stock_add_result_text(region: str, amount, currency: str, added: li
 
 
 def apple_id_stock_list_text(status_filter: str) -> str:
-    title = {"available": stock_status_label("available", plural=True), "used": stock_status_label("used", plural=True), "problem": stock_status_label("invalid", plural=True)}.get(status_filter, "🍎 Склад Apple ID")
+    title = {"available": stock_status_label("available", plural=True, category="apple_id"), "used": stock_status_label("used", plural=True, category="apple_id"), "problem": stock_status_label("invalid", plural=True, category="apple_id")}.get(status_filter, "🍎 Склад Apple ID")
     statuses = {"reserved", "invalid"} if status_filter == "problem" else {status_filter}
     rows = []
     for item in load_apple_id_stock():
@@ -12156,9 +12200,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Позиция не найдена.", show_alert=True)
             return
         if result == "already_used":
-            await query.answer("Позиция уже в разделе «Выданные».", show_alert=True)
+            await query.answer(f"Позиция уже в разделе «{stock_status_label('used', plural=True, category=(item or {}).get('category') or 'apple_id')}».", show_alert=True)
         else:
-            await query.answer("Позиция отмечена как выданная.")
+            await query.answer("Позиция отмечена как выполненная." if (item or {}).get("category") in {"telegram_stars", "telegram_premium", "steam", "subscriptions", "manual"} else "Позиция отмечена как выданная.")
         category = item.get("category") if item else "apple_id"
         await edit_or_send(query, context, stock_list_text(category, "used"), stock_list_keyboard(category, "used"))
     elif data.startswith("admin_stock_mark_issued:"):
@@ -12176,7 +12220,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context,
             stock_mark_issued_confirm_text(item),
             InlineKeyboardMarkup([
-                [InlineKeyboardButton(stock_action_label("confirm_mark_issued"), callback_data=f"admin_stock_mark_issued_confirm:{stock_id}")],
+                [InlineKeyboardButton(stock_mark_done_label(str(item.get("category") or "apple_id")).replace("Отметить как", "Да, отметить"), callback_data=f"admin_stock_mark_issued_confirm:{stock_id}")],
                 [InlineKeyboardButton("Отмена", callback_data=f"admin_stock_list:{item.get('category') or 'apple_id'}:{item.get('status') or 'available'}")],
             ]),
         )
