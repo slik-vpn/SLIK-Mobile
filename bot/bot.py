@@ -4063,7 +4063,7 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
         else:
             error = f"giftcard_code_missing: response_keys={supplier_response_shape(details)}"
         stock_item = upsert_apple_id_fazercards_stock_item(order, existing_supplier_order_id, fields, status="pending")
-        return {"ok": False, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), "response_shape": supplier_response_shape(details), "stock_code_id": (stock_item or {}).get("id", ""), **fields, "error": error, "manual_fallback": True}
+        return {"ok": False, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), "response_shape": supplier_response_shape(details), "stock_code_id": (stock_item or {}).get("id", ""), **fields, "error": error, "code_pending": True, "manual_fallback": False}
 
     if order.get("supplier_purchase_attempted"):
         stock = find_available_apple_id_stock_code(order.get("region") or order.get("country"), order.get("nominal") or order.get("amount"), order.get("currency")) if apple_stock_settings.get("enabled") else None
@@ -4136,7 +4136,7 @@ async def auto_fulfill_apple_id_order(order: dict) -> dict:
     if not ok:
         error = f"giftcard_code_missing: response_keys={supplier_response_shape(data)}"
         stock_item = upsert_apple_id_fazercards_stock_item(order, supplier_order_id, fields, status="pending") if supplier_order_id else None
-        return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), "response_shape": supplier_response_shape(data), "stock_code_id": (stock_item or {}).get("id", ""), **fields, "error": error, "manual_fallback": True}
+        return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), "response_shape": supplier_response_shape(data), "stock_code_id": (stock_item or {}).get("id", ""), **fields, "error": error, "code_pending": bool(supplier_order_id), "manual_fallback": False if supplier_order_id else True}
     stock_item = upsert_apple_id_fazercards_stock_item(order, supplier_order_id, fields, status="used")
     return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_purchase_attempted": True, "supplier_purchase_attempted_at": attempted_at, "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, "supplier_response": sanitized_supplier_response(data), "from_stock": False, "stock_code_id": stock_item.get("id"), **fields}
 
@@ -4211,6 +4211,14 @@ def auto_fulfillment_admin_text(order: dict, report: dict) -> str:
         if order_category_key(order) == "telegram_premium":
             return ("✅ <b>Telegram Premium оформлен</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
         return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+    if order_category_key(order) == "apple_id" and report.get("code_pending_exhausted"):
+        return (
+            "⚠️ <b>Код пока не получен от поставщика</b>\n\n"
+            f"Заказ: {html_escape(order_number_plain(order))}\n"
+            f"Товар: {html_escape(str(product))}\n"
+            "Статус: требуется ручная проверка\n"
+            "Проверьте заказ у поставщика вручную."
+        )
     title = "⚠️ <b>Автовыдача Apple ID не удалась, нужна ручная выдача</b>" if order_category_key(order) == "apple_id" else ("⚠️ <b>Автовыдача Telegram Stars не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_stars" else ("⚠️ <b>Автовыдача Telegram Premium не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_premium" else "⚠️ <b>Автовыдача не удалась</b>"))
     duration_line = f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" if order_category_key(order) == "telegram_premium" else ""
     return (title + "\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"{duration_line}" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
@@ -4295,7 +4303,36 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
             if result.get("ok"):
                 break
             last_error = str(result.get("error") or "supplier_error")
-            if category == "apple_id" and (result.get("supplier_purchase_attempted") or result.get("supplier_order_id") or order.get("supplier_purchase_attempted")):
+            if category == "apple_id" and result.get("code_pending") and result.get("supplier_order_id"):
+                pending_fields = {
+                    "supplier": "fazercards",
+                    "supplier_order_id": result.get("supplier_order_id"),
+                    "supplier_response": result.get("supplier_response", {}),
+                    "fulfillment_status": "waiting_supplier_code",
+                    "status": "paid_waiting_supplier_code",
+                    "auto_fulfillment": True,
+                    "auto_fulfillment_attempts": attempt,
+                    "auto_fulfillment_last_error": "Код ещё готовится",
+                    "supplier_purchase_attempted": True,
+                    "supplier_purchase_attempted_at": order.get("supplier_purchase_attempted_at") or result.get("supplier_purchase_attempted_at") or now_str(),
+                    "supplier_purchase_endpoint": FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT,
+                }
+                update_order_fields(order.get("id"), **pending_fields)
+                order = {**order, **pending_fields}
+                if attempt == 1 and get_orders_chat_id():
+                    try:
+                        await context.bot.send_message(
+                            chat_id=get_orders_chat_id(),
+                            text=(
+                                "⏳ Заказ у поставщика создан. Код ещё готовится. Бот проверит повторно.\n\n"
+                                f"Заказ: {html_escape(order_number_plain(order))}\n"
+                                f"Проверка у поставщика: попытка {attempt}/{attempts}"
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception as exc:
+                        logger.warning("Auto fulfillment pending-code notification failed for order %s: %s", order.get("id"), exc)
+            elif category == "apple_id" and (result.get("supplier_purchase_attempted") or result.get("supplier_order_id") or order.get("supplier_purchase_attempted")):
                 break
         except Exception as exc:
             last_error = fazercards_api_error(exc)
@@ -4326,7 +4363,9 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
         await notify_auto_fulfillment(context, updated, final)
         return final
     status = "manual_required" if settings.get("manual_fallback_enabled", True) else "failed"
-    failure_fields = {"fulfillment_status": status, "status": ("paid_waiting_manual_issue" if status == "manual_required" else status), "auto_fulfillment": True, "auto_fulfillment_attempts": attempt, "auto_fulfillment_last_error": last_error or result.get("error") or "supplier_error"}
+    code_pending_exhausted = bool(category == "apple_id" and result.get("code_pending") and (result.get("supplier_order_id") or order.get("supplier_order_id")))
+    final_error = "Код пока не получен от поставщика. Проверьте заказ у поставщика вручную." if code_pending_exhausted else (last_error or result.get("error") or "supplier_error")
+    failure_fields = {"fulfillment_status": status, "status": ("paid_waiting_manual_issue" if status == "manual_required" else status), "auto_fulfillment": True, "auto_fulfillment_attempts": attempt, "auto_fulfillment_last_error": final_error}
     if category == "apple_id":
         failure_fields["supplier_purchase_attempted"] = bool(order.get("supplier_purchase_attempted") or result.get("supplier_purchase_attempted") or result.get("supplier_order_id"))
         failure_fields["supplier_purchase_attempted_at"] = order.get("supplier_purchase_attempted_at") or now_str()
@@ -4336,7 +4375,7 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
     if result.get("supplier_response"):
         failure_fields["supplier_response"] = result.get("supplier_response")
     updated = update_order_fields(order.get("id"), **failure_fields) or {**order, **failure_fields}
-    final = {**report, "status": status, "supplier_order_id": updated.get("supplier_order_id") or result.get("supplier_order_id") or "", "response_shape": result.get("response_shape", ""), "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_required"}
+    final = {**report, "status": status, "supplier_order_id": updated.get("supplier_order_id") or result.get("supplier_order_id") or "", "response_shape": result.get("response_shape", ""), "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_required", "code_pending_exhausted": code_pending_exhausted}
     await notify_auto_fulfillment(context, updated, final)
     return final
 
@@ -6502,6 +6541,7 @@ FULFILLMENT_STATUS_LABELS = {
     "paid": "✅ оплачен",
     "pending": "⏳ ожидает выдачи",
     "auto_processing": "🤖 автовыдача выполняется",
+    "waiting_supplier_code": "⏳ Ожидает код",
     "issued": "✅ выдан",
     "manual_required": "⚠️ требуется ручная выдача",
     "auto_issue_pending": "🤖 ожидает автовыдачи",
