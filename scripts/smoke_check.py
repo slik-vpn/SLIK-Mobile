@@ -1506,6 +1506,7 @@ def check_unified_stock(bot_text: str, config_example_text: str) -> None:
 
 
 def check_fazercards_stock_sync(bot_text: str, config_example_text: str) -> None:
+    apple_helper = function_block(bot_text, "auto_fulfill_apple_id_order")
     fetch_block = function_block(bot_text, "fetch_fazercards_orders")
     sync_block = function_block(bot_text, "sync_fazercards_orders_to_stock")
     parser_block = function_block(bot_text, "parse_fazercards_orders_response")
@@ -1515,7 +1516,7 @@ def check_fazercards_stock_sync(bot_text: str, config_example_text: str) -> None
     record("FazerCards orders sync uses read-only GET", "async def fetch_fazercards_orders" in bot_text and "client.get" in fetch_block and "client.post" not in fetch_block)
     record("FazerCards stock sync avoids purchase helpers", "fazercards_post_order" not in sync_block and "/giftcards/order" not in sync_block and "client.post" not in sync_block)
     record("FazerCards orders parser supports common containers", all(x in parser_block for x in ('("data",)', '("data", "items")', '("data", "orders")', '("result",)', '("result", "items")', '("result", "orders")', '("orders",)', '("items",)')))
-    record("FazerCards order upsert exists and preserves used/invalid", "def upsert_stock_item_from_fazercards_order" in bot_text and "supplier_order_id" in upsert_block and '{"used", "invalid"}' in upsert_block)
+    record("FazerCards order upsert exists and preserves used/invalid", "def upsert_stock_item_from_fazercards_order" in bot_text and "supplier_order_id" in upsert_block and 'current_status == "used"' in upsert_block and 'current_status == "invalid"' in upsert_block)
     record("FazerCards upsert pending can become available", 'new_status = "available"' in upsert_block and 'new_status = "pending"' in upsert_block and "code_key" in upsert_block)
     record("FazerCards sync admin UI exists with admin/owner guard", "🔄 Синхронизировать с FazerCards" in bot_text and "admin_stock_sync_fazercards" in bot_text and "has_admin_access(query.from_user) or has_owner_access(query.from_user)" in callback_block)
     details_block = function_block(bot_text, "fetch_fazercards_order_details")
@@ -1533,6 +1534,19 @@ def check_fazercards_stock_sync(bot_text: str, config_example_text: str) -> None
     record("FazerCards pending supplier check button exists", "🔎 Проверить у поставщика" in stock_keyboard_block and "fetch_fazercards_order_details" in bot_text and "refresh_fazercards_pending_stock_item(supplier_order_id)" in pending_check_block)
     record("FazerCards sync report masks gift card codes", "mask_giftcard_code" in report_block and "delivery_code" in report_block)
     record("FazerCards stock_sync config exists disabled by default", '"stock_sync"' in config_example_text and '"fazercards_enabled": false' in config_example_text and all(x in config_example_text for x in ('"last_run_at"', '"last_ok_at"', '"last_error"')))
+    post_block = function_block(bot_text, "fazercards_post_order")
+    shape_block = function_block(bot_text, "supplier_response_shape")
+    giftcard_block = function_block(bot_text, "giftcard_fields_from_response")
+    record("FazerCards POST accepts idempotency_key", "idempotency_key: str | None = None" in post_block and 'headers["idempotency-key"]' in post_block)
+    record("Apple ID supplier POST passes idempotency_key", "idempotency_key=idempotency_key" in apple_helper and "slik-mobile:apple_id" in apple_helper)
+    record("Apple ID supplier idempotency key is saved before POST", "supplier_idempotency_key=idempotency_key" in apple_helper and apple_helper.find("supplier_idempotency_key=idempotency_key") < apple_helper.find("fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT"))
+    record("Apple ID retry reuses supplier_idempotency_key", 'order.get("supplier_idempotency_key") or f"slik-mobile:apple_id:' in apple_helper)
+    record("FazerCards response shape expands cards/items safely", all(x in shape_block for x in ('("order", "cards")', '("data", "cards")', '("result", "cards")', '("order", "items")', '("data", "items")', '("result", "items")', ': empty list', '[0] keys')))
+    record("FazerCards gift card parser supports order.cards alternates", all(x in giftcard_block for x in ("delivery_code", "activation_code", "card_code", "redeem_code", "voucher_code", "serial", "value", "number", "key", "secret", "token", "security_code", "credentials", "data", "payload")) and "dict" in giftcard_block and "list" in giftcard_block)
+    record("FazerCards stock item stores supplier_status", '"supplier_status": supplier_status' in upsert_block and "supplier_success_statuses" in upsert_block)
+    record("FazerCards failed statuses invalidate pending only", "supplier_failed_statuses" in upsert_block and 'new_status = "invalid"' in upsert_block and 'current_status == "used"' in upsert_block and upsert_block.find('current_status == "used"') < upsert_block.find('new_status = "invalid"'))
+    record("FazerCards sync never POSTs", "client.post" not in sync_block and "fazercards_post_order" not in sync_block)
+    record("FazerCards response shape does not include code values", "safe_keys" in shape_block and "str(child)" not in shape_block and "mask_giftcard_code" not in shape_block)
     record("FazerCards periodic stock sync is disabled by config gate", "stock_sync_fazercards_periodic_job" in bot_text and 'settings.get("fazercards_enabled", False)' in bot_text)
 
 def main() -> int:
