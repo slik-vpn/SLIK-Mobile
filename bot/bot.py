@@ -3336,7 +3336,7 @@ def supplier_order_id_from_response(payload) -> str:
 
 def giftcard_fields_from_response(payload) -> dict:
     fields = {"giftcard_code": "", "giftcard_pin": "", "giftcard_link": ""}
-    code_keys = {"code", "giftcard_code", "card_code", "voucher", "activation_code", "redeem_code", "voucher_code", "serial"}
+    code_keys = {"code", "giftcard_code", "delivery_code", "card_code", "voucher", "activation_code", "redeem_code", "voucher_code", "serial"}
     pin_keys = {"pin", "giftcard_pin"}
     link_keys = {"link", "url", "claim_url", "download_url", "giftcard_url"}
 
@@ -3480,6 +3480,13 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
                 return None, "skipped"
     action = "updated" if existing else "added"
     target = existing or {"id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}", "created_at": now_str()}
+    if existing and category == "unknown" and target.get("category"):
+        category = str(target.get("category"))
+    if existing:
+        title = title if title != "FazerCards order" else str(target.get("title") or title)
+        region = region or str(target.get("region") or "")
+        currency = currency or str(target.get("currency") or "")
+        amount = amount if amount not in (None, "") else target.get("amount")
     if existing is None:
         items.append(target)
     current_status = str(target.get("status") or "")
@@ -3489,6 +3496,7 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         new_status = "available"
     else:
         new_status = "pending"
+    response_shape = supplier_response_shape(order_data) if new_status == "pending" and not code_key else ""
     target.update({
         "category": category, "product_key": f"{category}_{region.lower()}_{stock_amount_key(amount)}_{currency.lower()}".strip("_"),
         "supplier": "fazercards", "supplier_order_id": supplier_order_id, "title": title,
@@ -3501,6 +3509,10 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         "giftcard_link": fields.get("giftcard_link", "") or target.get("giftcard_link", ""),
         "status": new_status, "updated_at": now_str(), "comment": target.get("comment") or "synced from FazerCards orders",
     })
+    if response_shape:
+        target["last_response_shape"] = response_shape
+    elif code_key:
+        target.pop("last_response_shape", None)
     save_stock([normalize_stock_item(item) for item in items])
     return normalize_stock_item(target), action
 
@@ -3607,8 +3619,15 @@ async def fetch_fazercards_orders(limit: int = 100, page: int = 1) -> dict:
         return data if isinstance(data, dict) else {"data": data}
 
 
+async def refresh_fazercards_pending_stock_item(supplier_order_id: str) -> tuple[dict | None, str]:
+    details = await fetch_fazercards_order_details(supplier_order_id)
+    if isinstance(details, dict):
+        details.setdefault("supplier_order_id", supplier_order_id)
+    return upsert_stock_item_from_fazercards_order(details)
+
+
 async def sync_fazercards_orders_to_stock(limit: int = 100, max_pages: int = 10) -> dict:
-    report = {"checked": 0, "added": 0, "updated": 0, "already": 0, "skipped": 0, "errors": 0, "added_items": [], "pending_items": []}
+    report = {"checked": 0, "added": 0, "updated": 0, "already": 0, "skipped": 0, "errors": 0, "became_available": 0, "still_pending": 0, "became_used": 0, "missing_code": 0, "added_items": [], "pending_items": []}
     page = 1
     seen_pages = set()
     while page and page not in seen_pages and len(seen_pages) < max_pages:
@@ -3624,10 +3643,21 @@ async def sync_fazercards_orders_to_stock(limit: int = 100, max_pages: int = 10)
             report["checked"] += 1
             try:
                 item, action = upsert_stock_item_from_fazercards_order(order_data)
+                if item and item.get("status") == "pending" and item.get("supplier_order_id"):
+                    item, detail_action = await refresh_fazercards_pending_stock_item(str(item.get("supplier_order_id")))
+                    if detail_action in {"added", "updated", "already", "skipped"} and detail_action != action:
+                        action = detail_action
                 if action in {"added", "updated", "already", "skipped"}:
                     report[action] += 1
                 else:
                     report["skipped"] += 1
+                if item:
+                    if item.get("status") == "available":
+                        report["became_available"] += 1
+                    elif item.get("status") == "pending":
+                        report["still_pending"] += 1; report["missing_code"] += 1
+                    elif item.get("status") == "used":
+                        report["became_used"] += 1
                 if item and action == "added":
                     (report["pending_items"] if item.get("status") == "pending" else report["added_items"]).append(item)
             except Exception as exc:
@@ -3650,8 +3680,12 @@ def fazercards_stock_sync_report_text(report: dict) -> str:
     lines = [
         "✅ <b>Синхронизация FazerCards завершена</b>", "",
         f"Проверено заказов: {int(report.get('checked') or 0)}",
-        f"Добавлено на склад: {int(report.get('added') or 0)}",
+        f"Добавлено: {int(report.get('added') or 0)}",
         f"Обновлено: {int(report.get('updated') or 0)}",
+        f"Стало доступно: {int(report.get('became_available') or 0)}",
+        f"Осталось pending: {int(report.get('still_pending') or 0)}",
+        f"Стало used: {int(report.get('became_used') or 0)}",
+        f"Не нашли код: {int(report.get('missing_code') or 0)}",
         f"Уже были: {int(report.get('already') or 0)}",
         f"Пропущено: {int(report.get('skipped') or 0)}",
         f"Ошибок: {int(report.get('errors') or 0)}",
@@ -7854,10 +7888,27 @@ def stock_list_text(category: str, status_filter: str) -> str:
     for item in load_stock():
         if item.get("category") == category and item.get("status") in statuses:
             code = item.get("delivery_code") or item.get("giftcard_code") or ""
-            lines.append(f"• <code>{html_escape(str(item.get('id') or '—'))}</code> · {html_escape(str(item.get('title') or item.get('product_key') or '—'))} · <code>{html_escape(mask_giftcard_code(code))}</code>")
+            supplier_order_id = str(item.get("supplier_order_id") or "—")
+            line = f"• <code>{html_escape(str(item.get('id') or '—'))}</code> · {html_escape(str(item.get('title') or item.get('product_key') or '—'))} · <code>{html_escape(mask_giftcard_code(code))}</code> · {html_escape(supplier_order_id)} · {html_escape(str(item.get('status') or '—'))}"
+            if status_filter == "pending" and item.get("last_response_shape"):
+                line += f"\n  response_shape: <code>{html_escape(str(item.get('last_response_shape')))}</code>"
+            lines.append(line)
     if len(lines) == 2:
         lines.append("Нет позиций.")
     return "\n".join(lines)
+
+
+def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMarkup:
+    rows = []
+    if category == "apple_id" and status_filter == "pending":
+        for item in load_stock():
+            if item.get("category") == "apple_id" and item.get("status") == "pending" and item.get("supplier_order_id"):
+                order_id = str(item.get("supplier_order_id"))[:64]
+                rows.append([InlineKeyboardButton(f"🔎 Проверить у поставщика {order_id}", callback_data=f"admin_stock_check_pending:{order_id}")])
+                if len(rows) >= 20:
+                    break
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{category}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def apple_id_stock_catalog_regions() -> list[str]:
@@ -11862,7 +11913,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("admin_stock_list:"):
         _, category, status_filter = data.split(":", 2)
         await query.answer()
-        await edit_or_send(query, context, stock_list_text(category, status_filter), InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{category}")]]))
+        await edit_or_send(query, context, stock_list_text(category, status_filter), stock_list_keyboard(category, status_filter))
+    elif data.startswith("admin_stock_check_pending:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        supplier_order_id = data.split(":", 1)[1]
+        await query.answer("Проверяю у поставщика...")
+        try:
+            item, _action = await refresh_fazercards_pending_stock_item(supplier_order_id)
+            if item and item.get("status") == "available":
+                message = "✅ Код найден, позиция стала доступной"
+            else:
+                message = "⚠️ Код не найден, response_shape обновлён"
+        except Exception as exc:
+            logger.warning("FazerCards pending details check failed: %s", exc)
+            message = f"⚠️ Ошибка проверки: {html_escape(fazercards_api_error(exc))}"
+        await edit_or_send(query, context, message + "\n\n" + stock_list_text("apple_id", "pending"), stock_list_keyboard("apple_id", "pending"))
     elif data == "admin_apple_id_stock":
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
