@@ -456,6 +456,7 @@ APPLE_ID_INPUT_MARKUP = "apple_id_markup"
 APPLE_ID_STOCK_INPUT_ADD = "apple_id_stock_add"
 APPLE_ID_STOCK_INPUT_QUICK_CODES = "apple_id_stock_quick_codes"
 APPLE_ID_STOCK_INPUT_QUICK_REGION = "apple_id_stock_quick_region"
+STOCK_INPUT_FIND_BY_ID = "stock_find_by_id"
 TELEGRAM_QUOTE_USERNAME_INPUT = "telegram_quote_username"
 TELEGRAM_PRODUCT_PRICE_INPUT = "telegram_product_price_input"
 TELEGRAM_PRODUCT_MARKUP_INPUT = "telegram_product_markup_input"
@@ -832,6 +833,47 @@ STOCK_CATEGORIES = {
 }
 
 
+
+
+def stock_status_label(status: str, *, plural: bool = False) -> str:
+    labels = {
+        "available": ("✅ В наличии", "✅ В наличии"),
+        "pending": ("⏳ Ожидает код", "⏳ Ожидают код"),
+        "used": ("📤 Выдана", "📤 Выданные"),
+        "invalid": ("⚠️ Проблема", "⚠️ Проблемные"),
+        "reserved": ("⚠️ Проблема", "⚠️ Проблемные"),
+    }
+    singular, many = labels.get(str(status or ""), ("—", "—"))
+    return many if plural else singular
+
+
+def stock_field_label(field: str) -> str:
+    labels = {
+        "stock_id": "ID позиции",
+        "id": "ID позиции",
+        "supplier_order_id": "Заказ у поставщика",
+        "delivery_code": "Код",
+        "giftcard_code": "Код",
+        "delivery_pin": "PIN",
+        "giftcard_pin": "PIN",
+        "supplier_status": "Статус поставщика",
+        "response_shape": "Диагностика ответа поставщика",
+        "last_response_shape": "Диагностика ответа поставщика",
+        "fallback_to_supplier": "Покупать у поставщика, если склад пуст",
+    }
+    return labels.get(str(field or ""), str(field or ""))
+
+
+def stock_action_label(action: str) -> str:
+    labels = {
+        "mark_issued": "📤 Отметить как выданную",
+        "confirm_mark_issued": "Да, отметить выданной",
+        "find_by_id": "🧾 Найти позицию по ID",
+        "refresh_from_fazercards": "🔄 Обновить склад из FazerCards",
+    }
+    return labels.get(str(action or ""), str(action or ""))
+
+
 def normalize_stock_code(code: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())
 
@@ -1007,18 +1049,25 @@ def find_available_apple_id_stock_code(region: str, amount, currency: str) -> di
     return None
 
 
-def mark_apple_id_stock_code_used(stock_id: str, order_id: int) -> dict | None:
+def mark_stock_item_issued(stock_id: str, used_order_id: str | None = None, comment: str = "") -> tuple[dict | None, str]:
     items = load_stock()
     for item in items:
         if str(item.get("id") or "") == str(stock_id):
             if item.get("status") == "used":
-                return None
+                return normalize_stock_item(item), "already_used"
             item["status"] = "used"
-            item["used_order_id"] = str(order_id)
             item["used_at"] = now_str()
+            item["used_order_id"] = str(used_order_id or item.get("used_order_id") or "manual")
+            item["comment"] = comment or "Отмечено как выданное вручную"
+            item["updated_at"] = now_str()
             save_stock(items)
-            return normalize_stock_item(item)
-    return None
+            return normalize_stock_item(item), "marked_issued"
+    return None, "item_not_found"
+
+
+def mark_apple_id_stock_code_used(stock_id: str, order_id: int) -> dict | None:
+    item, status = mark_stock_item_issued(str(stock_id), str(order_id), "Выдано по заказу")
+    return item if status == "marked_issued" else None
 
 
 def add_stock_item(item: dict) -> dict:
@@ -3758,15 +3807,15 @@ def fazercards_stock_sync_report_text(report: dict) -> str:
         f"Проверено заказов: {int(report.get('checked') or 0)}",
         f"Добавлено: {int(report.get('added') or 0)}",
         f"Обновлено: {int(report.get('updated') or 0)}",
-        f"Стало доступно: {int(report.get('became_available') or 0)}",
-        f"Осталось pending: {int(report.get('still_pending') or 0)}",
-        f"Стало used: {int(report.get('became_used') or 0)}",
-        f"Не нашли код: {int(report.get('missing_code') or 0)}",
+        f"✅ Стало в наличии: {int(report.get('became_available') or 0)}",
+        f"⏳ Всё ещё без кода: {int(report.get('still_pending') or 0)}",
+        f"📤 Уже выданы: {int(report.get('became_used') or 0)}",
+        f"⚠️ Не удалось получить код: {int(report.get('missing_code') or 0)}",
         f"Уже были: {int(report.get('already') or 0)}",
         f"Пропущено: {int(report.get('skipped') or 0)}",
         f"Ошибок: {int(report.get('errors') or 0)}",
     ]
-    for title, key in (("Добавлено", "added_items"), ("Pending", "pending_items")):
+    for title, key in (("Добавлено", "added_items"), ("Ожидают код", "pending_items")):
         items = report.get(key) or []
         if items:
             lines.extend(["", f"<b>{title}:</b>"])
@@ -4016,13 +4065,13 @@ def auto_fulfillment_admin_text(order: dict, report: dict) -> str:
     if report.get("ok"):
         if order_category_key(order) == "apple_id":
             if report.get("from_stock"):
-                return ("✅ <b>Apple ID код выдан со склада</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Складская позиция: <code>{html_escape(str(report.get('stock_code_id') or order.get('stock_code_id') or '—'))}</code>\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Регион: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n" f"Номинал: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))} {html_escape(str(order.get('currency') or ''))}\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
-            return ("✅ <b>Apple ID код выдан</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
+                return ("✅ <b>Apple ID код выдан со склада</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"ID позиции: <code>{html_escape(str(report.get('stock_code_id') or order.get('stock_code_id') or '—'))}</code>\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Регион: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n" f"Номинал: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))} {html_escape(str(order.get('currency') or ''))}\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
+            return ("✅ <b>Apple ID код выдан</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>\n" f"Код: <code>{html_escape(mask_giftcard_code(order.get('giftcard_code')) or '—')}</code>")
         if order_category_key(order) == "telegram_stars":
-            return ("✅ <b>Telegram Stars отправлены</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Количество: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))} ⭐\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+            return ("✅ <b>Telegram Stars отправлены</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Количество: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))} ⭐\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
         if order_category_key(order) == "telegram_premium":
-            return ("✅ <b>Telegram Premium оформлен</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
-        return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Supplier order: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+            return ("✅ <b>Telegram Premium оформлен</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
+        return ("✅ <b>Автовыдача успешна</b>\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" "Поставщик: FazerCards\n" f"Заказ у поставщика: <code>{html_escape(str(report.get('supplier_order_id') or '—'))}</code>")
     title = "⚠️ <b>Автовыдача Apple ID не удалась, нужна ручная выдача</b>" if order_category_key(order) == "apple_id" else ("⚠️ <b>Автовыдача Telegram Stars не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_stars" else ("⚠️ <b>Автовыдача Telegram Premium не удалась, нужна ручная выдача</b>" if order_category_key(order) == "telegram_premium" else "⚠️ <b>Автовыдача не удалась</b>"))
     duration_line = f"Срок: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))} {html_escape(month_word(order.get('duration_months') or order.get('months')))}\n" if order_category_key(order) == "telegram_premium" else ""
     return (title + "\n\n" f"Заказ: {html_escape(order_number_plain(order))}\n" f"Товар: {html_escape(str(product))}\n" f"Получатель: {html_escape(str(recipient))}\n" f"{duration_line}" f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}\n" "Статус: ручная выдача")
@@ -4049,20 +4098,20 @@ async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
                         (
                             (("FazerCards Apple ID details fetched but code missing" if report.get("supplier_order_id") or order.get("supplier_order_id") else "FazerCards Apple ID fulfillment failed") + "\n") +
                             f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
-                            f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
-                            f"region: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n"
-                            f"amount: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))}\n"
-                            f"currency: {html_escape(str(order.get('currency') or '—'))}\n"
-                            f"response_shape: {html_escape(str(report.get('response_shape') or '—'))}\n"
-                            f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                            f"Заказ у поставщика: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
+                            f"Регион: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n"
+                            f"Номинал: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))}\n"
+                            f"Валюта: {html_escape(str(order.get('currency') or '—'))}\n"
+                            f"🧪 Диагностика ответа поставщика: {html_escape(str(report.get('response_shape') or '—'))}\n"
+                            f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}"
                         ) if order_category_key(order) == "apple_id" else (
                             ("FazerCards Telegram Premium fulfillment failed" if order_category_key(order) == "telegram_premium" else "FazerCards Telegram Stars fulfillment failed") + "\n"
                             f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
-                            f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
+                            f"Заказ у поставщика: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
                             f"recipient: {html_escape(display_telegram_username(order.get('telegram_recipient_username') or order.get('recipient') or ''))}\n"
                             f"duration_months: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))}\n"
                             f"amount: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))}\n"
-                            f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                            f"Ошибка: {html_escape(str(report.get('error') or 'unknown'))}"
                         )
                     ),
                     parse_mode="HTML",
@@ -6605,7 +6654,7 @@ def build_order_card_text(order: dict) -> str:
         "\n<b>Автовыдача</b>\n"
         f"Статус: <b>{html_escape(auto_issue_label)}</b>\n"
         f"Поставщик: <b>{html_escape(str(order.get('supplier') or '—'))}</b>\n"
-        f"Supplier order ID: <code>{html_escape(str(order.get('supplier_order_id') or '—'))}</code>\n"
+        f"Заказ у поставщика: <code>{html_escape(str(order.get('supplier_order_id') or '—'))}</code>\n"
         + (f"Код: <code>{html_escape(masked_giftcard_code)}</code>\n" if masked_giftcard_code else "")
         + f"Попыток: <b>{html_escape(str(order.get('auto_fulfillment_attempts') or 0))}</b>\n"
         f"Последняя ошибка: <b>{html_escape(str(order.get('auto_fulfillment_last_error') or '—'))}</b>\n\n"
@@ -7887,9 +7936,9 @@ def apple_id_stock_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Быстро добавить коды", callback_data="admin_apple_id_stock_quick")],
         [InlineKeyboardButton("➕ Добавить код", callback_data="admin_apple_id_stock_add")],
-        [InlineKeyboardButton("📦 Доступные коды", callback_data="admin_apple_id_stock_list:available")],
-        [InlineKeyboardButton("✅ Использованные", callback_data="admin_apple_id_stock_list:used")],
-        [InlineKeyboardButton("⚠️ Проблемные", callback_data="admin_apple_id_stock_list:problem")],
+        [InlineKeyboardButton(stock_status_label("available", plural=True), callback_data="admin_apple_id_stock_list:available")],
+        [InlineKeyboardButton(stock_status_label("used", plural=True), callback_data="admin_apple_id_stock_list:used")],
+        [InlineKeyboardButton(stock_status_label("invalid", plural=True), callback_data="admin_apple_id_stock_list:problem")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
 
@@ -7924,7 +7973,7 @@ def stock_dashboard_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(stock_category_title("telegram_stars"), callback_data="admin_stock_category:telegram_stars")],
         [InlineKeyboardButton(stock_category_title("telegram_premium"), callback_data="admin_stock_category:telegram_premium")],
         [InlineKeyboardButton(stock_category_title("esim"), callback_data="admin_stock_category:esim")],
-        [InlineKeyboardButton("🔄 Синхронизировать с FazerCards", callback_data="admin_stock_sync_fazercards")],
+        [InlineKeyboardButton(stock_action_label("refresh_from_fazercards"), callback_data="admin_stock_sync_fazercards")],
         [InlineKeyboardButton("⚙️ Настройки склада", callback_data="admin_stock_settings")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_service_sections")],
     ])
@@ -7936,11 +7985,13 @@ def stock_category_text(category: str) -> str:
     return (
         f"📦 <b>Склад: {html_escape(STOCK_CATEGORIES.get(category, {}).get('title', category))}</b>\n\n"
         f"Использовать склад: {'✅ ВКЛ' if settings.get('enabled') else '❌ ВЫКЛ'}\n"
-        f"Если склад пустой — покупать у поставщика: {'✅ ВКЛ' if settings.get('fallback_to_supplier') else '❌ ВЫКЛ'}\n\n"
-        f"Доступно: {counts['available']}\n"
-        f"Pending: {counts['pending']}\n"
-        f"Used: {counts['used']}\n"
-        f"Invalid: {counts['invalid']}"
+        f"🛒 Покупать у поставщика, если склад пуст: {'✅ ВКЛ' if settings.get('fallback_to_supplier') else '❌ ВЫКЛ'}\n"
+        "Включено — бот сначала ищет код на складе. Если подходящего кода нет, покупает у поставщика.\n"
+        "Выключено — бот продаёт только то, что уже есть на складе.\n\n"
+        f"{stock_status_label('available', plural=True)}: {counts['available']}\n"
+        f"{stock_status_label('pending', plural=True)}: {counts['pending']}\n"
+        f"{stock_status_label('used', plural=True)}: {counts['used']}\n"
+        f"{stock_status_label('invalid', plural=True)}: {counts['invalid']}"
     )
 
 
@@ -7948,13 +7999,14 @@ def stock_category_keyboard(category: str) -> InlineKeyboardMarkup:
     settings = stock_category_settings(category)
     rows = [
         [InlineKeyboardButton(f"🔁 Использовать склад: {'ВКЛ' if settings.get('enabled') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_enabled:{category}")],
-        [InlineKeyboardButton(f"🔁 Покупать у поставщика если пусто: {'ВКЛ' if settings.get('fallback_to_supplier') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_fallback:{category}")],
+        [InlineKeyboardButton(f"🛒 Покупать у поставщика, если склад пуст: {'ВКЛ' if settings.get('fallback_to_supplier') else 'ВЫКЛ'}", callback_data=f"admin_stock_toggle_fallback:{category}")],
         [InlineKeyboardButton("➕ Добавить товар", callback_data=("admin_apple_id_stock_add" if category == "apple_id" else f"admin_stock_add:{category}"))],
         [InlineKeyboardButton("➕ Быстро добавить товары", callback_data=("admin_apple_id_stock_quick" if category == "apple_id" else f"admin_stock_quick:{category}"))],
-        [InlineKeyboardButton("📦 Доступные", callback_data=f"admin_stock_list:{category}:available")],
-        [InlineKeyboardButton("⏳ Ожидают код", callback_data=f"admin_stock_list:{category}:pending")],
-        [InlineKeyboardButton("✅ Использованные", callback_data=f"admin_stock_list:{category}:used")],
-        [InlineKeyboardButton("⚠️ Проблемные", callback_data=f"admin_stock_list:{category}:problem")],
+        [InlineKeyboardButton(stock_status_label("available", plural=True), callback_data=f"admin_stock_list:{category}:available")],
+        [InlineKeyboardButton(stock_status_label("pending", plural=True), callback_data=f"admin_stock_list:{category}:pending")],
+        [InlineKeyboardButton(stock_status_label("used", plural=True), callback_data=f"admin_stock_list:{category}:used")],
+        [InlineKeyboardButton(stock_status_label("invalid", plural=True), callback_data=f"admin_stock_list:{category}:problem")],
+        [InlineKeyboardButton(stock_action_label("find_by_id"), callback_data=f"admin_stock_find_by_id:{category}")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_stock")],
     ]
     return InlineKeyboardMarkup(rows)
@@ -7962,14 +8014,17 @@ def stock_category_keyboard(category: str) -> InlineKeyboardMarkup:
 
 def stock_list_text(category: str, status_filter: str) -> str:
     statuses = {"reserved", "invalid"} if status_filter == "problem" else {status_filter}
-    lines = [f"📦 <b>{html_escape(stock_category_title(category))}</b>", ""]
+    header_status = "invalid" if status_filter == "problem" else status_filter
+    lines = [f"📦 <b>{html_escape(stock_category_title(category))} → {html_escape(stock_status_label(header_status, plural=True))}</b>", ""]
     for item in load_stock():
         if item.get("category") == category and item.get("status") in statuses:
-            code = item.get("delivery_code") or item.get("giftcard_code") or ""
-            supplier_order_id = str(item.get("supplier_order_id") or "—")
-            line = f"• <code>{html_escape(str(item.get('id') or '—'))}</code> · {html_escape(str(item.get('title') or item.get('product_key') or '—'))} · <code>{html_escape(mask_giftcard_code(code))}</code> · {html_escape(supplier_order_id)} · {html_escape(str(item.get('status') or '—'))}"
+            line = stock_item_summary_text(item)
             if status_filter == "pending" and item.get("last_response_shape"):
-                line += f"\n  response_shape: <code>{html_escape(str(item.get('last_response_shape')))}</code>"
+                line += (
+                    f"\n\n🧪 <b>{html_escape(stock_field_label('response_shape'))}</b>\n"
+                    "Этот блок нужен только для настройки интеграции. Значения кодов не показываются.\n"
+                    f"<code>{html_escape(str(item.get('last_response_shape')))}</code>"
+                )
             lines.append(line)
     if len(lines) == 2:
         lines.append("Нет позиций.")
@@ -7978,6 +8033,13 @@ def stock_list_text(category: str, status_filter: str) -> str:
 
 def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMarkup:
     rows = []
+    if category == "apple_id" and status_filter == "available":
+        for item in load_stock():
+            if item.get("category") == "apple_id" and item.get("status") == "available":
+                stock_id = str(item.get("id"))[:64]
+                rows.append([InlineKeyboardButton(stock_action_label("mark_issued"), callback_data=f"admin_stock_mark_issued:{stock_id}")])
+                if len(rows) >= 20:
+                    break
     if category == "apple_id" and status_filter == "pending":
         for item in load_stock():
             if item.get("category") == "apple_id" and item.get("status") == "pending" and item.get("supplier_order_id"):
@@ -7987,6 +8049,39 @@ def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMark
                     break
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{category}")])
     return InlineKeyboardMarkup(rows)
+
+
+def find_stock_item_by_id(stock_id: str) -> dict | None:
+    return next((item for item in load_stock() if str(item.get("id") or "") == str(stock_id)), None)
+
+
+def stock_item_product_label(item: dict) -> str:
+    title = str(item.get("title") or item.get("product_key") or "—")
+    amount = item.get("amount")
+    currency = str(item.get("currency") or "").upper()
+    return f"{title} • {amount} {currency}".strip() if amount not in (None, "") else title
+
+
+def stock_item_summary_text(item: dict) -> str:
+    code = mask_giftcard_code(item.get("delivery_code") or item.get("giftcard_code")) or "—"
+    lines = [
+        f"{stock_field_label('stock_id')}: <code>{html_escape(str(item.get('id') or '—'))}</code>",
+        f"Товар: {html_escape(stock_item_product_label(item))}",
+        f"{stock_field_label('delivery_code')}: <code>{html_escape(code)}</code>",
+        f"{stock_field_label('supplier_order_id')}: <code>{html_escape(str(item.get('supplier_order_id') or '—'))}</code>",
+        f"Статус: {html_escape(stock_status_label(str(item.get('status') or '')))}",
+    ]
+    if item.get("supplier_status"):
+        lines.append(f"{stock_field_label('supplier_status')}: {html_escape(str(item.get('supplier_status')))}")
+    return "\n".join(lines)
+
+
+def stock_mark_issued_confirm_text(item: dict) -> str:
+    return (
+        "Позиция уже была выдана клиенту?\n\n"
+        f"{stock_item_summary_text(item)}\n\n"
+        "После подтверждения позиция исчезнет из “В наличии” и попадёт в “Выданные”."
+    )
 
 
 def apple_id_stock_catalog_regions() -> list[str]:
@@ -8019,7 +8114,7 @@ def apple_id_stock_quick_prompt(region: str, amount, currency: str, order_id: in
         return (
             f"Вставьте код для заказа #{order_id}:\n"
             f"{region} {amount} {currency}\n\n"
-            "Можно вставить CODE или supplier_order_id | CODE."
+            "Можно вставить КОД или Заказ у поставщика | КОД."
         )
     return (
         "Вставьте Apple ID коды для:\n"
@@ -8064,12 +8159,12 @@ def apple_id_stock_add_result_text(region: str, amount, currency: str, added: li
 
 
 def apple_id_stock_list_text(status_filter: str) -> str:
-    title = {"available": "📦 Доступные коды", "used": "✅ Использованные", "problem": "⚠️ Проблемные"}.get(status_filter, "🍎 Склад Apple ID")
+    title = {"available": stock_status_label("available", plural=True), "used": stock_status_label("used", plural=True), "problem": stock_status_label("invalid", plural=True)}.get(status_filter, "🍎 Склад Apple ID")
     statuses = {"reserved", "invalid"} if status_filter == "problem" else {status_filter}
     rows = []
     for item in load_apple_id_stock():
         if item.get("status") in statuses:
-            rows.append(f"• <code>{html_escape(str(item.get('supplier_order_id') or '—'))}</code> · {html_escape(str(item.get('region') or '—'))} {html_escape(str(item.get('amount') or '—'))} {html_escape(str(item.get('currency') or '—'))} · <code>{html_escape(mask_giftcard_code(item.get('giftcard_code')) or '****')}</code> · {html_escape(str(item.get('status') or '—'))}")
+            rows.append(stock_item_summary_text(item))
     return f"{title}\n\n" + ("\n".join(rows[:50]) if rows else "Нет кодов.")
 
 
@@ -9782,7 +9877,7 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             return
         parts = [part.strip() for part in msg.text.split("|")]
         if len(parts) != 5:
-            await msg.reply_text("⚠️ Формат: supplier_order_id | region | amount | currency | code")
+            await msg.reply_text("⚠️ Формат: Заказ у поставщика | регион | номинал | валюта | код")
             return
         supplier_order_id, region, amount, currency, code = parts
         try:
@@ -9798,11 +9893,7 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("client_input", None)
         await msg.reply_text(
             "✅ Код добавлен на склад\n\n"
-            f"Supplier order: {html_escape(str(stock.get('supplier_order_id')))}\n"
-            f"Регион: {html_escape(str(stock.get('region')))}\n"
-            f"Номинал: {html_escape(str(stock.get('amount')))} {html_escape(str(stock.get('currency')))}\n"
-            f"Код: {html_escape(mask_giftcard_code(stock.get('giftcard_code')))}\n"
-            f"Статус: {html_escape(str(stock.get('status')))}",
+            f"{stock_item_summary_text(stock)}",
             parse_mode="HTML",
             reply_markup=apple_id_stock_keyboard(),
         )
@@ -9866,6 +9957,25 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
             parse_mode="HTML",
             reply_markup=apple_id_stock_keyboard(),
         )
+        return
+
+    if input_mode == STOCK_INPUT_FIND_BY_ID:
+        if not (has_admin_access(update.effective_user) or has_owner_access(update.effective_user)):
+            context.user_data.pop("client_input", None)
+            await deny_admin_access(update)
+            return
+        stock_id = msg.text.strip()
+        category = context.user_data.pop("stock_find_category", "apple_id")
+        context.user_data.pop("client_input", None)
+        item = find_stock_item_by_id(stock_id)
+        if not item:
+            await msg.reply_text("⚠️ Позиция с таким ID не найдена.", reply_markup=stock_category_keyboard(category))
+            return
+        rows = []
+        if item.get("status") != "used":
+            rows.append([InlineKeyboardButton(stock_action_label("mark_issued"), callback_data=f"admin_stock_mark_issued:{str(item.get('id'))[:64]}")])
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{item.get('category') or category}")])
+        await msg.reply_text(stock_item_summary_text(item), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if input_mode == ADMIN_MANAGEMENT_INPUT_TELEGRAM_ID:
@@ -11899,7 +12009,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 logger.warning("Apple ID stock delivery failed for order %s: %s", order_id, exc)
         chat_id = get_orders_chat_id()
         if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=("✅ Apple ID код выдан со склада\n\n" f"Заказ: {html_escape(order_number_plain(updated))}\n" f"Складская позиция: <code>{html_escape(str(stock.get('id')))}</code>\n" f"Supplier order: <code>{html_escape(str(stock.get('supplier_order_id') or '—'))}</code>\n" f"Регион: {html_escape(str(stock.get('region') or '—'))}\n" f"Номинал: {html_escape(str(stock.get('amount') or '—'))} {html_escape(str(stock.get('currency') or ''))}\n" f"Код: <code>{html_escape(mask_giftcard_code(stock.get('giftcard_code')))}</code>"), parse_mode="HTML")
+            await context.bot.send_message(chat_id=chat_id, text=("✅ Apple ID код выдан со склада\n\n" f"Заказ: {html_escape(order_number_plain(updated))}\n" f"ID позиции: <code>{html_escape(str(stock.get('id')))}</code>\n" f"Заказ у поставщика: <code>{html_escape(str(stock.get('supplier_order_id') or '—'))}</code>\n" f"Регион: {html_escape(str(stock.get('region') or '—'))}\n" f"Номинал: {html_escape(str(stock.get('amount') or '—'))} {html_escape(str(stock.get('currency') or ''))}\n" f"Код: <code>{html_escape(mask_giftcard_code(stock.get('giftcard_code')))}</code>"), parse_mode="HTML")
         await edit_or_send(query, context, build_order_card_text(updated), order_card_keyboard(order_id))
     elif data.startswith("order_manual_code:"):
         await query.answer("Используйте склад Apple ID.", show_alert=True)
@@ -11952,7 +12062,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await deny_admin_access(update)
             return
         await query.answer("Синхронизирую...")
-        await edit_or_send(query, context, "🔄 Синхронизирую купленные товары FazerCards...", stock_dashboard_keyboard())
+        await edit_or_send(query, context, "🔄 Обновляю склад из FazerCards...", stock_dashboard_keyboard())
         report = await sync_fazercards_orders_to_stock()
         await edit_or_send(query, context, fazercards_stock_sync_report_text(report), stock_dashboard_keyboard())
     elif data.startswith("admin_stock_category:"):
@@ -11987,11 +12097,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("admin_stock_add:"):
         category = data.split(":", 1)[1]
         await query.answer()
-        await edit_or_send(query, context, "Расширенное добавление: category | product_key | title | delivery_type | region | amount | currency | supplier_order_id | code", stock_category_keyboard(category))
+        await edit_or_send(query, context, "Расширенное добавление: категория | товар | название | тип выдачи | регион | номинал | валюта | заказ у поставщика | код", stock_category_keyboard(category))
     elif data.startswith("admin_stock_list:"):
         _, category, status_filter = data.split(":", 2)
         await query.answer()
         await edit_or_send(query, context, stock_list_text(category, status_filter), stock_list_keyboard(category, status_filter))
+    elif data.startswith("admin_stock_find_by_id:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        category = data.split(":", 1)[1]
+        context.user_data["client_input"] = STOCK_INPUT_FIND_BY_ID
+        context.user_data["stock_find_category"] = category
+        await query.answer()
+        await context.bot.send_message(chat_id=query.from_user.id, text="Отправьте ID позиции, например:\nstock_20260623225937_1")
+    elif data.startswith("admin_stock_mark_issued_confirm:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        stock_id = data.split(":", 1)[1]
+        item, result = mark_stock_item_issued(stock_id)
+        if result == "item_not_found":
+            await query.answer("Позиция не найдена.", show_alert=True)
+            return
+        if result == "already_used":
+            await query.answer("Позиция уже в разделе «Выданные».", show_alert=True)
+        else:
+            await query.answer("Позиция отмечена как выданная.")
+        category = item.get("category") if item else "apple_id"
+        await edit_or_send(query, context, stock_list_text(category, "used"), stock_list_keyboard(category, "used"))
+    elif data.startswith("admin_stock_mark_issued:"):
+        if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
+            await deny_admin_access(update)
+            return
+        stock_id = data.split(":", 1)[1]
+        item = find_stock_item_by_id(stock_id)
+        if not item:
+            await query.answer("Позиция не найдена.", show_alert=True)
+            return
+        await query.answer()
+        await edit_or_send(
+            query,
+            context,
+            stock_mark_issued_confirm_text(item),
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(stock_action_label("confirm_mark_issued"), callback_data=f"admin_stock_mark_issued_confirm:{stock_id}")],
+                [InlineKeyboardButton("Отмена", callback_data=f"admin_stock_list:{item.get('category') or 'apple_id'}:{item.get('status') or 'available'}")],
+            ]),
+        )
     elif data.startswith("admin_stock_check_pending:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
@@ -12003,7 +12156,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if item and item.get("status") == "available":
                 message = "✅ Код найден, позиция стала доступной"
             else:
-                message = "⚠️ Код не найден, response_shape обновлён"
+                message = "⚠️ Код не найден, диагностика ответа поставщика обновлена"
         except Exception as exc:
             logger.warning("FazerCards pending details check failed: %s", exc)
             message = f"⚠️ Ошибка проверки: {html_escape(fazercards_api_error(exc))}"
@@ -12024,7 +12177,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             chat_id=query.from_user.id,
             text=(
                 "Введите данные Apple ID кода в формате:\n\n"
-                "supplier_order_id | region | amount | currency | code\n\n"
+                "Заказ у поставщика | регион | номинал | валюта | код\n\n"
                 "Пример:\n"
                 "ord-49748 | US | 2 | USD | XXXX-XXXX-XXXX"
             ),
