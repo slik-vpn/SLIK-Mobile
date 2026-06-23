@@ -849,8 +849,8 @@ def stock_status_label(status: str, *, plural: bool = False) -> str:
 
 def stock_field_label(field: str) -> str:
     labels = {
-        "stock_id": "ID позиции",
-        "id": "ID позиции",
+        "stock_id": "Внутренний ID",
+        "id": "Внутренний ID",
         "supplier_order_id": "Заказ у поставщика",
         "delivery_code": "Код",
         "giftcard_code": "Код",
@@ -868,7 +868,7 @@ def stock_action_label(action: str) -> str:
     labels = {
         "mark_issued": "📤 Отметить как выданную",
         "confirm_mark_issued": "Да, отметить выданной",
-        "find_by_id": "🧾 Найти позицию по ID",
+        "find_by_id": "🧾 Найти позицию",
         "refresh_from_fazercards": "🔄 Обновить склад из FazerCards",
     }
     return labels.get(str(action or ""), str(action or ""))
@@ -8037,7 +8037,7 @@ def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMark
         for item in load_stock():
             if item.get("category") == "apple_id" and item.get("status") == "available":
                 stock_id = str(item.get("id"))[:64]
-                rows.append([InlineKeyboardButton(stock_action_label("mark_issued"), callback_data=f"admin_stock_mark_issued:{stock_id}")])
+                rows.append([InlineKeyboardButton(stock_mark_issued_button_label(item), callback_data=f"admin_stock_mark_issued:{stock_id}")])
                 if len(rows) >= 20:
                     break
     if category == "apple_id" and status_filter == "pending":
@@ -8052,7 +8052,22 @@ def stock_list_keyboard(category: str, status_filter: str) -> InlineKeyboardMark
 
 
 def find_stock_item_by_id(stock_id: str) -> dict | None:
-    return next((item for item in load_stock() if str(item.get("id") or "") == str(stock_id)), None)
+    return find_stock_item(stock_id)
+
+
+def find_stock_item(query: str) -> dict | None:
+    needle = str(query or "").strip()
+    normalized_needle = normalize_stock_code(needle)
+    for item in load_stock():
+        if str(item.get("id") or "").strip() == needle:
+            return item
+        if str(item.get("supplier_order_id") or "").strip() == needle:
+            return item
+        if normalized_needle and normalize_stock_code(item.get("delivery_code")) == normalized_needle:
+            return item
+        if normalized_needle and normalize_stock_code(item.get("giftcard_code")) == normalized_needle:
+            return item
+    return None
 
 
 def stock_item_product_label(item: dict) -> str:
@@ -8062,17 +8077,37 @@ def stock_item_product_label(item: dict) -> str:
     return f"{title} • {amount} {currency}".strip() if amount not in (None, "") else title
 
 
+def stock_display_id(item: dict) -> str:
+    supplier_order_id = str(item.get("supplier_order_id") or "").strip()
+    if supplier_order_id:
+        return supplier_order_id
+    order_id = str(item.get("source_order_id") or item.get("used_order_id") or "").strip()
+    if order_id:
+        return f"Заказ SLIK #{order_id}"
+    if item.get("title") and item.get("amount") not in (None, "") and item.get("currency"):
+        return stock_item_product_label(item)
+    return str(item.get("id") or "—")
+
+
+def stock_mark_issued_button_label(item: dict) -> str:
+    return f"📤 Отметить выданной: {stock_display_id(item)}"
+
+
 def stock_item_summary_text(item: dict) -> str:
     code = mask_giftcard_code(item.get("delivery_code") or item.get("giftcard_code")) or "—"
     lines = [
-        f"{stock_field_label('stock_id')}: <code>{html_escape(str(item.get('id') or '—'))}</code>",
+        f"📦 Позиция: {html_escape(stock_display_id(item))}",
         f"Товар: {html_escape(stock_item_product_label(item))}",
-        f"{stock_field_label('delivery_code')}: <code>{html_escape(code)}</code>",
-        f"{stock_field_label('supplier_order_id')}: <code>{html_escape(str(item.get('supplier_order_id') or '—'))}</code>",
-        f"Статус: {html_escape(stock_status_label(str(item.get('status') or '')))}",
     ]
+    if code != "—":
+        lines.append(f"{stock_field_label('delivery_code')}: <code>{html_escape(code)}</code>")
+    lines.append(f"Статус: {html_escape(stock_status_label(str(item.get('status') or '')))}")
+    if item.get("status") == "used" and item.get("used_at"):
+        lines.append(f"Выдана: {html_escape(str(item.get('used_at')))}")
     if item.get("supplier_status"):
         lines.append(f"{stock_field_label('supplier_status')}: {html_escape(str(item.get('supplier_status')))}")
+    if not item.get("supplier_order_id"):
+        lines.append(f"{stock_field_label('stock_id')}: <code>{html_escape(str(item.get('id') or '—'))}</code>")
     return "\n".join(lines)
 
 
@@ -9967,13 +10002,13 @@ async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_
         stock_id = msg.text.strip()
         category = context.user_data.pop("stock_find_category", "apple_id")
         context.user_data.pop("client_input", None)
-        item = find_stock_item_by_id(stock_id)
+        item = find_stock_item(stock_id)
         if not item:
-            await msg.reply_text("⚠️ Позиция с таким ID не найдена.", reply_markup=stock_category_keyboard(category))
+            await msg.reply_text("⚠️ Позиция с таким номером, заказом поставщика или кодом не найдена.", reply_markup=stock_category_keyboard(category))
             return
         rows = []
         if item.get("status") != "used":
-            rows.append([InlineKeyboardButton(stock_action_label("mark_issued"), callback_data=f"admin_stock_mark_issued:{str(item.get('id'))[:64]}")])
+            rows.append([InlineKeyboardButton(stock_mark_issued_button_label(item), callback_data=f"admin_stock_mark_issued:{str(item.get('id'))[:64]}")])
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"admin_stock_category:{item.get('category') or category}")])
         await msg.reply_text(stock_item_summary_text(item), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
         return
@@ -12110,7 +12145,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["client_input"] = STOCK_INPUT_FIND_BY_ID
         context.user_data["stock_find_category"] = category
         await query.answer()
-        await context.bot.send_message(chat_id=query.from_user.id, text="Отправьте ID позиции, например:\nstock_20260623225937_1")
+        await context.bot.send_message(chat_id=query.from_user.id, text="Отправьте номер позиции или заказа у поставщика.\n\nПример:\nord-49748")
     elif data.startswith("admin_stock_mark_issued_confirm:"):
         if not (has_admin_access(query.from_user) or has_owner_access(query.from_user)):
             await deny_admin_access(update)
