@@ -74,6 +74,7 @@ FAZERCARDS_TELEGRAM_PREMIUM_ENDPOINT = "/telegram/premium"
 FAZERCARDS_TELEGRAM_STARS_BUY_ENDPOINT = "/telegram/stars/buy"
 FAZERCARDS_TELEGRAM_PREMIUM_BUY_ENDPOINT = "/telegram/premium/buy"
 FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT = "/giftcards/order"
+FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT = os.environ.get("FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT", "").strip()
 MULTITRANSFER_OZON_APPLE_ID_URL = "https://embedded.multitransfer.ru/ozon/products/business/APPLE%20ID"
 APPLE_ID_MARKET_TIMEOUT_SECONDS = 6.0
 APPLE_ID_PRICE_MIN_RUB = 50
@@ -2849,6 +2850,16 @@ def order_already_fulfilled(order: dict) -> bool:
     )
 
 
+def apple_id_can_fetch_existing_supplier_order(order: dict) -> bool:
+    return (
+        order_category_key(order) == "apple_id"
+        and bool(order.get("supplier_order_id"))
+        and not bool(order.get("giftcard_code"))
+        and not bool(order.get("auto_fulfilled_at"))
+        and order_fulfillment_status(order) not in {"issued", "auto_issued"}
+    )
+
+
 def mask_giftcard_code(value) -> str:
     text = str(value or "").strip()
     compact = "".join(ch for ch in text if ch.isalnum())
@@ -2874,38 +2885,83 @@ def sanitized_supplier_response(payload):
     return payload
 
 
+def supplier_response_shape(payload) -> str:
+    lines = []
+
+    def safe_keys(value) -> str:
+        if not isinstance(value, dict):
+            return ""
+        return ",".join(str(key) for key in list(value.keys())[:30])
+
+    if isinstance(payload, dict):
+        lines.append(f"dict keys: {safe_keys(payload)}")
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                lines.append(f"{key} keys: {safe_keys(value)}")
+            elif isinstance(value, list):
+                lines.append(f"{key} list length: {len(value)}")
+                if value and isinstance(value[0], dict):
+                    lines.append(f"{key}[0] keys: {safe_keys(value[0])}")
+            if len(lines) >= 12:
+                break
+    elif isinstance(payload, list):
+        lines.append(f"list length: {len(payload)}")
+        if payload and isinstance(payload[0], dict):
+            lines.append(f"[0] keys: {safe_keys(payload[0])}")
+    else:
+        lines.append(f"type: {type(payload).__name__}")
+    return "; ".join(lines)[:500]
+
+
 def supplier_order_id_from_response(payload) -> str:
     if not isinstance(payload, dict):
         return ""
-    for key in ("order_id", "id", "supplier_order_id", "uuid"):
+    direct_keys = ("id", "order_id", "supplier_order_id", "invoice_id", "transaction_id", "uuid")
+    for key in direct_keys:
         if payload.get(key):
             return str(payload.get(key))
-    for parent in ("data", "result", "order"):
+    for parent in ("result", "data", "order"):
         value = payload.get(parent)
         nested = supplier_order_id_from_response(value) if isinstance(value, dict) else ""
         if nested:
             return nested
+    for parent in ("items", "cards"):
+        value = payload.get(parent)
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            nested = supplier_order_id_from_response(value[0])
+            if nested:
+                return nested
     return ""
 
 
 def giftcard_fields_from_response(payload) -> dict:
     fields = {"giftcard_code": "", "giftcard_pin": "", "giftcard_link": ""}
-    if not isinstance(payload, dict):
-        return fields
-    for key, value in payload.items():
-        lk = str(key).lower()
-        if not fields["giftcard_code"] and lk in {"code", "giftcard_code", "card_code", "voucher"}:
-            fields["giftcard_code"] = str(value or "")
-        if not fields["giftcard_pin"] and "pin" in lk:
-            fields["giftcard_pin"] = str(value or "")
-        if not fields["giftcard_link"] and ("link" in lk or "url" in lk):
-            fields["giftcard_link"] = str(value or "")
-        if isinstance(value, dict):
-            nested = giftcard_fields_from_response(value)
-            for fkey, fval in nested.items():
-                fields[fkey] = fields[fkey] or fval
-    return fields
+    code_keys = {"code", "giftcard_code", "card_code", "voucher", "activation_code", "redeem_code", "voucher_code", "serial"}
+    pin_keys = {"pin", "giftcard_pin"}
+    link_keys = {"link", "claim_url", "url", "giftcard_url"}
 
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                lk = str(key).lower()
+                if child not in (None, ""):
+                    if not fields["giftcard_code"] and lk in code_keys:
+                        fields["giftcard_code"] = str(child)
+                    if not fields["giftcard_pin"] and (lk in pin_keys or "pin" == lk):
+                        fields["giftcard_pin"] = str(child)
+                    if not fields["giftcard_link"] and lk in link_keys:
+                        fields["giftcard_link"] = str(child)
+                if isinstance(child, (dict, list)):
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                if isinstance(child, (dict, list)):
+                    walk(child)
+                if fields["giftcard_code"] and fields["giftcard_pin"] and fields["giftcard_link"]:
+                    break
+
+    walk(payload)
+    return fields
 
 def update_order_fields(order_id: int, **fields) -> dict | None:
     orders = load_orders()
@@ -2930,6 +2986,23 @@ async def fazercards_post_order(endpoint: str, payload: dict) -> dict:
         raise ValueError("FAZERCARDS_API_KEY not configured")
     async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
         response = await client.post(endpoint, headers=fazercards_headers(api_key), json=payload)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and data.get("ok", True) is False:
+            raise ValueError(str(data.get("error") or data.get("message") or "supplier_error"))
+        return data if isinstance(data, dict) else {"data": data}
+
+
+async def fetch_fazercards_order_details(order_id: str) -> dict:
+    endpoint_template = FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT
+    if not endpoint_template:
+        return {"ok": False, "error": "order_details_endpoint_not_configured"}
+    api_key = get_fazercards_api_key()
+    if not api_key:
+        return {"ok": False, "error": "FAZERCARDS_API_KEY not configured"}
+    endpoint = endpoint_template.replace("{order_id}", quote(str(order_id), safe=""))
+    async with httpx.AsyncClient(base_url=FAZERCARDS_API_BASE_URL, timeout=FAZERCARDS_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        response = await client.get(endpoint, headers=fazercards_headers(api_key))
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("ok", True) is False:
@@ -3005,21 +3078,57 @@ async def auto_fulfill_telegram_premium_order(order: dict) -> dict:
 async def auto_fulfill_apple_id_order(order: dict) -> dict:
     if order_category_key(order) != "apple_id" and str(order.get("product_type") or "") != "apple_id":
         return {"ok": False, "error": "not_apple_id_order", "manual_fallback": True}
+    if order_payment_status(order) != "paid":
+        return {"ok": False, "error": "payment_not_paid", "manual_fallback": True}
+
+    existing_supplier_order_id = str(order.get("supplier_order_id") or "").strip()
+    if existing_supplier_order_id and not order.get("giftcard_code") and not order.get("auto_fulfilled_at"):
+        details = await fetch_fazercards_order_details(existing_supplier_order_id)
+        fields = giftcard_fields_from_response(details)
+        if fields.get("giftcard_code"):
+            return {"ok": True, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), **fields}
+        if details.get("error") == "order_details_endpoint_not_configured":
+            error = "giftcard_code_missing: supplier_order_id present but order details endpoint not configured"
+        else:
+            error = f"giftcard_code_missing: response_keys={supplier_response_shape(details)}"
+        return {"ok": False, "supplier": "fazercards", "supplier_order_id": existing_supplier_order_id, "supplier_response": sanitized_supplier_response(details), **fields, "error": error, "manual_fallback": True}
+
     if order_already_fulfilled(order):
         return {"ok": False, "error": "already_fulfilled", "already_fulfilled": True, "manual_fallback": False}
     category_id = order.get("fazercards_category_id")
     card_id = order.get("fazercards_card_id") or order.get("fazercards_product_id")
+    product_id = order.get("fazercards_product_id") or card_id
     amount = order.get("nominal") or order.get("amount")
     region = order.get("region") or order.get("country")
-    if not category_id or not card_id or not amount or not region:
+    currency = order.get("currency")
+    if not category_id or not card_id or not product_id or not amount or not region:
         return {"ok": False, "error": "apple_id_supplier_data_missing", "manual_fallback": True}
-    payload = {"category_id": str(category_id), "card_id": str(card_id), "quantity": 1}
+    payload = {"category_id": str(category_id), "card_id": str(card_id), "product_id": str(product_id), "quantity": 1}
+    if amount:
+        payload["amount"] = amount
+        payload["nominal"] = amount
+    if region:
+        payload["region"] = region
+        payload["country"] = region
+    if currency:
+        payload["currency"] = currency
     data = await fazercards_post_order(FAZERCARDS_GIFTCARDS_ORDER_ENDPOINT, payload)
     fields = giftcard_fields_from_response(data)
     supplier_order_id = supplier_order_id_from_response(data)
+    if supplier_order_id and not fields.get("giftcard_code"):
+        details = await fetch_fazercards_order_details(supplier_order_id)
+        detail_fields = giftcard_fields_from_response(details)
+        for key, value in detail_fields.items():
+            fields[key] = fields.get(key) or value
+        if details.get("ok") is not False:
+            data = details
     ok = bool(fields.get("giftcard_code"))
     if not ok:
-        return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), **fields, "error": "giftcard_code_missing", "manual_fallback": True}
+        if supplier_order_id and not FAZERCARDS_GIFTCARDS_ORDER_DETAILS_ENDPOINT:
+            error = "giftcard_code_missing: supplier_order_id present but order details endpoint not configured"
+        else:
+            error = f"giftcard_code_missing: response_keys={supplier_response_shape(data)}"
+        return {"ok": False, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), **fields, "error": error, "manual_fallback": True}
     return {"ok": True, "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_response": sanitized_supplier_response(data), **fields}
 
 
@@ -3114,13 +3223,23 @@ async def notify_auto_fulfillment(context, order: dict, report: dict) -> None:
                 await context.bot.send_message(
                     chat_id=tech_chat_id,
                     text=(
-                        ("FazerCards Telegram Premium fulfillment failed" if order_category_key(order) == "telegram_premium" else ("FazerCards Telegram Stars fulfillment failed" if order_category_key(order) == "telegram_stars" else "FazerCards Apple ID fulfillment failed")) + "\n"
-                        f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
-                        f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
-                        f"recipient: {html_escape(display_telegram_username(order.get('telegram_recipient_username') or order.get('recipient') or ''))}\n"
-                        f"duration_months: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))}\n"
-                        f"amount: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))}\n"
-                        f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                        (
+                            "FazerCards Apple ID fulfillment failed\n"
+                            f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
+                            f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
+                            f"region: {html_escape(str(order.get('region') or order.get('country') or '—'))}\n"
+                            f"amount: {html_escape(str(order.get('nominal') or order.get('amount') or '—'))}\n"
+                            f"currency: {html_escape(str(order.get('currency') or '—'))}\n"
+                            f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                        ) if order_category_key(order) == "apple_id" else (
+                            ("FazerCards Telegram Premium fulfillment failed" if order_category_key(order) == "telegram_premium" else "FazerCards Telegram Stars fulfillment failed") + "\n"
+                            f"order_id: {html_escape(str(order.get('id') or order.get('number') or '—'))}\n"
+                            f"supplier_order_id: {html_escape(str(report.get('supplier_order_id') or order.get('supplier_order_id') or '—'))}\n"
+                            f"recipient: {html_escape(display_telegram_username(order.get('telegram_recipient_username') or order.get('recipient') or ''))}\n"
+                            f"duration_months: {html_escape(str(order.get('duration_months') or order.get('months') or '—'))}\n"
+                            f"amount: {html_escape(str(order.get('stars_amount') or order.get('amount') or '—'))}\n"
+                            f"error: {html_escape(str(report.get('error') or 'unknown'))}"
+                        )
                     ),
                     parse_mode="HTML",
                 )
@@ -3133,7 +3252,7 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
     report = {"ok": False, "order_id": str(order.get("number") or order.get("id") or ""), "category": category, "status": order_fulfillment_status(order)}
     if order_payment_status(order) != "paid":
         return {**report, "skipped": True, "message": "payment_not_paid"}
-    if order_already_fulfilled(order):
+    if order_already_fulfilled(order) and not apple_id_can_fetch_existing_supplier_order(order):
         return {**report, "ok": True, "skipped": True, "message": "already_fulfilled"}
     settings = get_auto_fulfillment_settings()
     toggle = {"apple_id": "apple_id_enabled", "telegram_stars": "telegram_stars_enabled", "telegram_premium": "telegram_premium_enabled", "esim": "esim_enabled"}.get(category)
@@ -3157,6 +3276,8 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
     for attempt in range(1, attempts + 1):
         try:
             result = await helpers[category](order)
+            if result.get("supplier_order_id"):
+                order = {**order, "supplier_order_id": result.get("supplier_order_id")}
             if result.get("ok"):
                 break
             last_error = str(result.get("error") or "supplier_error")
@@ -3180,8 +3301,13 @@ async def maybe_auto_fulfill_paid_order(context, order: dict, reason: str = "pay
         await notify_auto_fulfillment(context, updated, final)
         return final
     status = "manual_required" if settings.get("manual_fallback_enabled", True) else "failed"
-    updated = update_order_fields(order.get("id"), fulfillment_status=status, status=("paid_waiting_manual_issue" if status == "manual_required" else status), auto_fulfillment=True, auto_fulfillment_attempts=attempts, auto_fulfillment_last_error=last_error or result.get("error") or "supplier_error") or order
-    final = {**report, "status": status, "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_required"}
+    failure_fields = {"fulfillment_status": status, "status": ("paid_waiting_manual_issue" if status == "manual_required" else status), "auto_fulfillment": True, "auto_fulfillment_attempts": attempts, "auto_fulfillment_last_error": last_error or result.get("error") or "supplier_error"}
+    if result.get("supplier_order_id"):
+        failure_fields["supplier_order_id"] = result.get("supplier_order_id")
+    if result.get("supplier_response"):
+        failure_fields["supplier_response"] = result.get("supplier_response")
+    updated = update_order_fields(order.get("id"), **failure_fields) or {**order, **failure_fields}
+    final = {**report, "status": status, "supplier_order_id": updated.get("supplier_order_id") or result.get("supplier_order_id") or "", "error": updated.get("auto_fulfillment_last_error"), "manual_fallback": status == "manual_required"}
     await notify_auto_fulfillment(context, updated, final)
     return final
 
@@ -10528,7 +10654,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not order:
             await query.answer("Заказ не найден.", show_alert=True)
             return
-        if order_payment_status(order) != "paid" or order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"} or not auto_fulfillment_supported_product(order) or order_already_fulfilled(order):
+        retry_existing_supplier = apple_id_can_fetch_existing_supplier_order(order)
+        if order_payment_status(order) != "paid" or order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"} or not auto_fulfillment_supported_product(order) or (order_already_fulfilled(order) and not retry_existing_supplier):
             await query.answer("Повторная автовыдача недоступна для этого заказа.", show_alert=True)
             return
         update_order_fields(order_id, auto_fulfilled_at="", fulfillment_status="pending")
