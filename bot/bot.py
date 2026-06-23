@@ -3271,12 +3271,19 @@ def mask_giftcard_code(value) -> str:
 
 
 def sanitized_supplier_response(payload):
+    sensitive_container_keys = {"cards", "items", "codes", "keys", "vouchers"}
+
     if isinstance(payload, dict):
         clean = {}
         for key, value in payload.items():
             lk = str(key).lower()
             if any(token in lk for token in ("code", "pin", "voucher", "secret", "token", "api_key")):
                 clean[key] = mask_giftcard_code(value)
+            elif lk in sensitive_container_keys and isinstance(value, list):
+                clean[key] = [
+                    mask_giftcard_code(item) if isinstance(item, str) and looks_like_giftcard_code(item) else sanitized_supplier_response(item)
+                    for item in value
+                ]
             else:
                 clean[key] = sanitized_supplier_response(value)
         return clean
@@ -3302,6 +3309,7 @@ def supplier_response_shape(payload) -> str:
             current = current.get(key)
             label = f"{label}.{key}" if label else key
         if isinstance(current, list):
+            lines.append(f"{label} length: {len(current)}")
             if not current:
                 lines.append(f"{label}: empty list")
             elif isinstance(current[0], dict):
@@ -3362,30 +3370,56 @@ def giftcard_fields_from_response(payload) -> dict:
     code_keys = {"code", "delivery_code", "giftcard_code", "card_code", "activation_code", "redeem_code", "voucher_code", "serial", "value", "number", "key", "secret", "token", "voucher"}
     pin_keys = {"pin", "giftcard_pin", "security_code"}
     link_keys = {"link", "url", "claim_url", "download_url", "giftcard_url"}
-    recursive_card_payload_keys = {"credentials", "credential", "data", "payload"}
+    string_code_container_keys = {"cards", "items", "codes", "keys", "vouchers"}
 
-    def walk(value):
+    def walk(value, parent_key: str = ""):
+        if fields["giftcard_code"] and fields["giftcard_pin"] and fields["giftcard_link"]:
+            return
+        if isinstance(value, str):
+            if parent_key in string_code_container_keys and not fields["giftcard_code"] and looks_like_giftcard_code(value):
+                fields["giftcard_code"] = value.strip()
+            return
+
         if isinstance(value, dict):
             for key, child in value.items():
                 lk = str(key).lower()
                 if child not in (None, ""):
-                    if not fields["giftcard_code"] and lk in code_keys:
+                    if not fields["giftcard_code"] and lk in code_keys and not isinstance(child, (dict, list)):
                         fields["giftcard_code"] = str(child)
                     if not fields["giftcard_pin"] and (lk in pin_keys or "pin" == lk):
                         fields["giftcard_pin"] = str(child)
                     if not fields["giftcard_link"] and lk in link_keys:
                         fields["giftcard_link"] = str(child)
-                if isinstance(child, (dict, list)):
-                    walk(child)
+                if isinstance(child, (dict, list, str)):
+                    walk(child, lk)
         elif isinstance(value, list):
             for child in value:
-                if isinstance(child, (dict, list)):
-                    walk(child)
+                if isinstance(child, (dict, list, str)):
+                    walk(child, parent_key)
                 if fields["giftcard_code"] and fields["giftcard_pin"] and fields["giftcard_link"]:
                     break
 
     walk(payload)
     return fields
+
+
+def looks_like_giftcard_code(value: str) -> bool:
+    text = str(value or "").strip()
+    if len(text) < 6:
+        return False
+    if not any(ch.isalnum() for ch in text):
+        return False
+    words = [part for part in re.split(r"\s+", text) if part]
+    if len(words) >= 4:
+        return False
+    lowered = text.lower()
+    plain_text_markers = {
+        "pending", "completed", "complete", "failed", "cancelled", "canceled", "refunded",
+        "app store", "itunes", "apple id", "category", "gift card", "fazer", "order",
+    }
+    if any(marker in lowered for marker in plain_text_markers) and not any(ch in text for ch in "-_:/."):
+        return False
+    return True
 
 
 def parse_fazercards_orders_response(data: dict) -> list[dict]:
