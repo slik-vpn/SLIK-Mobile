@@ -3535,11 +3535,15 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
     if existing is None and code_key:
         for item in items:
             if normalize_stock_code(item.get("delivery_code") or item.get("giftcard_code")) == code_key:
-                return None, "already"
-        for order in load_orders():
-            if normalize_stock_code(order.get("giftcard_code")) == code_key:
-                return None, "skipped"
+                existing = item
+                break
+        if existing is None:
+            for order in load_orders():
+                if normalize_stock_code(order.get("giftcard_code")) == code_key:
+                    return None, "skipped"
     action = "updated" if existing else "added"
+    if existing and str(existing.get("status") or "") == "used":
+        action = "already"
     target = existing or {"id": f"stock_{datetime.datetime.now(tz=TZ).strftime('%Y%m%d%H%M%S')}_{len(items) + 1}", "created_at": now_str()}
     if existing and category == "unknown" and target.get("category"):
         category = str(target.get("category"))
@@ -3563,10 +3567,12 @@ def upsert_stock_item_from_fazercards_order(order_data: dict) -> tuple[dict | No
         new_status = "pending"
     else:
         new_status = "pending"
+    used_status_locked = current_status == "used"
+    target_supplier_order_id = str(target.get("supplier_order_id") or supplier_order_id).strip() if used_status_locked else supplier_order_id
     response_shape = supplier_response_shape(order_data) if new_status == "pending" and not code_key else ""
     target.update({
         "category": category, "product_key": f"{category}_{region.lower()}_{stock_amount_key(amount)}_{currency.lower()}".strip("_"),
-        "supplier": "fazercards", "supplier_order_id": supplier_order_id, "supplier_status": supplier_status, "title": title,
+        "supplier": "fazercards", "supplier_order_id": target_supplier_order_id, "supplier_status": supplier_status, "title": title,
         "region": region, "amount": amount, "currency": currency, "delivery_type": "code",
         "delivery_code": code or target.get("delivery_code", ""),
         "delivery_pin": fields.get("giftcard_pin", "") or target.get("delivery_pin", ""),
