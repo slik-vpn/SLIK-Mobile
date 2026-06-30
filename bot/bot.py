@@ -6564,12 +6564,22 @@ ORDER_LIST_FILTERS = {
     "esim": {"category:esim"},
     "pending_payment": {"payment:pending_payment"},
     "paid": {"payment:paid"},
+    "payment_pending": {"payment:pending_payment"},
+    "payment_paid": {"payment:paid"},
+    "payment_failed": {"payment:payment_failed"},
+    "payment_refunded": {"payment:refunded"},
+    "payment_cancelled": {"payment:cancelled"},
     "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new", "fulfillment:waiting_supplier_code", "fulfillment:client_delivery_failed"},
     "issued": {"fulfillment:issued", "fulfillment:auto_issued"},
     "cancelled": {"payment:cancelled", "fulfillment:cancelled"},
     "refunded": {"payment:refunded"},
     "new": {"fulfillment:new"},
     "auto_fulfillment": {"fulfillment:auto_processing", "fulfillment:auto_issue_pending", "fulfillment:auto_issue_processing"},
+    "fulfillment_auto": {"fulfillment:auto_processing", "fulfillment:auto_issue_pending", "fulfillment:auto_issue_processing"},
+    "fulfillment_waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new", "fulfillment:client_delivery_failed"},
+    "fulfillment_waiting_supplier_code": {"fulfillment:waiting_supplier_code"},
+    "fulfillment_issued": {"fulfillment:issued", "fulfillment:auto_issued"},
+    "fulfillment_failed_or_manual": {"fulfillment:failed", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:client_delivery_failed"},
     "attention": {"payment:payment_failed", "fulfillment:failed", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:client_delivery_failed"},
     "in_progress": {"fulfillment:waiting_manual_issue"},
     "pending": {"payment:pending_payment", "fulfillment:new", "fulfillment:waiting_manual_issue"},
@@ -6583,11 +6593,21 @@ ORDER_LIST_TITLES = {
     "esim": "🌍 eSIM",
     "pending_payment": "⏳ Ожидают оплаты",
     "paid": "✅ Оплачены",
+    "payment_pending": "⏳ Ожидает оплаты",
+    "payment_paid": "✅ Оплачен",
+    "payment_failed": "⚠️ Требует проверки оплаты",
+    "payment_refunded": "↩️ Возврат оплаты",
+    "payment_cancelled": "❌ Оплата отменена",
     "waiting_issue": "⏳ Ожидают выдачи",
     "issued": "📤 Выданные / выполненные",
     "cancelled": "❌ Отменённые",
     "refunded": "↩️ Возвраты",
     "auto_fulfillment": "🤖 Автовыдача",
+    "fulfillment_auto": "🤖 Автовыдача",
+    "fulfillment_waiting_issue": "⏳ Ожидает выдачи",
+    "fulfillment_waiting_supplier_code": "⏳ Ожидает код",
+    "fulfillment_issued": "📤 Выдан / выполнен",
+    "fulfillment_failed_or_manual": "⚠️ Требует ручной проверки",
     "attention": "⚠️ Требуют внимания",
     "new": "🆕 Новые заказы",
     "in_progress": "📦 Ожидают выдачи",
@@ -6876,8 +6896,8 @@ def orders_filter_keyboard(filter_type: str) -> InlineKeyboardMarkup:
             ("↩️ Возвраты", "refunded"),
         ],
         "product": [("🍎 Apple ID", "apple_id"), ("⭐ Telegram Stars", "telegram_stars"), ("💎 Telegram Premium", "telegram_premium"), ("🌍 eSIM", "esim")],
-        "payment": [("⏳ Ожидает оплаты", "pending_payment"), ("✅ Оплачен", "paid"), ("⚠️ Требует проверки", "attention"), ("↩️ Возврат", "refunded"), ("❌ Отменён", "cancelled")],
-        "fulfillment": [("🤖 Автовыдача", "auto_fulfillment"), ("⏳ Ожидает выдачи", "waiting_issue"), ("⏳ Ожидает код", "waiting_issue"), ("📤 Выдан / выполнен", "issued"), ("⚠️ Требует ручной проверки", "attention")],
+        "payment": [("⏳ Ожидает оплаты", "payment_pending"), ("✅ Оплачен", "payment_paid"), ("⚠️ Требует проверки", "payment_failed"), ("↩️ Возврат", "payment_refunded"), ("❌ Отменён", "payment_cancelled")],
+        "fulfillment": [("🤖 Автовыдача", "fulfillment_auto"), ("⏳ Ожидает выдачи", "fulfillment_waiting_issue"), ("⏳ Ожидает код", "fulfillment_waiting_supplier_code"), ("📤 Выдан / выполнен", "fulfillment_issued"), ("⚠️ Требует ручной проверки", "fulfillment_failed_or_manual")],
     }
     buttons = groups.get(filter_type, [])
     rows = [[InlineKeyboardButton(label, callback_data=f"orders_list:{key}")] for label, key in buttons]
@@ -7011,8 +7031,6 @@ def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> I
         rows.append([InlineKeyboardButton("👁 Показать код", callback_data=f"order_show_code:{order_id}")])
     if fulfillment_status not in {"issued", "auto_issued"}:
         rows.append([InlineKeyboardButton("📤 Выдать вручную", callback_data=f"order_status:issued:{order_id}")])
-        if auto_fulfillment_supported_product(order):
-            rows.append([InlineKeyboardButton("🤖 Запустить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
     else:
         rows.append([InlineKeyboardButton("⚠️ Отметить проблему / возврат", callback_data=f"order_status:cancelled:{order_id}")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])

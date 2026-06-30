@@ -123,6 +123,15 @@ def check_multiservice_crm(bot_text: str) -> None:
     status_group = status_filter_block.split('"status":', 1)[1].split('"product":', 1)[0] if '"status":' in status_filter_block and '"product":' in status_filter_block else ""
     record("status filter does not contain product category buttons", all(x in bot_text for x in ("orders_filter:status", "orders_filter:product", "orders_filter:payment", "orders_filter:fulfillment")) and all(x not in status_group for x in ("🍎 Apple ID", "⭐ Telegram Stars", "💎 Telegram Premium", "🌍 eSIM")))
     record("category filter is not named status filter", "Фильтр заказов по товару" in filter_text_block and "Выберите товарную категорию" in filter_text_block)
+    payment_group = status_filter_block.split('"payment":', 1)[1].split('"fulfillment":', 1)[0] if '"payment":' in status_filter_block and '"fulfillment":' in status_filter_block else ""
+    fulfillment_group = status_filter_block.split('"fulfillment":', 1)[1].split("}", 1)[0] if '"fulfillment":' in status_filter_block else ""
+    order_filters_block = bot_text.split("ORDER_LIST_FILTERS =", 1)[1].split("ORDER_LIST_CALLBACK_KEYS", 1)[0] if "ORDER_LIST_FILTERS =" in bot_text and "ORDER_LIST_CALLBACK_KEYS" in bot_text else ""
+    record("payment attention filter uses dedicated payment_failed key", "payment_failed" in payment_group and "attention" not in payment_group)
+    record("fulfillment waiting-code filter uses dedicated supplier-code key", "fulfillment_waiting_supplier_code" in fulfillment_group and ("waiting_issue" not in fulfillment_group.split("⏳ Ожидает код", 1)[1].split(")", 1)[0] if "⏳ Ожидает код" in fulfillment_group else False))
+    payment_filters_slice = "\n".join(line for line in order_filters_block.splitlines() if '"payment_' in line)
+    fulfillment_filters_slice = "\n".join(line for line in order_filters_block.splitlines() if '"fulfillment_' in line)
+    record("payment filters do not use fulfillment statuses", "fulfillment:" not in payment_filters_slice and all(x in payment_filters_slice for x in ("payment_pending", "payment_paid", "payment_failed", "payment_refunded", "payment_cancelled")))
+    record("fulfillment filters do not use payment statuses", "payment:" not in fulfillment_filters_slice and all(x in fulfillment_filters_slice for x in ("fulfillment_auto", "fulfillment_waiting_issue", "fulfillment_waiting_supplier_code", "fulfillment_issued", "fulfillment_failed_or_manual")))
     payment_confirm_block = function_block(bot_text, "handle_order_payment_confirm")
     admin_action_block = function_block(bot_text, "handle_admin_action")
     record("manual payment confirm button does not route to in-progress status", "✅ Подтвердить оплату вручную" in order_keyboard_block and "order_payment_confirm:" in order_keyboard_block and "order_status:in_progress" not in order_keyboard_block)
@@ -130,6 +139,11 @@ def check_multiservice_crm(bot_text: str) -> None:
     record("manual payment confirmation triggers paid auto fulfillment", 'maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")' in payment_confirm_block)
     record("manual payment confirmation notifies payments chat", "notify_payment_event_once" in payment_confirm_block and "manual_payment_confirmed" in payment_confirm_block and "manual_confirm" in payment_confirm_block)
     record("fulfillment status buttons do not change payment status", 'payment_status="paid"' not in admin_action_block and "manual_payment_confirmed" not in admin_action_block)
+    retry_button_count = order_keyboard_block.count("🤖 Запустить автовыдачу")
+    retry_button_pos = order_keyboard_block.find("🤖 Запустить автовыдачу")
+    retry_allowed_pos = order_keyboard_block.find("if retry_allowed:")
+    record("auto fulfillment button appears only when retry handler accepts it", retry_button_count == 1 and retry_allowed_pos != -1 and retry_allowed_pos < retry_button_pos and 'order_fulfillment_status(order) not in {"failed", "manual_required", "manual_issue_required"}' in callback_branch_block(bot_text, 'elif data.startswith("order_auto_retry:")'))
+    record("no generic auto fulfillment button outside retry_allowed", retry_button_count == 1)
     record("Apple ID card with received unsent code can resend to client", "📨 Отправить код клиенту повторно" in order_keyboard_block and "order_resend_code:" in order_keyboard_block)
     record("issued Apple ID card keeps full code behind explicit admin owner button", "👁 Показать код" in order_keyboard_block and "order_show_code:" in order_keyboard_block and "mask_giftcard_code" in order_card_block)
     record("Telegram Stars Premium UI uses fulfilled wording not code-issued wording", "Выполнен" in bot_text and "Выполненные" in bot_text and "Выдан код" not in (function_block(bot_text, "orders_filter_keyboard") + function_block(bot_text, "build_order_card_text") + function_block(bot_text, "order_issued_user_text")))
