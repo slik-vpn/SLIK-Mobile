@@ -6994,7 +6994,7 @@ def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> I
     fulfillment_status = order_fulfillment_status(order)
     category = order_category_key(order)
     if payment_status != "paid":
-        rows.append([InlineKeyboardButton("✅ Подтвердить оплату вручную", callback_data=f"order_status:in_progress:{order_id}")])
+        rows.append([InlineKeyboardButton("✅ Подтвердить оплату вручную", callback_data=f"order_payment_confirm:{order_id}")])
         rows.append([InlineKeyboardButton("❌ Отменить заказ", callback_data=f"order_status:cancelled:{order_id}")])
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
         return InlineKeyboardMarkup(rows)
@@ -10205,10 +10205,6 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Заявка не найдена.", show_alert=True)
         return
 
-    if normalize_order_status(status) == "in_progress" and str(order.get("payment_provider") or "").lower() == "card":
-        order = update_order_fields(order_id, payment_status="paid", paid_at=order.get("paid_at") or now_str(), fulfillment_status=order.get("fulfillment_status") or "pending") or order
-        await notify_payment_event_once(context, "manual_confirm", "manual_payment_confirmed", order, query.from_user, order, order.get("payment_details"), actor=query.from_user)
-        await maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")
     if normalize_order_status(status) == "cancelled" and previous_order and order_payment_status(previous_order) == "paid":
         await notify_payment_event_once(context, "payment_cancelled_after_paid", "refund_required", order, query.from_user, order, order.get("payment_details"), actor=query.from_user, error="отмена оплаченного заказа")
     await query.answer(f"Статус: {order_status_label(order.get('status'))}")
@@ -10217,6 +10213,45 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─── Вводы Clients CRM ───────────────────────────────────────────────────────
+
+
+
+async def handle_order_payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+
+    order_id = int(query.data.split(":", 1)[1])
+    current_order = find_order(order_id)
+    if not current_order:
+        await query.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    paid_at = current_order.get("paid_at") or now_str()
+    order = update_order_fields(
+        order_id,
+        status="paid",
+        payment_status="paid",
+        paid_at=paid_at,
+        payment_paid_at=current_order.get("payment_paid_at") or paid_at,
+        fulfillment_status=current_order.get("fulfillment_status") or "pending",
+    ) or current_order
+    await notify_payment_event_once(
+        context,
+        "manual_confirm",
+        "manual_payment_confirmed",
+        order,
+        query.from_user,
+        order,
+        order.get("payment_details"),
+        actor=query.from_user,
+    )
+    await maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")
+    fresh = find_order(order_id) or order
+    await query.answer("Оплата подтверждена вручную")
+    await edit_or_send(query, context, build_order_card_text(fresh), order_card_keyboard(order_id))
+
 
 async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
@@ -12424,6 +12459,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         await context.bot.send_message(chat_id=query.from_user.id, text=(f"👁 Код Apple ID для {html_escape(order_number_plain(order))}:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>"), parse_mode="HTML")
+    elif data.startswith("order_payment_confirm:"):
+        await handle_order_payment_confirm(update, context)
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
     elif data == "admin_stock":
