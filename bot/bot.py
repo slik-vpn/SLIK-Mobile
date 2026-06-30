@@ -6564,13 +6564,27 @@ ORDER_LIST_FILTERS = {
     "esim": {"category:esim"},
     "pending_payment": {"payment:pending_payment"},
     "paid": {"payment:paid"},
-    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new"},
+    "payment_pending": {"payment:pending_payment"},
+    "payment_paid": {"payment:paid"},
+    "payment_failed": {"payment:payment_failed"},
+    "payment_refunded": {"payment:refunded"},
+    "payment_cancelled": {"payment:cancelled"},
+    "waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new", "fulfillment:waiting_supplier_code", "fulfillment:client_delivery_failed"},
     "issued": {"fulfillment:issued", "fulfillment:auto_issued"},
     "cancelled": {"payment:cancelled", "fulfillment:cancelled"},
+    "refunded": {"payment:refunded"},
     "new": {"fulfillment:new"},
+    "auto_fulfillment": {"fulfillment:auto_processing", "fulfillment:auto_issue_pending", "fulfillment:auto_issue_processing"},
+    "fulfillment_auto": {"fulfillment:auto_processing", "fulfillment:auto_issue_pending", "fulfillment:auto_issue_processing"},
+    "fulfillment_waiting_issue": {"fulfillment:waiting_manual_issue", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:pending", "fulfillment:auto_issue_pending", "fulfillment:paid", "fulfillment:new", "fulfillment:client_delivery_failed"},
+    "fulfillment_waiting_supplier_code": {"fulfillment:waiting_supplier_code"},
+    "fulfillment_issued": {"fulfillment:issued", "fulfillment:auto_issued"},
+    "fulfillment_failed_or_manual": {"fulfillment:failed", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:client_delivery_failed"},
+    "attention": {"payment:payment_failed", "fulfillment:failed", "fulfillment:manual_required", "fulfillment:manual_issue_required", "fulfillment:client_delivery_failed"},
     "in_progress": {"fulfillment:waiting_manual_issue"},
     "pending": {"payment:pending_payment", "fulfillment:new", "fulfillment:waiting_manual_issue"},
 }
+ORDER_LIST_CALLBACK_KEYS = ("orders_list:apple_id", "orders_list:telegram_stars", "orders_list:telegram_premium", "orders_list:esim", "orders_list:pending_payment", "orders_list:paid", "orders_list:waiting_issue", "orders_list:issued", "orders_list:cancelled")
 ORDER_LIST_TITLES = {
     "all": "🧾 Все заказы",
     "apple_id": "🍎 Apple ID",
@@ -6579,9 +6593,22 @@ ORDER_LIST_TITLES = {
     "esim": "🌍 eSIM",
     "pending_payment": "⏳ Ожидают оплаты",
     "paid": "✅ Оплачены",
-    "waiting_issue": "📦 Ожидают выдачи",
-    "issued": "✅ Выданы",
-    "cancelled": "❌ Отменены",
+    "payment_pending": "⏳ Ожидает оплаты",
+    "payment_paid": "✅ Оплачен",
+    "payment_failed": "⚠️ Требует проверки оплаты",
+    "payment_refunded": "↩️ Возврат оплаты",
+    "payment_cancelled": "❌ Оплата отменена",
+    "waiting_issue": "⏳ Ожидают выдачи",
+    "issued": "📤 Выданные / выполненные",
+    "cancelled": "❌ Отменённые",
+    "refunded": "↩️ Возвраты",
+    "auto_fulfillment": "🤖 Автовыдача",
+    "fulfillment_auto": "🤖 Автовыдача",
+    "fulfillment_waiting_issue": "⏳ Ожидает выдачи",
+    "fulfillment_waiting_supplier_code": "⏳ Ожидает код",
+    "fulfillment_issued": "📤 Выдан / выполнен",
+    "fulfillment_failed_or_manual": "⚠️ Требует ручной проверки",
+    "attention": "⚠️ Требуют внимания",
     "new": "🆕 Новые заказы",
     "in_progress": "📦 Ожидают выдачи",
     "pending": "🟡 Активные заказы",
@@ -6625,29 +6652,31 @@ ORDER_CATEGORY_META = {
     "other": ("📦", "Другое"),
 }
 PAYMENT_STATUS_LABELS = {
-    "pending_payment": "⏳ ожидает оплаты",
-    "paid": "✅ оплачено",
-    "payment_failed": "❌ ошибка оплаты",
-    "refunded": "↩️ возврат",
-    "cancelled": "❌ отменено",
+    "pending_payment": "⏳ Ожидает оплаты",
+    "waiting_payment": "⏳ Ожидает оплаты",
+    "pending": "⏳ Ожидает оплаты",
+    "paid": "✅ Оплачен",
+    "payment_failed": "⚠️ Требует ручной проверки",
+    "refunded": "↩️ Возврат",
+    "cancelled": "❌ Отменён",
 }
 FULFILLMENT_STATUS_LABELS = {
-    "new": "🆕 новый",
-    "waiting_payment": "⏳ ожидает оплаты",
-    "paid": "✅ оплачен",
-    "pending": "⏳ ожидает выдачи",
-    "auto_processing": "🤖 автовыдача выполняется",
+    "new": "🆕 Новый",
+    "waiting_payment": "⏳ Ожидает оплаты",
+    "paid": "✅ Оплачен",
+    "pending": "⏳ Ожидает выдачи",
+    "auto_processing": "🤖 Автовыдача выполняется",
     "waiting_supplier_code": "⏳ Ожидает код",
-    "client_delivery_failed": "⚠️ код получен, но не отправлен клиенту",
-    "issued": "✅ выдан",
-    "manual_required": "⚠️ требуется ручная выдача",
-    "auto_issue_pending": "🤖 ожидает автовыдачи",
-    "auto_issue_processing": "🤖 автовыдача выполняется",
-    "auto_issued": "✅ автовыдан",
-    "manual_issue_required": "⚠️ требуется ручная выдача",
-    "waiting_manual_issue": "⏳ ожидает ручной выдачи",
-    "failed": "❌ ошибка выдачи",
-    "cancelled": "❌ отменён",
+    "client_delivery_failed": "⚠️ Код получен, но не отправлен клиенту",
+    "issued": "✅ Выдан",
+    "manual_required": "⚠️ Требует ручной проверки",
+    "auto_issue_pending": "🤖 Ожидает автовыдачи",
+    "auto_issue_processing": "🤖 Автовыдача выполняется",
+    "auto_issued": "✅ Выдан",
+    "manual_issue_required": "⚠️ Требует ручной проверки",
+    "waiting_manual_issue": "⏳ Ожидает выдачи",
+    "failed": "⚠️ Требует ручной проверки",
+    "cancelled": "❌ Отменён",
 }
 ACCESS_LABELS = {False: "✅ активен", True: "🚫 заблокирован"}
 
@@ -6838,14 +6867,42 @@ def build_orders_dashboard() -> str:
 def orders_dashboard_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧾 Все заказы", callback_data="orders_list:all")],
-        [InlineKeyboardButton("🍎 Apple ID", callback_data="orders_list:apple_id"), InlineKeyboardButton("⭐ Stars", callback_data="orders_list:telegram_stars")],
-        [InlineKeyboardButton("💎 Premium", callback_data="orders_list:telegram_premium"), InlineKeyboardButton("🌍 eSIM", callback_data="orders_list:esim")],
-        [InlineKeyboardButton("⏳ Ожидают оплаты", callback_data="orders_list:pending_payment"), InlineKeyboardButton("✅ Оплачены", callback_data="orders_list:paid")],
-        [InlineKeyboardButton("📦 Ожидают выдачи", callback_data="orders_list:waiting_issue"), InlineKeyboardButton("✅ Выданы", callback_data="orders_list:issued")],
-        [InlineKeyboardButton("❌ Отменены", callback_data="orders_list:cancelled"), InlineKeyboardButton("🔎 Поиск", callback_data="orders_list:all")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="orders_stats")],
+        [InlineKeyboardButton("📌 По статусу", callback_data="orders_filter:status")],
+        [InlineKeyboardButton("📦 По товару", callback_data="orders_filter:product")],
+        [InlineKeyboardButton("💳 По оплате", callback_data="orders_filter:payment")],
+        [InlineKeyboardButton("🤖 По выдаче", callback_data="orders_filter:fulfillment")],
+        [InlineKeyboardButton("🔎 Поиск", callback_data="orders_list:all"), InlineKeyboardButton("📊 Статистика", callback_data="orders_stats")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="admin_panel")],
     ])
+
+
+def orders_filter_text(filter_type: str) -> str:
+    texts = {
+        "status": "📌 <b>Фильтр заказов по статусу</b>\n\nВыберите статус заказа:",
+        "product": "📦 <b>Фильтр заказов по товару</b>\n\nВыберите товарную категорию:",
+        "payment": "💳 <b>Фильтр заказов по оплате</b>\n\nВыберите состояние оплаты:",
+        "fulfillment": "🤖 <b>Фильтр заказов по выдаче</b>\n\nВыберите состояние выдачи:",
+    }
+    return texts.get(filter_type, "📋 <b>Заказы</b>")
+
+
+def orders_filter_keyboard(filter_type: str) -> InlineKeyboardMarkup:
+    groups = {
+        "status": [
+            ("🆕 Новые", "new"), ("⏳ Ожидают оплаты", "pending_payment"),
+            ("✅ Оплаченные", "paid"), ("🤖 Автовыдача", "auto_fulfillment"),
+            ("⏳ Ожидают выдачи", "waiting_issue"), ("📤 Выданные / выполненные", "issued"),
+            ("⚠️ Требуют внимания", "attention"), ("❌ Отменённые", "cancelled"),
+            ("↩️ Возвраты", "refunded"),
+        ],
+        "product": [("🍎 Apple ID", "apple_id"), ("⭐ Telegram Stars", "telegram_stars"), ("💎 Telegram Premium", "telegram_premium"), ("🌍 eSIM", "esim")],
+        "payment": [("⏳ Ожидает оплаты", "payment_pending"), ("✅ Оплачен", "payment_paid"), ("⚠️ Требует проверки", "payment_failed"), ("↩️ Возврат", "payment_refunded"), ("❌ Отменён", "payment_cancelled")],
+        "fulfillment": [("🤖 Автовыдача", "fulfillment_auto"), ("⏳ Ожидает выдачи", "fulfillment_waiting_issue"), ("⏳ Ожидает код", "fulfillment_waiting_supplier_code"), ("📤 Выдан / выполнен", "fulfillment_issued"), ("⚠️ Требует ручной проверки", "fulfillment_failed_or_manual")],
+    }
+    buttons = groups.get(filter_type, [])
+    rows = [[InlineKeyboardButton(label, callback_data=f"orders_list:{key}")] for label, key in buttons]
+    rows.append([InlineKeyboardButton("⬅️ К фильтрам", callback_data="admin_orders")])
+    return InlineKeyboardMarkup(rows)
 
 
 def order_list_keyboard(filter_key: str) -> InlineKeyboardMarkup:
@@ -6855,7 +6912,7 @@ def order_list_keyboard(filter_key: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(format_order_button_text(order), callback_data=f"order_card:{order.get('id')}")]
         for order in latest_orders
     ]
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin_orders")])
+    rows.append([InlineKeyboardButton("⬅️ К фильтрам", callback_data="admin_orders")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -6892,7 +6949,7 @@ def build_order_card_text(order: dict) -> str:
     manager_comment = order.get("manager_comment") or order.get("admin_comment") or "—"
     issued_at = order.get("issued_at") or order.get("fulfilled_at") or order.get("auto_fulfilled_at") or "—"
     paid_at = order.get("paid_at") or order.get("payment_paid_at") or "—"
-    auto_issue_label = "успешна" if order.get("auto_fulfillment") and order_fulfillment_status(order) == "issued" else str(order.get("fulfillment_status") or "disabled")
+    auto_issue_label = "успешна" if order.get("auto_fulfillment") and order_fulfillment_status(order) == "issued" else fulfillment_status_label(order)
     masked_giftcard_code = mask_giftcard_code(order.get("giftcard_code")) if category == "apple_id" else ""
     code_received_text = "✅" if category == "apple_id" and (order.get("giftcard_code_received") or order.get("giftcard_code")) else "—"
     client_sent_text = "✅" if category == "apple_id" and order.get("client_delivery_status") == "sent" else ("⚠️ не отправлен" if category == "apple_id" and order.get("giftcard_code") else "—")
@@ -6930,7 +6987,7 @@ def build_order_card_text(order: dict) -> str:
         f"Метод: <b>{html_escape(str(payment_method))}</b>\n\n"
         "<b>Выполнение</b>\n"
         f"Статус выдачи: <b>{html_escape(fulfillment_status_label(order))}</b>\n"
-        f"Тип выдачи: <b>{html_escape('автоматическая' if order.get('auto_fulfillment') and order_fulfillment_status(order) == 'issued' else 'ручная / fallback')}</b>\n"
+        f"Тип выдачи: <b>{html_escape('автоматическая' if order.get('auto_fulfillment') and order_fulfillment_status(order) == 'issued' else 'ручная выдача')}</b>\n"
         "\n<b>Автовыдача</b>\n"
         f"Статус: <b>{html_escape(auto_issue_label)}</b>\n"
         f"Поставщик: <b>{html_escape(str(order.get('supplier') or '—'))}</b>\n"
@@ -6953,23 +7010,30 @@ def auto_fulfillment_supported_product(order: dict) -> bool:
 def order_card_keyboard(order_id: int, back_callback: str = "admin_orders") -> InlineKeyboardMarkup:
     order = find_order(order_id) or {}
     rows = []
-    retry_allowed = order_payment_status(order) == "paid" and order_fulfillment_status(order) in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order) and (not order_already_fulfilled(order) or apple_id_can_fetch_existing_supplier_order(order))
+    payment_status = order_payment_status(order)
+    fulfillment_status = order_fulfillment_status(order)
+    category = order_category_key(order)
+    if payment_status != "paid":
+        rows.append([InlineKeyboardButton("✅ Подтвердить оплату вручную", callback_data=f"order_payment_confirm:{order_id}")])
+        rows.append([InlineKeyboardButton("❌ Отменить заказ", callback_data=f"order_status:cancelled:{order_id}")])
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
+        return InlineKeyboardMarkup(rows)
+    retry_allowed = order_payment_status(order) == "paid" and fulfillment_status in {"failed", "manual_required", "manual_issue_required"} and auto_fulfillment_supported_product(order) and (not order_already_fulfilled(order) or apple_id_can_fetch_existing_supplier_order(order))
     if retry_allowed:
-        rows.append([InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and order.get("supplier_order_id") and not order.get("giftcard_code") and order_fulfillment_status(order) not in {"issued", "auto_issued"}:
+        rows.append([InlineKeyboardButton("🤖 Запустить автовыдачу", callback_data=f"order_auto_retry:{order_id}")])
+    if category == "apple_id" and payment_status == "paid" and order.get("supplier_order_id") and not order.get("giftcard_code") and fulfillment_status not in {"issued", "auto_issued"}:
         rows.append([InlineKeyboardButton("🔎 Проверить у поставщика", callback_data=f"order_check_supplier:{order_id}")])
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"} and is_stock_enabled_for_category("apple_id"):
+    if category == "apple_id" and payment_status == "paid" and not order.get("giftcard_code") and fulfillment_status in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"} and is_stock_enabled_for_category("apple_id"):
         rows.append([InlineKeyboardButton("📦 Выдать со склада", callback_data=f"order_issue_stock:{order_id}")])
         rows.append([InlineKeyboardButton("➕ Добавить код под этот заказ", callback_data=f"order_add_stock_code:{order_id}")])
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and order.get("giftcard_code"):
+    if category == "apple_id" and payment_status == "paid" and order.get("giftcard_code"):
         rows.append([InlineKeyboardButton("📨 Отправить код клиенту повторно", callback_data=f"order_resend_code:{order_id}")])
         rows.append([InlineKeyboardButton("👁 Показать код", callback_data=f"order_show_code:{order_id}")])
-    rows.extend([
-        [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
-        [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
-        [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
-    ])
+    if fulfillment_status not in {"issued", "auto_issued"}:
+        rows.append([InlineKeyboardButton("📤 Выдать вручную", callback_data=f"order_status:issued:{order_id}")])
+    else:
+        rows.append([InlineKeyboardButton("⚠️ Отметить проблему / возврат", callback_data=f"order_status:cancelled:{order_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -8718,17 +8782,7 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 
 
 def admin_order_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    order = find_order(order_id) or {}
-    rows = []
-    if order_category_key(order) == "apple_id" and order_payment_status(order) == "paid" and not order.get("giftcard_code") and order_fulfillment_status(order) in {"manual_required", "failed", "pending", "paid_waiting_manual_issue"} and is_stock_enabled_for_category("apple_id"):
-        rows.append([InlineKeyboardButton("📦 Выдать со склада", callback_data=f"order_issue_stock:{order_id}")])
-    rows.extend([
-        [InlineKeyboardButton("🔁 Повторить автовыдачу", callback_data=f"order_auto_retry:{order_id}")],
-        [InlineKeyboardButton("✅ В работу", callback_data=f"order_status:in_progress:{order_id}")],
-        [InlineKeyboardButton("✅ Выдан вручную", callback_data=f"order_status:issued:{order_id}")],
-        [InlineKeyboardButton("❌ Отменить", callback_data=f"order_status:cancelled:{order_id}")],
-    ])
-    return InlineKeyboardMarkup(rows)
+    return order_card_keyboard(order_id)
 
 
 def profile_keyboard() -> InlineKeyboardMarkup:
@@ -10169,10 +10223,6 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Заявка не найдена.", show_alert=True)
         return
 
-    if normalize_order_status(status) == "in_progress" and str(order.get("payment_provider") or "").lower() == "card":
-        order = update_order_fields(order_id, payment_status="paid", paid_at=order.get("paid_at") or now_str(), fulfillment_status=order.get("fulfillment_status") or "pending") or order
-        await notify_payment_event_once(context, "manual_confirm", "manual_payment_confirmed", order, query.from_user, order, order.get("payment_details"), actor=query.from_user)
-        await maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")
     if normalize_order_status(status) == "cancelled" and previous_order and order_payment_status(previous_order) == "paid":
         await notify_payment_event_once(context, "payment_cancelled_after_paid", "refund_required", order, query.from_user, order, order.get("payment_details"), actor=query.from_user, error="отмена оплаченного заказа")
     await query.answer(f"Статус: {order_status_label(order.get('status'))}")
@@ -10181,6 +10231,45 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─── Вводы Clients CRM ───────────────────────────────────────────────────────
+
+
+
+async def handle_order_payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not has_admin_access(query.from_user):
+        await deny_admin_access(update)
+        return
+
+    order_id = int(query.data.split(":", 1)[1])
+    current_order = find_order(order_id)
+    if not current_order:
+        await query.answer("Заявка не найдена.", show_alert=True)
+        return
+
+    paid_at = current_order.get("paid_at") or now_str()
+    order = update_order_fields(
+        order_id,
+        status="paid",
+        payment_status="paid",
+        paid_at=paid_at,
+        payment_paid_at=current_order.get("payment_paid_at") or paid_at,
+        fulfillment_status=current_order.get("fulfillment_status") or "pending",
+    ) or current_order
+    await notify_payment_event_once(
+        context,
+        "manual_confirm",
+        "manual_payment_confirmed",
+        order,
+        query.from_user,
+        order,
+        order.get("payment_details"),
+        actor=query.from_user,
+    )
+    await maybe_auto_fulfill_paid_order(context, order, reason="manual_payment_confirmed")
+    fresh = find_order(order_id) or order
+    await query.answer("Оплата подтверждена вручную")
+    await edit_or_send(query, context, build_order_card_text(fresh), order_card_keyboard(order_id))
+
 
 async def handle_client_crm_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
@@ -12388,6 +12477,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         await context.bot.send_message(chat_id=query.from_user.id, text=(f"👁 Код Apple ID для {html_escape(order_number_plain(order))}:\n<code>{html_escape(str(order.get('giftcard_code')))}</code>"), parse_mode="HTML")
+    elif data.startswith("order_payment_confirm:"):
+        await handle_order_payment_confirm(update, context)
     elif data.startswith("order_status:"):
         await handle_admin_action(update, context)
     elif data == "admin_stock":
@@ -12575,6 +12666,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         await query.answer()
         await edit_or_send(query, context, apple_id_stock_list_text(data.split(":", 1)[1]), apple_id_stock_list_keyboard())
+    elif data.startswith("orders_filter:"):
+        filter_type = data.split(":", 1)[1]
+        await query.answer("Выберите фильтр")
+        await edit_or_send(query, context, orders_filter_text(filter_type), orders_filter_keyboard(filter_type))
     elif data.startswith("orders_list:"):
         await query.answer()
         filter_key = data.split(":", 1)[1]
