@@ -1,0 +1,48 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  OWNER
+  MANAGER
+  EMPLOYEE
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  ARCHIVED
+}
+
+enum EventLevel {
+  INFO
+  WARNING
+  ALERT
+  FINANCE
+}
+
+model User {
+  id         Int        @id @default(autoincrement())
+  telegramId String     @unique
+  username   String?
+  firstName  String?
+  lastName   String?
+  role       Role       @default(EMPLOYEE)
+  status     UserStatus @default(PENDING)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+}
+
+model EventLog {
+  id        Int        @id @default(autoincrement())
+  type      String
+  level     EventLevel
+  message   String
+  metadata  Json?
+  createdAt DateTime   @default(now())
+}

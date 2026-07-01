@@ -29,3 +29,12 @@ frontend/tma/dist/
 
 # Payment methods runtime settings
 bot/payment_methods.json
+
+# Node.js
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Prisma local database
+prisma/*.db
+prisma/*.db-journal
